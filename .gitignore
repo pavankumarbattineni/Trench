@@ -1,0 +1,21 @@
+# Reference-only files — never commit
+frontend.html
+trench-e4b2f-firebase-adminsdk-fbsvc-acc908edf9.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+trench_backend/.env
+.pytest_cache/
+
+# Node / Next.js
+node_modules/
+trench_frontend/.next/
+trench_frontend/out/
+trench_frontend/.env.local
+*.tsbuildinfo
+
+# Editors / OS
+.DS_Store
+.vscode/
