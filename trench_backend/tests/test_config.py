@@ -1,7 +1,11 @@
-from app.core.config import get_settings
+from app.config import get_settings
 
 
-def test_settings_load_database_url_from_env():
+def test_settings_parse_trench_config_from_env():
     settings = get_settings()
-    assert settings.database_url.startswith("postgresql+asyncpg://")
-    assert settings.app_name == "Trench"
+    config = settings.TRENCH_CONFIG
+
+    assert config.DB.database == "trench"
+    assert config.DB.url.startswith("postgresql+asyncpg://")
+    assert config.JWT.algorithm == "HS256"
+    assert config.FIREBASE.credentials_path.endswith(".json")

@@ -1,7 +1,7 @@
 import pytest
 from sqlalchemy import text
 
-from app.db.session import async_session_factory
+from app.database.session import async_session_factory
 
 
 @pytest.mark.asyncio

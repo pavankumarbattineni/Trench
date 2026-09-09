@@ -19,3 +19,7 @@ trench_frontend/.env.local
 # Editors / OS
 .DS_Store
 .vscode/
+
+# Playwright MCP review artifacts (screenshots, snapshots, console logs)
+.playwright-mcp/
+/*.png
