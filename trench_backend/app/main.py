@@ -1,6 +1,9 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.jobs.app import app as procrastinate_app
 from app.middleware.error_handler import register_error_handling
 from app.router.auth import router as auth_router
 from app.router.credentials import router as credentials_router
@@ -11,7 +14,14 @@ from app.utils.logging import configure_logging
 
 configure_logging()
 
-app = FastAPI(title="Trench API")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    async with procrastinate_app.open_async():
+        yield
+
+
+app = FastAPI(title="Trench API", lifespan=lifespan)
 
 register_error_handling(app)
 

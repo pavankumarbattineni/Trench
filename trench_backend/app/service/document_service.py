@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Document, UsageCounter, User
+from app.jobs.document_tasks import process_document
 from app.service.credential_service import CredentialService
 from app.service.document_storage_service import get_storage_provider
 from app.service.knowledge_base_service import KnowledgeBaseService
@@ -88,6 +89,8 @@ class DocumentService:
         db.add(document)
         await db.commit()
         await db.refresh(document)
+
+        await process_document.defer_async(document_id=str(document.id))
         return document
 
     @classmethod
