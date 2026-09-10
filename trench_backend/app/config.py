@@ -38,12 +38,17 @@ class FirebaseConfig(BaseModel):
     credentials_path: str
 
 
+class GroqConfig(BaseModel):
+    api_key: str
+
+
 class TrenchConfig(BaseModel):
     ENVIRONMENT: str = "DEV"
     DB: DBConfig
     JWT: JWTConfig
     MCP: MCPConfig
     FIREBASE: FirebaseConfig
+    GROQ: GroqConfig
 
 
 class Settings(BaseSettings):
