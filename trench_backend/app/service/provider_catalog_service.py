@@ -41,6 +41,19 @@ class ProviderCatalogService:
         return model
 
     @staticmethod
+    async def get_default_with_provider(
+        db: AsyncSession, model_type: str
+    ) -> tuple[Provider, ProviderModel]:
+        """Same as get_default, but also returns the owning Provider row --
+        needed wherever code has to record which provider a model came
+        from (e.g. KnowledgeBase.embedding_provider)."""
+        model = await ProviderCatalogService.get_default(db, model_type)
+        result = await db.execute(
+            select(Provider).where(Provider.id == model.provider_id)
+        )
+        return result.scalar_one(), model
+
+    @staticmethod
     async def list_models(
         db: AsyncSession, model_type: str, *, provider_name: str | None = None
     ) -> list[ProviderModel]:

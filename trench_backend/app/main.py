@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.middleware.error_handler import register_error_handling
 from app.router.auth import router as auth_router
 from app.router.credentials import router as credentials_router
+from app.router.documents import router as documents_router
 from app.router.health import router as health_router
 from app.router.users import router as users_router
 from app.utils.logging import configure_logging
@@ -26,3 +27,4 @@ app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(credentials_router)
+app.include_router(documents_router)

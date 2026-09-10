@@ -63,6 +63,18 @@ class CredentialService:
         return _mask_key(plaintext)
 
     @staticmethod
+    async def has_credential(
+        db: AsyncSession, *, user_id: uuid.UUID, provider_type: str
+    ) -> bool:
+        result = await db.execute(
+            select(UserCredential.id).where(
+                UserCredential.user_id == user_id,
+                UserCredential.provider_type == provider_type,
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
     async def delete_credential(
         db: AsyncSession, *, user_id: uuid.UUID, provider_type: str
     ) -> None:

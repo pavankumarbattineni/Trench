@@ -42,6 +42,10 @@ class GroqConfig(BaseModel):
     api_key: str
 
 
+class StorageConfig(BaseModel):
+    local_root_path: str
+
+
 class TrenchConfig(BaseModel):
     ENVIRONMENT: str = "DEV"
     DB: DBConfig
@@ -49,6 +53,7 @@ class TrenchConfig(BaseModel):
     MCP: MCPConfig
     FIREBASE: FirebaseConfig
     GROQ: GroqConfig
+    STORAGE: StorageConfig
 
 
 class Settings(BaseSettings):

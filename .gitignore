@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 trench_backend/.env
 .pytest_cache/
+trench_backend/storage/
 
 # Node / Next.js
 node_modules/
