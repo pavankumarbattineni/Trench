@@ -39,4 +39,4 @@ ignore = ["B008"]
 
 [tool.ruff.lint.per-file-ignores]
 # Alembic autogenerates these; they're not hand-maintained code.
-"alembic/versions/*.py" = ["I001", "UP035", "UP007", "PIE790", "F401"]
+"alembic/versions/*.py" = ["I001", "UP035", "UP007", "PIE790", "F401", "E501"]
