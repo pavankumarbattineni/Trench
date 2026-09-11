@@ -50,6 +50,19 @@ class OrganizationMemberResponse(BaseModel):
     created_at: datetime
 
 
+class PaginatedMembersResponse(BaseModel):
+    """GET /organizations/{id}/members -- a page of the roster plus enough
+    to render pagination controls (search matches against username/email
+    are applied before paging, so `total`/`total_pages` reflect the
+    filtered count, not the organization's full membership)."""
+
+    items: list[OrganizationMemberResponse]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
 class AddMemberRequest(BaseModel):
     username: str
     role: OrganizationRole = "member"
@@ -66,3 +79,15 @@ class KnowledgeAccessResponse(BaseModel):
     knowledge_type: str
     is_active: bool
     created_at: datetime
+
+
+class KnowledgeAccessBulkRevokeResponse(BaseModel):
+    revoked_count: int
+
+
+class KnowledgeAccessBulkGrantResponse(BaseModel):
+    granted_count: int
+
+
+class MemberBulkRemoveResponse(BaseModel):
+    removed_count: int

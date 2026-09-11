@@ -9,6 +9,7 @@ approval, no sub-agent dispatch.
 """
 
 import asyncio
+import logging
 import uuid
 
 from fastapi import HTTPException
@@ -23,6 +24,8 @@ from app.graph.rag_graph import build_graph
 from app.service.thread_service import ThreadService
 from app.service.thread_title_service import ThreadTitleService
 from app.utils.stream_manager import stream_manager
+
+logger = logging.getLogger(__name__)
 
 _compiled_graph = None
 
@@ -122,59 +125,139 @@ class ChatService:
         knowledge_type: str,
         stream_id: str,
     ) -> None:
-        async with async_session_factory() as db:
-            assistant_message = await db.get(ChatHistory, assistant_message_id)
-            assistant_message.status = "running"
-            await db.commit()
+        # The whole body runs inside this try -- not just the ainvoke() call
+        # -- because a Stop click races the background task from the moment
+        # it's created: StreamManager.cancel_task() has no idea whether the
+        # task has reached ainvoke() yet, so a fast cancel (or a fast
+        # provider like Groq that lets the whole turn finish in well under a
+        # second) can just as easily land while still fetching the message,
+        # committing status="running", or re-fetching the user. Only
+        # wrapping ainvoke() left every one of those earlier awaits
+        # uncovered: a CancelledError raised there propagated straight out
+        # of this task uncaught (asyncio doesn't log a bare CancelledError),
+        # permanently stranding the row at "pending"/"running" and, via
+        # _enforce_no_concurrent_query, wedging the user's account so every
+        # later message 409'd.
+        try:
+            async with async_session_factory() as db:
+                assistant_message = await db.get(ChatHistory, assistant_message_id)
+                assistant_message.status = "running"
+                await db.commit()
 
-            initial_state = {
-                "user_id": str(user.id),
-                "thread_id": str(thread_id),
-                "stream_id": stream_id,
-                "query": query,
-                "knowledge_type": knowledge_type,
-                "organization_id": None,
-                "access_denied": False,
-                "denial_reason": None,
-                "condensed_query": "",
-                "retrieved_chunks": [],
-                "response": "",
-                "citations": [],
-                "messages": [{"role": "user", "content": query}],
-            }
-            config = {
-                "configurable": {
+                # Re-fetch the user row in this task's own session rather than
+                # reusing the `user` object captured by the HTTP request that
+                # spawned this background task: this task can run seconds after
+                # that request returned (202 Accepted), and the user may have
+                # since changed their selected model (PATCH /users/me) -- using
+                # the stale in-memory object would silently generate against
+                # whatever model was selected *before* that change instead of
+                # the user's current selection.
+                user = await db.get(User, user.id) or user
+
+                initial_state = {
+                    "user_id": str(user.id),
                     "thread_id": str(thread_id),
-                    "db": db,
-                    "user": user,
                     "stream_id": stream_id,
-                    "assistant_message_id": str(assistant_message_id),
+                    "query": query,
+                    "knowledge_type": knowledge_type,
+                    "organization_id": None,
+                    "access_denied": False,
+                    "denial_reason": None,
+                    "condensed_query": "",
+                    "retrieved_chunks": [],
+                    "response": "",
+                    "citations": [],
+                    "messages": [{"role": "user", "content": query}],
                 }
-            }
+                config = {
+                    "configurable": {
+                        "thread_id": str(thread_id),
+                        "db": db,
+                        "user": user,
+                        "stream_id": stream_id,
+                        "assistant_message_id": str(assistant_message_id),
+                    }
+                }
 
-            try:
                 await _get_compiled_graph().ainvoke(initial_state, config=config)
-            except asyncio.CancelledError:
-                partial_content = "".join(
-                    chunk["content"]
-                    for chunk in stream_manager.get_buffer(stream_id)
-                    if chunk.get("type") == "token"
+        except asyncio.CancelledError:
+            partial_content = "".join(
+                chunk["content"]
+                for chunk in stream_manager.get_buffer(stream_id)
+                if chunk.get("type") == "token"
+            )
+            # A fresh session/connection, never the `db` above: cancellation
+            # can land mid-await on that session's own connection (e.g. the
+            # status="running" commit, or a query inside ainvoke), which can
+            # leave it in a state that raises on any further use. Persisting
+            # the final status must not depend on that connection having
+            # survived the cancellation cleanly.
+            try:
+                async with async_session_factory() as recovery_db:
+                    message = await recovery_db.get(ChatHistory, assistant_message_id)
+                    if message is not None:
+                        message.content = partial_content
+                        message.status = "interrupted"
+                        await recovery_db.commit()
+            except Exception:
+                logger.exception(
+                    "Failed to persist interrupted status for stream_id=%s",
+                    stream_id,
                 )
-                assistant_message.content = partial_content
-                assistant_message.status = "interrupted"
-                await db.commit()
-                stream_manager.append_chunk(
-                    stream_id, {"type": "interrupted", "content": partial_content}
+            stream_manager.append_chunk(
+                stream_id, {"type": "interrupted", "content": partial_content}
+            )
+            stream_manager.finish(stream_id)
+
+            # Cancellation lands mid-`generate`, so that node's own
+            # {"messages": [...]} return (which would normally record
+            # what the assistant said) never happens -- the partial
+            # answer would otherwise be visible only in Postgres
+            # (assistant_message.content above), invisible to the
+            # graph's own conversational memory. Recording it here
+            # (best-effort; a continuable conversation matters more
+            # than this succeeding) is what lets a later "continue"
+            # naturally build on what was already said instead of the
+            # agent having no idea a prior answer was in progress.
+            if partial_content:
+                try:
+                    await _get_compiled_graph().aupdate_state(
+                        {"configurable": {"thread_id": str(thread_id)}},
+                        {
+                            "messages": [
+                                {
+                                    "role": "assistant",
+                                    "content": (
+                                        f"{partial_content}\n\n"
+                                        "[This response was interrupted "
+                                        "before it finished.]"
+                                    ),
+                                }
+                            ]
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to record interrupted response into "
+                        "checkpoint state for stream_id=%s",
+                        stream_id,
+                    )
+        except Exception as exc:
+            try:
+                async with async_session_factory() as recovery_db:
+                    message = await recovery_db.get(ChatHistory, assistant_message_id)
+                    if message is not None:
+                        message.status = "failed"
+                        message.content = str(exc)
+                        await recovery_db.commit()
+            except Exception:
+                logger.exception(
+                    "Failed to persist failed status for stream_id=%s", stream_id
                 )
-                stream_manager.finish(stream_id)
-            except Exception as exc:
-                assistant_message.status = "failed"
-                assistant_message.content = str(exc)
-                await db.commit()
-                stream_manager.append_chunk(
-                    stream_id, {"type": "error", "content": str(exc)}
-                )
-                stream_manager.finish(stream_id)
+            stream_manager.append_chunk(
+                stream_id, {"type": "error", "content": str(exc)}
+            )
+            stream_manager.finish(stream_id)
 
     @staticmethod
     async def _enforce_no_concurrent_query(

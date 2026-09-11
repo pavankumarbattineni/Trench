@@ -8,7 +8,7 @@ is always a single unambiguous lookup.
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import case, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -232,14 +232,65 @@ class OrganizationService:
 
     @staticmethod
     async def list_members(
-        db: AsyncSession, organization_id: uuid.UUID
-    ) -> list[OrganizationMember]:
+        db: AsyncSession,
+        organization_id: uuid.UUID,
+        *,
+        page: int = 1,
+        page_size: int = 10,
+        search: str | None = None,
+    ) -> tuple[list[OrganizationMember], int]:
+        """Returns (this page's members, total matching count).
+
+        `search`, when given, matches a case-insensitive substring against
+        either the member's username or email (joined in from `users`,
+        since neither lives on `OrganizationMember` itself). Ordered
+        owner first, then other admins, then regular members (each group
+        then by join date) -- not just insertion order.
+        """
+        base_query = select(OrganizationMember).join(
+            User, User.id == OrganizationMember.user_id
+        )
+        count_query = (
+            select(func.count())
+            .select_from(OrganizationMember)
+            .join(User, User.id == OrganizationMember.user_id)
+        )
+        condition = OrganizationMember.organization_id == organization_id
+        if search:
+            pattern = f"%{search}%"
+            condition = condition & (
+                User.username.ilike(pattern) | User.email.ilike(pattern)
+            )
+        base_query = base_query.where(condition)
+        count_query = count_query.where(condition)
+
+        total = (await db.execute(count_query)).scalar_one()
+
+        organization = await OrganizationService.get_by_id(db, organization_id)
+        owner_user_id = organization.owner_user_id if organization else None
+        rank = case(
+            (OrganizationMember.user_id == owner_user_id, 0),
+            (OrganizationMember.role == "admin", 1),
+            else_=2,
+        )
+        result = await db.execute(
+            base_query.order_by(rank, OrganizationMember.created_at.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        return list(result.scalars().all()), total
+
+    @staticmethod
+    async def get_member(
+        db: AsyncSession, *, organization_id: uuid.UUID, user_id: uuid.UUID
+    ) -> OrganizationMember | None:
         result = await db.execute(
             select(OrganizationMember).where(
-                OrganizationMember.organization_id == organization_id
+                OrganizationMember.organization_id == organization_id,
+                OrganizationMember.user_id == user_id,
             )
         )
-        return list(result.scalars().all())
+        return result.scalar_one_or_none()
 
     @staticmethod
     async def add_member(
@@ -330,6 +381,34 @@ class OrganizationService:
             raise _MEMBER_NOT_FOUND
         await db.delete(member)
         await db.commit()
+
+    @classmethod
+    async def remove_all_members(
+        cls, db: AsyncSession, *, organization_id: uuid.UUID, acting_user_id: uuid.UUID
+    ) -> int:
+        """Removes every member of the organization except the permanent
+        owner (who can never be removed) and the caller themself (removing
+        yourself via a bulk action would leave you unable to confirm what
+        just happened, same reasoning as the single-remove self-check).
+
+        Returns:
+            How many members were removed.
+        """
+        organization = await cls.get_by_id(db, organization_id)
+        if organization is None:
+            raise _NOT_FOUND
+        result = await db.execute(
+            delete(OrganizationMember)
+            .where(
+                OrganizationMember.organization_id == organization_id,
+                OrganizationMember.user_id != organization.owner_user_id,
+                OrganizationMember.user_id != acting_user_id,
+            )
+            .returning(OrganizationMember.id)
+        )
+        removed_ids = result.scalars().all()
+        await db.commit()
+        return len(removed_ids)
 
     @classmethod
     async def require_not_owner(

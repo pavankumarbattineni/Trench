@@ -18,23 +18,45 @@ import {
   getCurrentUser,
   loginWithFirebase,
   logoutSession,
+  signupWithFirebase,
+  type SignupProfile,
   type UserProfile,
 } from "@/lib/api";
 import { firebaseAuth, googleProvider } from "@/lib/firebase";
 
-async function establishSession(user: FirebaseUser, username?: string): Promise<UserProfile> {
+async function establishSession(user: FirebaseUser): Promise<UserProfile> {
   const idToken = await user.getIdToken();
-  await loginWithFirebase(idToken, username);
+  await loginWithFirebase(idToken);
   return getCurrentUser();
 }
 
+/**
+ * Registers a new Trench user. Deliberately does NOT sign the user in --
+ * signup and signin are separate actions now, so this never sets any
+ * session tokens. Callers should send the user to /signin next, not to
+ * the authenticated app.
+ */
 export async function signUp(
   username: string,
   email: string,
-  password: string
-): Promise<UserProfile> {
+  password: string,
+  registerAsAdmin?: boolean
+): Promise<SignupProfile> {
   const credential = await createUserWithEmailAndPassword(firebaseAuth, email, password);
-  return establishSession(credential.user, username);
+  const idToken = await credential.user.getIdToken();
+  return signupWithFirebase(idToken, username, registerAsAdmin);
+}
+
+/**
+ * "Continue with Google" used as a signup action (from the signup page):
+ * creates the account (if new) but does NOT log the user in -- mirrors
+ * the email/password split above. Google collects no username, so one is
+ * auto-generated from the email.
+ */
+export async function signUpWithGoogle(registerAsAdmin?: boolean): Promise<SignupProfile> {
+  const credential = await signInWithPopup(firebaseAuth, googleProvider);
+  const idToken = await credential.user.getIdToken();
+  return signupWithFirebase(idToken, undefined, registerAsAdmin);
 }
 
 export async function signIn(email: string, password: string): Promise<UserProfile> {

@@ -23,10 +23,14 @@ def _fake_claims(uid: str = TEST_FIREBASE_UID, email: str = TEST_EMAIL) -> dict:
 async def _login(
     client: AsyncClient, uid: str = TEST_FIREBASE_UID, email: str = TEST_EMAIL
 ) -> None:
+    """Signs up (idempotently -- a 409 for an already-registered email is
+    fine here) then signs in, since login no longer lazily creates a
+    user."""
     with patch(
         "app.utils.firebase.verify_firebase_id_token",
         return_value=_fake_claims(uid=uid, email=email),
     ):
+        await client.post("/api/v1/auth/signup", json={"id_token": "fake"})
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
 

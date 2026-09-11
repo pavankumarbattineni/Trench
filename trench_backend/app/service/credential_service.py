@@ -15,6 +15,19 @@ from app.database.models import UserCredential
 from app.service.credential_validation_service import CredentialValidationService
 from app.utils.encryption import decrypt_secret, encrypt_secret
 
+# Which BYOK credential (see VALID_PROVIDER_TYPES in app/schemas/credential.py)
+# a given LLM provider (app.database.models.Provider.name) needs. The one
+# provider absent here -- "groq" -- is the platform-owned free default and
+# never needs a per-user credential. Single source of truth: both
+# LLMClientService (generation-time resolution) and the /config + model-
+# selection endpoints (UI gating, selection-time validation) import this
+# rather than each hardcoding their own copy.
+LLM_PROVIDER_TO_CREDENTIAL_TYPE = {
+    "openai": "openai_llm",
+    "anthropic": "anthropic_llm",
+    "google": "gemini_llm",
+}
+
 
 def _mask_key(api_key: str) -> str:
     if len(api_key) <= 8:
@@ -61,6 +74,12 @@ class CredentialService:
         4 characters) -- the full plaintext key never leaves this call."""
         plaintext = decrypt_secret(credential.encrypted_credential, purpose="byok")
         return _mask_key(plaintext)
+
+    @staticmethod
+    def required_credential_type(provider_name: str) -> str | None:
+        """The BYOK provider_type a given LLM provider needs, or None if it
+        needs no credential at all (the platform-owned Groq default)."""
+        return LLM_PROVIDER_TO_CREDENTIAL_TYPE.get(provider_name)
 
     @staticmethod
     async def has_credential(

@@ -18,12 +18,6 @@ from app.service.credential_service import CredentialService
 from app.service.provider_catalog_service import ProviderCatalogService
 from app.utils.encryption import decrypt_secret
 
-_BYOK_PROVIDER_TYPE = {
-    "openai": "openai_llm",
-    "anthropic": "anthropic_llm",
-    "google": "gemini_llm",
-}
-
 
 class ResolvedModel:
     def __init__(self, *, provider_name: str, model_name: str, api_key: str) -> None:
@@ -47,7 +41,7 @@ class LLMClientService:
                 api_key=get_settings().TRENCH_CONFIG.GROQ.api_key,
             )
 
-        byok_type = _BYOK_PROVIDER_TYPE.get(provider.name)
+        byok_type = CredentialService.required_credential_type(provider.name)
         credentials = (
             await CredentialService.list_credentials(db, user_id=user.id)
             if byok_type

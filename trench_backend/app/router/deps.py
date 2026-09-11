@@ -16,6 +16,10 @@ _COMPANY_ACCESS_DENIED = HTTPException(
     status.HTTP_403_FORBIDDEN,
     "You don't have access to this organization's company knowledge",
 )
+_TRENCH_ADMIN_REQUIRED = HTTPException(
+    status.HTTP_403_FORBIDDEN,
+    "Only a Trench administrator can create an organization",
+)
 
 # A real FastAPI/OpenAPI security scheme (not just a raw header read) --
 # this is what makes Swagger show a lock icon and an "Authorize" button on
@@ -46,6 +50,21 @@ async def get_current_user(
     """
     token = credentials.credentials if credentials else None
     return await AuthService.resolve_access_token(db, token)
+
+
+async def require_trench_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Ensures the caller is a Trench *application* administrator
+    (`User.role == "admin"`) -- entirely separate from any organization's
+    own admin role. Gates organization creation.
+
+    Raises:
+        HTTPException: 403 if the caller isn't a Trench admin.
+    """
+    if current_user.role != "admin":
+        raise _TRENCH_ADMIN_REQUIRED
+    return current_user
 
 
 async def require_org_admin(

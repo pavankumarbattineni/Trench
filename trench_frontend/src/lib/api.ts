@@ -32,6 +32,18 @@ export interface UserProfile {
   model_name: string | null;
   organization: UserOrganization | null;
   has_company_access: boolean;
+  /** The Trench *application* role ("admin" | "user") -- separate from
+   * `organization.role`, an org's own admin/member role. Only a Trench
+   * admin can create an organization. */
+  role: "admin" | "user";
+}
+
+export interface SignupProfile {
+  id: string;
+  email: string;
+  username: string;
+  role: "admin" | "user";
+  created_at: string;
 }
 
 // Trench uses Bearer-token auth, not cookies for the API itself: the
@@ -77,16 +89,50 @@ export function isAuthenticated(): boolean {
   return Boolean(getAccessToken());
 }
 
-export async function loginWithFirebase(
-  idToken: string,
-  username?: string
-): Promise<TokenResponse> {
+/**
+ * Signs in an *already-registered* user -- never creates one. The backend
+ * rejects (404) a valid Firebase ID token that has no matching Trench
+ * account; the caller must go through `signupWithFirebase` first. See
+ * signup/signin split in AuthService (backend) -- these are deliberately
+ * two separate operations, not one lazy "create-if-missing" login.
+ */
+export async function loginWithFirebase(idToken: string): Promise<TokenResponse> {
   const { data } = await apiClient.post<TokenResponse>("/api/v1/auth/login", {
     id_token: idToken,
-    username,
   });
   setAuthTokens(data);
   return data;
+}
+
+/**
+ * Registers a new Trench user. Deliberately does NOT set any session
+ * tokens -- signup never logs the user in; the frontend sends them to
+ * /signin next.
+ */
+export async function signupWithFirebase(
+  idToken: string,
+  username?: string,
+  registerAsAdmin?: boolean
+): Promise<SignupProfile> {
+  const { data } = await apiClient.post<SignupProfile>("/api/v1/auth/signup", {
+    id_token: idToken,
+    username,
+    register_as_admin: registerAsAdmin ?? false,
+  });
+  return data;
+}
+
+/**
+ * Whether a Trench administrator has already been registered -- lets the
+ * signup page decide whether to offer "register as administrator" at all.
+ * Purely a UX convenience: the backend independently re-checks the same
+ * condition when signup actually happens.
+ */
+export async function getAdminStatus(): Promise<boolean> {
+  const { data } = await apiClient.get<{ admin_exists: boolean }>(
+    "/api/v1/auth/admin-status"
+  );
+  return data.admin_exists;
 }
 
 export async function getCurrentUser(): Promise<UserProfile> {
@@ -145,7 +191,11 @@ interface RetriableRequestConfig extends InternalAxiosRequestConfig {
 }
 
 function isAuthExchange(url: string | undefined): boolean {
-  return url === "/api/v1/auth/login" || url === "/api/v1/auth/refresh";
+  return (
+    url === "/api/v1/auth/login" ||
+    url === "/api/v1/auth/refresh" ||
+    url === "/api/v1/auth/signup"
+  );
 }
 
 // Coalesces concurrent 401s into a single refresh call instead of one per request.

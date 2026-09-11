@@ -32,6 +32,14 @@ _RECENT_LOGIN_REQUIRED = HTTPException(
     status.HTTP_401_UNAUTHORIZED,
     "Please sign in again before deleting your account",
 )
+_NOT_REGISTERED = HTTPException(
+    status.HTTP_404_NOT_FOUND,
+    "No account found for this email. Please sign up first.",
+)
+_ALREADY_REGISTERED = HTTPException(
+    status.HTTP_409_CONFLICT,
+    "An account already exists for this email. Please sign in instead.",
+)
 
 # How fresh a Firebase ID token's issued-at time must be to count as "recent
 # authentication" for a destructive operation like account deletion.
@@ -67,25 +75,73 @@ class AuthService:
             raise _INVALID_FIREBASE_TOKEN from exc
 
     @classmethod
+    async def signup(
+        cls,
+        db: AsyncSession,
+        *,
+        id_token: str,
+        username: str | None,
+        register_as_admin: bool,
+    ) -> User:
+        """Registers a new Trench user from a verified Firebase ID token.
+
+        Deliberately does NOT return session tokens -- signup and signin are
+        separate actions (see `create_session`); the frontend sends the user
+        to the sign-in page after this succeeds rather than logging them in
+        immediately.
+
+        Args:
+            db: An active async SQLAlchemy session.
+            id_token: The Firebase ID token from the client's just-completed
+                signup (email/password creation, or a first-time Google
+                sign-in used as a signup action).
+            username: A username collected at signup (absent for Google,
+                which auto-generates one from the email instead).
+            register_as_admin: Whether the signer-upper asked to become the
+                Trench application's administrator (only ever honored if
+                none exists yet -- see `UserService.create_user`).
+
+        Returns:
+            The newly created User row.
+
+        Raises:
+            HTTPException: 409 if an account already exists for this email,
+                or if `username` is already taken.
+        """
+        claims = cls.verify_firebase_token(id_token)
+        if await UserService.get_by_email(db, claims["email"]) is not None:
+            raise _ALREADY_REGISTERED
+        return await UserService.create_user(
+            db,
+            email=claims["email"],
+            desired_username=username,
+            register_as_admin=register_as_admin,
+        )
+
+    @classmethod
     async def create_session(
-        cls, db: AsyncSession, id_token: str, username: str | None = None
+        cls, db: AsyncSession, id_token: str
     ) -> tuple[User, str, str]:
         """Starts a Trench session from a verified Firebase ID token.
+
+        Only ever resolves an *existing* user -- never creates one. An
+        unregistered Firebase identity (valid token, but no matching Trench
+        user) must go through `signup` first.
 
         Args:
             db: An active async SQLAlchemy session.
             id_token: The Firebase ID token from the client's sign-in.
-            username: A username collected at signup, used only the first
-                time this Firebase account is seen (see
-                `UserService.get_or_create_user`).
 
         Returns:
             A (user, access_token, refresh_token) tuple.
+
+        Raises:
+            HTTPException: 404 if no Trench account exists for this email.
         """
         claims = cls.verify_firebase_token(id_token)
-        user = await UserService.get_or_create_user(
-            db, email=claims["email"], desired_username=username
-        )
+        user = await UserService.get_by_email(db, claims["email"])
+        if user is None:
+            raise _NOT_REGISTERED
         return user, create_access_token(user.id), create_refresh_token(user.id)
 
     @staticmethod

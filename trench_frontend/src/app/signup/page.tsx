@@ -1,6 +1,7 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
+import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
@@ -13,11 +14,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PasswordInput } from "@/components/ui/password-input";
-import { useAuthSuccess } from "@/hooks/use-auth-success";
+import { Switch } from "@/components/ui/switch";
+import { useSignupSuccess } from "@/hooks/use-signup-success";
+import { getAdminStatus } from "@/lib/api";
 import { signUp } from "@/lib/auth-service";
 import { getErrorMessage } from "@/lib/errors";
 
-// Mirrors the backend's FirebaseSessionRequest.username constraint
+// Mirrors the backend's SignupRequest.username constraint
 // (app/schemas/auth.py) -- kept in sync deliberately, not shared code,
 // since the backend re-validates independently regardless of this check.
 const schema = z
@@ -39,8 +42,19 @@ const schema = z
 type FormValues = z.infer<typeof schema>;
 
 export default function SignupPage() {
-  const handleAuthSuccess = useAuthSuccess();
+  const handleSignupSuccess = useSignupSuccess();
   const [formError, setFormError] = useState<string | null>(null);
+  // Only ever offered while no Trench administrator exists yet -- purely
+  // a UX convenience; the backend independently re-checks the same
+  // "no admin yet" condition when signup actually happens, so hiding this
+  // is never the security boundary.
+  const [registerAsAdmin, setRegisterAsAdmin] = useState(false);
+  const adminStatusQuery = useQuery({
+    queryKey: ["auth", "admin-status"],
+    queryFn: getAdminStatus,
+  });
+  const offerAdminToggle = adminStatusQuery.data === false;
+
   const {
     register,
     handleSubmit,
@@ -50,7 +64,8 @@ export default function SignupPage() {
   const onSubmit = async (values: FormValues) => {
     setFormError(null);
     try {
-      handleAuthSuccess(await signUp(values.username, values.email, values.password));
+      await signUp(values.username, values.email, values.password, registerAsAdmin);
+      handleSignupSuccess();
     } catch (error) {
       setFormError(getErrorMessage(error));
     }
@@ -72,7 +87,12 @@ export default function SignupPage() {
         </>
       }
     >
-      <GoogleSignInButton onSuccess={handleAuthSuccess} onError={setFormError} />
+      <GoogleSignInButton
+        mode="signup"
+        registerAsAdmin={registerAsAdmin}
+        onSuccess={handleSignupSuccess}
+        onError={setFormError}
+      />
 
       <AuthDivider />
 
@@ -113,6 +133,24 @@ export default function SignupPage() {
             <p className="text-sm text-destructive">{errors.confirmPassword.message}</p>
           )}
         </div>
+
+        {offerAdminToggle && (
+          <div className="flex items-start justify-between gap-3 rounded-xl border border-border bg-muted/40 p-3">
+            <div className="space-y-0.5">
+              <Label htmlFor="register-as-admin">Register as administrator</Label>
+              <p className="text-xs text-muted-foreground">
+                No Trench administrator exists yet. Only an administrator can
+                create organizations.
+              </p>
+            </div>
+            <Switch
+              id="register-as-admin"
+              checked={registerAsAdmin}
+              onCheckedChange={setRegisterAsAdmin}
+            />
+          </div>
+        )}
+
         {formError && <p className="text-sm text-destructive">{formError}</p>}
         <Button type="submit" className="w-full" disabled={isSubmitting}>
           {isSubmitting ? "Creating account…" : "Create account"}

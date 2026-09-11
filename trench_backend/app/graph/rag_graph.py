@@ -133,7 +133,15 @@ async def access_denied_node(state: AgentState, config: RunnableConfig) -> dict:
     stream_manager.append_chunk(
         state["stream_id"], {"type": "error", "content": reason}
     )
-    return {"response": reason, "citations": []}
+    # Recorded into `messages` too (see `generate`'s docstring) so a
+    # denied turn still shows up in conversational memory for later turns
+    # -- otherwise a follow-up right after a denial would be condensed/
+    # generated with a silent gap in what the assistant actually said.
+    return {
+        "response": reason,
+        "citations": [],
+        "messages": [{"role": "assistant", "content": reason}],
+    }
 
 
 async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
@@ -193,7 +201,29 @@ async def hybrid_retrieve(state: AgentState, config: RunnableConfig) -> dict:
     }
 
 
+def _to_provider_message(message: object) -> dict[str, str]:
+    """Converts a LangChain BaseMessage (as restored from the checkpointer)
+    into the plain {"role", "content"} shape LLMClientService.stream_generate
+    expects, provider-agnostically."""
+    role = "assistant" if getattr(message, "type", "human") == "ai" else "user"
+    return {"role": role, "content": getattr(message, "content", "")}
+
+
 async def generate(state: AgentState, config: RunnableConfig) -> dict:
+    """Generates the assistant's reply from the retrieved context *and* the
+    full prior conversation (every earlier turn in `state["messages"]"),
+    not just this turn's raw query in isolation -- this is what makes the
+    agent genuinely conversational: a short follow-up like "continue" or
+    "what about the second point" is meaningless without the turns before
+    it, and previously only the bare current-turn query was ever sent to
+    the model, discarding history entirely regardless of interruption.
+
+    The assistant's own reply is written back into `messages` (returned
+    here, merged by the `add_messages` reducer) so the *next* turn's
+    history includes what was actually said, not just what was asked --
+    without this, conversational memory would stay permanently one-sided
+    (user turns only) no matter how many turns accumulate.
+    """
     db = _config_get(config, "db")
     user = _config_get(config, "user")
     stream_id = state["stream_id"]
@@ -212,17 +242,26 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
         context=context,
     )
 
+    # Every message so far is `state["messages"]` up to (but not
+    # including) the current turn's own raw query, which `initial_state`
+    # always appends last -- see ChatService._run_generation.
+    history = [_to_provider_message(m) for m in state["messages"][:-1]]
+    conversation = [*history, {"role": "user", "content": state["query"]}]
+
     resolved = await LLMClientService.resolve_for_user(db, user)
     full_text = ""
     async for delta in LLMClientService.stream_generate(
         resolved,
         system_prompt=system_prompt,
-        messages=[{"role": "user", "content": state["query"]}],
+        messages=conversation,
     ):
         full_text += delta
         stream_manager.append_chunk(stream_id, {"type": "token", "content": delta})
 
-    return {"response": full_text}
+    return {
+        "response": full_text,
+        "messages": [{"role": "assistant", "content": full_text}],
+    }
 
 
 async def build_citations(state: AgentState, config: RunnableConfig) -> dict:

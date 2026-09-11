@@ -1,8 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { Suspense } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { isAxiosError } from "axios";
 import { Building2, FileText, Users } from "lucide-react";
+
+import { ShieldAlert } from "lucide-react";
 
 import { useAuth } from "@/components/auth-provider";
 import { Badge } from "@/components/ui/badge";
@@ -33,6 +36,25 @@ export default function OrganizationPage() {
   }
 
   if (notInOrg) {
+    // Only a Trench *application* admin (User.role -- entirely separate
+    // from any organization's own admin role) can create an organization.
+    // Backend-enforced (require_trench_admin on POST /organizations) --
+    // this is purely so a regular user isn't shown a form they can't
+    // submit.
+    if (user?.role !== "admin") {
+      return (
+        <main className="mx-auto flex h-full max-w-3xl items-center justify-center px-4">
+          <div className="flex max-w-md flex-col items-center gap-3 rounded-2xl border border-dashed border-border p-8 text-center">
+            <ShieldAlert className="size-8 text-muted-foreground" />
+            <p className="text-sm text-muted-foreground">
+              You&apos;re not part of an organization yet, and only a Trench
+              administrator can create one. Ask your administrator to create an
+              organization and add you as a member.
+            </p>
+          </div>
+        </main>
+      );
+    }
     return (
       <main className="mx-auto h-full max-w-3xl overflow-y-auto px-4">
         <CreateOrganizationForm />
@@ -64,15 +86,7 @@ export default function OrganizationPage() {
   );
 }
 
-function OrganizationDetail({
-  organizationId,
-  name,
-  domain,
-  createdAt,
-  isAdmin,
-  hasCompanyAccess,
-  currentUserId,
-}: {
+interface OrganizationDetailProps {
   organizationId: string;
   name: string;
   domain: string;
@@ -80,8 +94,52 @@ function OrganizationDetail({
   isAdmin: boolean;
   hasCompanyAccess: boolean;
   currentUserId: string | undefined;
-}) {
-  const [tab, setTab] = useState<OrgTab>("members");
+}
+
+function OrganizationDetail(props: OrganizationDetailProps) {
+  // useSearchParams requires a Suspense boundary (Next.js opts a page
+  // using it into client-only rendering otherwise) -- cheap to add and
+  // keeps this correct regardless of how the route ends up being
+  // rendered.
+  return (
+    <Suspense
+      fallback={
+        <main className="mx-auto flex h-full max-w-3xl flex-col gap-4 overflow-y-auto px-4 py-10">
+          <Skeleton className="h-24 w-full rounded-2xl" />
+          <Skeleton className="h-8 w-64" />
+        </main>
+      }
+    >
+      <OrganizationDetailContent {...props} />
+    </Suspense>
+  );
+}
+
+function OrganizationDetailContent({
+  organizationId,
+  name,
+  domain,
+  createdAt,
+  isAdmin,
+  hasCompanyAccess,
+  currentUserId,
+}: OrganizationDetailProps) {
+  // The active tab lives in the URL (?tab=members|documents), not local
+  // component state -- a component's own useState resets to its initial
+  // value on every remount, which is exactly what a full page refresh
+  // does, so a tab held only in memory always snaps back to "members" on
+  // reload. Reading/writing it through the URL survives refreshes,
+  // back/forward navigation, and sharing a direct link to a tab.
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+  const tab: OrgTab = searchParams.get("tab") === "documents" ? "documents" : "members";
+
+  const setTab = (next: OrgTab) => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("tab", next);
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+  };
 
   return (
     <main className="mx-auto flex h-full max-w-3xl flex-col gap-6 overflow-y-auto px-4 py-10">

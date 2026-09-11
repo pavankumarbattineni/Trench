@@ -1,3 +1,5 @@
+import uuid
+from datetime import datetime
 from typing import Annotated
 
 from pydantic import BaseModel, Field
@@ -8,8 +10,37 @@ Username = Annotated[
 
 
 class FirebaseSessionRequest(BaseModel):
+    """POST /auth/login (signin) only -- no username, since signin never
+    creates a user; see SignupRequest for that."""
+
+    id_token: str
+
+
+class SignupRequest(BaseModel):
+    """POST /auth/signup only.
+
+    `register_as_admin` is a request, not a grant -- the backend only ever
+    honors it when no Trench administrator exists yet (see
+    UserService.create_user). There is no raw `role` field a client could
+    set directly; "admin" is reachable only through this one bootstrap
+    path.
+    """
+
     id_token: str
     username: Username | None = None
+    register_as_admin: bool = False
+
+
+class SignupResponse(BaseModel):
+    id: uuid.UUID
+    email: str
+    username: str
+    role: str
+    created_at: datetime
+
+
+class AdminStatusResponse(BaseModel):
+    admin_exists: bool
 
 
 class AccountDeletionRequest(BaseModel):

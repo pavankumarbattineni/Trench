@@ -2,6 +2,7 @@
 
 import { useState, type KeyboardEvent } from "react";
 import { ArrowUp, Square } from "lucide-react";
+import { toast } from "sonner";
 
 import { useAuth } from "@/components/auth-provider";
 import { Button } from "@/components/ui/button";
@@ -16,6 +17,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useConfig } from "@/hooks/use-config";
 import { useUpdateModel } from "@/hooks/use-update-model";
 import type { KnowledgeType } from "@/lib/chat";
+import { getErrorMessage } from "@/lib/errors";
 
 interface ChatComposerProps {
   /** True while a message is in flight but there's no active stream yet
@@ -54,6 +56,13 @@ export function ChatComposer({
   const modelItems: Record<string, string> = Object.fromEntries(
     (config?.llm_models ?? []).map((model) => [model.id, model.display_name])
   );
+
+  const handleModelChange = (value: string | null) => {
+    if (!value) return;
+    updateModel.mutate(value, {
+      onError: (err) => toast.error(getErrorMessage(err)),
+    });
+  };
 
   const handleSubmit = () => {
     const trimmed = query.trim();
@@ -126,19 +135,23 @@ export function ChatComposer({
           <Select
             items={modelItems}
             value={user?.model_id ?? undefined}
-            onValueChange={(value) => {
-              if (value) updateModel.mutate(value);
-            }}
+            onValueChange={handleModelChange}
           >
             <SelectTrigger size="sm" className="min-w-[13rem]">
               <SelectValue placeholder="Model" />
             </SelectTrigger>
             <SelectContent className="max-h-60">
-              {config.llm_models.map((model) => (
-                <SelectItem key={model.id} value={model.id}>
-                  {model.display_name}
-                </SelectItem>
-              ))}
+              {config.llm_models.map((model) => {
+                const unusable = model.requires_api_key && !model.has_credential;
+                return (
+                  <SelectItem key={model.id} value={model.id} disabled={unusable}>
+                    {model.display_name}
+                    {unusable && (
+                      <span className="text-muted-foreground"> (BYOK)</span>
+                    )}
+                  </SelectItem>
+                );
+              })}
             </SelectContent>
           </Select>
         )}

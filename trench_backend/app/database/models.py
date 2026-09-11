@@ -42,7 +42,7 @@ class BaseModel(Base):
 class User(BaseModel):
     """No firebase_uid: Firebase still owns identity/passwords, but a
     Trench user row is correlated to a Firebase account by email (see
-    UserService.get_or_create_user), not by storing Firebase's own UID."""
+    UserService.create_user), not by storing Firebase's own UID."""
 
     __tablename__ = "users"
 
@@ -52,6 +52,12 @@ class User(BaseModel):
     username: Mapped[str] = mapped_column(
         String(64), unique=True, nullable=False, index=True
     )
+    # The Trench *application* role -- "admin" | "user". Entirely separate
+    # from OrganizationMember.role (an org's own admin/member roles): a
+    # Trench admin can create organizations but isn't automatically an
+    # admin of any one of them, and vice versa (see UserService.create_user
+    # for how "admin" can ever be assigned -- never from a raw client value).
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     # The user's currently selected LLM, surfaced through GET /users/me.
     # Nullable: resolved lazily to the platform default the first time it
     # matters (see UserPreferenceService) rather than being required at

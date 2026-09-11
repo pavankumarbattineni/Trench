@@ -43,4 +43,5 @@ class UserProfileService:
             model_name=model.display_name if model else None,
             organization=organization,
             has_company_access=has_company_access,
+            role=user.role,
         )

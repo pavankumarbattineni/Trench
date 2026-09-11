@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 
 import { useAuth } from "@/components/auth-provider";
@@ -8,11 +8,15 @@ import {
   addMember,
   createOrganization,
   getMyOrganization,
-  grantKnowledgeAccess,
+  grantAllKnowledgeAccess,
   listMembers,
+  removeAllKnowledgeAccess,
+  removeAllMembers,
   removeMember,
   revokeKnowledgeAccess,
+  updateKnowledgeAccess,
   updateMemberRole,
+  type ListMembersParams,
   type OrganizationRole,
 } from "@/lib/organizations";
 import { getCurrentUser } from "@/lib/api";
@@ -32,11 +36,30 @@ export function useMyOrganization() {
   });
 }
 
-export function useOrganizationMembers(organizationId: string | undefined) {
+function membersQueryKey(organizationId: string | undefined, params: ListMembersParams) {
+  return ["organization", organizationId, "members", params] as const;
+}
+
+export function useOrganizationMembers(
+  organizationId: string | undefined,
+  params: ListMembersParams = {}
+) {
   return useQuery({
-    queryKey: ["organization", organizationId, "members"],
-    queryFn: () => listMembers(organizationId!),
+    queryKey: membersQueryKey(organizationId, params),
+    queryFn: () => listMembers(organizationId!, params),
     enabled: Boolean(organizationId),
+    // Keeps the previous page's rows on screen while a new page/search
+    // loads, instead of flashing a loading state on every keystroke/click.
+    placeholderData: keepPreviousData,
+  });
+}
+
+function invalidateMembers(
+  queryClient: ReturnType<typeof useQueryClient>,
+  organizationId: string
+) {
+  queryClient.invalidateQueries({
+    queryKey: ["organization", organizationId, "members"],
   });
 }
 
@@ -61,11 +84,7 @@ export function useAddMember(organizationId: string) {
   return useMutation({
     mutationFn: ({ username, role }: { username: string; role: OrganizationRole }) =>
       addMember(organizationId, username, role),
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["organization", organizationId, "members"],
-      });
-    },
+    onSuccess: () => invalidateMembers(queryClient, organizationId),
   });
 }
 
@@ -73,11 +92,7 @@ export function useRemoveMember(organizationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (userId: string) => removeMember(organizationId, userId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["organization", organizationId, "members"],
-      });
-    },
+    onSuccess: () => invalidateMembers(queryClient, organizationId),
   });
 }
 
@@ -86,11 +101,7 @@ export function useUpdateMemberRole(organizationId: string) {
   return useMutation({
     mutationFn: ({ userId, role }: { userId: string; role: OrganizationRole }) =>
       updateMemberRole(organizationId, userId, role),
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["organization", organizationId, "members"],
-      });
-    },
+    onSuccess: () => invalidateMembers(queryClient, organizationId),
   });
 }
 
@@ -99,12 +110,32 @@ export function useToggleKnowledgeAccess(organizationId: string) {
   return useMutation({
     mutationFn: ({ userId, grant }: { userId: string; grant: boolean }) =>
       grant
-        ? grantKnowledgeAccess(organizationId, userId)
+        ? updateKnowledgeAccess(organizationId, userId, true)
         : revokeKnowledgeAccess(organizationId, userId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["organization", organizationId, "members"],
-      });
-    },
+    onSuccess: () => invalidateMembers(queryClient, organizationId),
+  });
+}
+
+export function useRemoveAllKnowledgeAccess(organizationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => removeAllKnowledgeAccess(organizationId),
+    onSuccess: () => invalidateMembers(queryClient, organizationId),
+  });
+}
+
+export function useGrantAllKnowledgeAccess(organizationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => grantAllKnowledgeAccess(organizationId),
+    onSuccess: () => invalidateMembers(queryClient, organizationId),
+  });
+}
+
+export function useRemoveAllMembers(organizationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => removeAllMembers(organizationId),
+    onSuccess: () => invalidateMembers(queryClient, organizationId),
   });
 }

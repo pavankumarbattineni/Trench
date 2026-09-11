@@ -8,15 +8,10 @@ allowed to reach the vector store (see RetrievalService).
 
 import uuid
 
-from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import KnowledgeAccess, OrganizationMember
-
-_ACCESS_NOT_FOUND = HTTPException(
-    status.HTTP_404_NOT_FOUND, "That user doesn't have company-knowledge access"
-)
 
 
 class KnowledgeAccessService:
@@ -57,6 +52,10 @@ class KnowledgeAccessService:
         user_id: uuid.UUID,
         knowledge_type: str = "company",
     ) -> None:
+        """Revokes a grant if one exists. Idempotent: revoking a user who
+        was never granted access (or already revoked) is a no-op success,
+        not an error -- this is the "desired state" side of a toggle, not
+        a strict "delete this specific existing thing" operation."""
         result = await db.execute(
             select(KnowledgeAccess).where(
                 KnowledgeAccess.organization_id == organization_id,
@@ -66,9 +65,87 @@ class KnowledgeAccessService:
         )
         access = result.scalar_one_or_none()
         if access is None:
-            raise _ACCESS_NOT_FOUND
+            return
         await db.delete(access)
         await db.commit()
+
+    @staticmethod
+    async def revoke_all(
+        db: AsyncSession, *, organization_id: uuid.UUID, knowledge_type: str = "company"
+    ) -> int:
+        """Revokes every member's company-knowledge grant for an
+        organization in one shot. Never touches org admins' effective
+        access (that's derived from OrganizationMember.role, not from
+        these rows -- see `authorized_company_organization_id`), so this
+        never needs to special-case the owner.
+
+        Returns:
+            How many grants were revoked.
+        """
+        result = await db.execute(
+            delete(KnowledgeAccess)
+            .where(
+                KnowledgeAccess.organization_id == organization_id,
+                KnowledgeAccess.knowledge_type == knowledge_type,
+            )
+            .returning(KnowledgeAccess.id)
+        )
+        revoked_ids = result.scalars().all()
+        await db.commit()
+        return len(revoked_ids)
+
+    @staticmethod
+    async def grant_all(
+        db: AsyncSession, *, organization_id: uuid.UUID, knowledge_type: str = "company"
+    ) -> int:
+        """Grants company-knowledge access to every current member of the
+        organization in one shot -- creating a new grant, or reactivating
+        an existing inactive one, for whichever members aren't already
+        actively granted. Org admins are unaffected either way (their
+        access is derived from role, not a grant row), but granting them
+        one too is harmless.
+
+        Returns:
+            How many members were newly granted access (already-active
+            grants aren't re-counted).
+        """
+        member_ids_result = await db.execute(
+            select(OrganizationMember.user_id).where(
+                OrganizationMember.organization_id == organization_id
+            )
+        )
+        member_ids = [row[0] for row in member_ids_result.all()]
+        if not member_ids:
+            return 0
+
+        existing_result = await db.execute(
+            select(KnowledgeAccess).where(
+                KnowledgeAccess.organization_id == organization_id,
+                KnowledgeAccess.knowledge_type == knowledge_type,
+                KnowledgeAccess.user_id.in_(member_ids),
+            )
+        )
+        existing_by_user = {
+            access.user_id: access for access in existing_result.scalars().all()
+        }
+
+        granted = 0
+        for user_id in member_ids:
+            existing = existing_by_user.get(user_id)
+            if existing is None:
+                db.add(
+                    KnowledgeAccess(
+                        organization_id=organization_id,
+                        user_id=user_id,
+                        knowledge_type=knowledge_type,
+                    )
+                )
+                granted += 1
+            elif not existing.is_active:
+                existing.is_active = True
+                granted += 1
+        await db.commit()
+        return granted
 
     @staticmethod
     async def list_for_organization(

@@ -58,7 +58,11 @@ export default function SigninPage() {
         </>
       }
     >
-      <GoogleSignInButton onSuccess={handleAuthSuccess} onError={setFormError} />
+      <GoogleSignInButton
+        mode="signin"
+        onSuccess={handleAuthSuccess}
+        onError={setFormError}
+      />
 
       <AuthDivider />
 

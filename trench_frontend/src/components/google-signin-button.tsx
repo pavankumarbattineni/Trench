@@ -3,9 +3,9 @@
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { signInWithGoogle } from "@/lib/auth-service";
+import { signInWithGoogle, signUpWithGoogle } from "@/lib/auth-service";
 import { getErrorMessage } from "@/lib/errors";
-import type { UserProfile } from "@/lib/api";
+import type { SignupProfile, UserProfile } from "@/lib/api";
 
 function GoogleIcon() {
   return (
@@ -30,21 +30,36 @@ function GoogleIcon() {
   );
 }
 
-export function GoogleSignInButton({
-  onSuccess,
-  onError,
-}: {
-  onSuccess: (profile: UserProfile) => void;
-  onError: (message: string) => void;
-}) {
+type GoogleSignInButtonProps =
+  | {
+      /** Signs in an existing account -- rejects (with a clear error) an
+       * email that hasn't signed up yet. */
+      mode: "signin";
+      onSuccess: (profile: UserProfile) => void;
+      onError: (message: string) => void;
+    }
+  | {
+      /** Creates the account (if new) but does NOT log the user in --
+       * mirrors the email/password signup form's behavior. */
+      mode: "signup";
+      registerAsAdmin?: boolean;
+      onSuccess: (profile: SignupProfile) => void;
+      onError: (message: string) => void;
+    };
+
+export function GoogleSignInButton(props: GoogleSignInButtonProps) {
   const [loading, setLoading] = useState(false);
 
   const handleClick = async () => {
     setLoading(true);
     try {
-      onSuccess(await signInWithGoogle());
+      if (props.mode === "signup") {
+        props.onSuccess(await signUpWithGoogle(props.registerAsAdmin));
+      } else {
+        props.onSuccess(await signInWithGoogle());
+      }
     } catch (error) {
-      onError(getErrorMessage(error));
+      props.onError(getErrorMessage(error));
     } finally {
       setLoading(false);
     }

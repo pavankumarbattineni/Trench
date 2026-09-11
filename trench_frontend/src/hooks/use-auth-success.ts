@@ -6,10 +6,11 @@ import { useAuth } from "@/components/auth-provider";
 import type { UserProfile } from "@/lib/api";
 
 /**
- * Shared "an auth action just completed" handler: records the profile in
- * AuthProvider's state and goes straight to the main chat page -- there's
- * no intermediate landing step after signup/signin. Used identically after
- * email/password signup/signin and after Google sign-in, on both auth pages.
+ * "Signin just completed" handler: records the profile in AuthProvider's
+ * state and goes straight to the main chat page. Signin-only -- signup
+ * deliberately does NOT establish a session (see useSignupSuccess), so
+ * this is used only on the /signin page, for both email/password and
+ * "Continue with Google".
  */
 export function useAuthSuccess() {
   const router = useRouter();

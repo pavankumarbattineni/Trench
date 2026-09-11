@@ -43,7 +43,7 @@ export function MessageBubble({ message, onOpenCitations }: MessageBubbleProps) 
             {message.status === "interrupted" && (
               <div className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
                 <OctagonX className="size-3.5" />
-                Stopped before finishing.
+                <i>Trench Was Interrupted.</i>
               </div>
             )}
             {message.chunks.length > 0 && (

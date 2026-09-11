@@ -21,7 +21,11 @@ def _claims() -> dict:
 
 
 async def _login(client: AsyncClient) -> None:
+    """Signs up (idempotently -- a 409 for an already-registered email is
+    fine here) then signs in, since login no longer lazily creates a
+    user."""
     with patch("app.utils.firebase.verify_firebase_id_token", return_value=_claims()):
+        await client.post("/api/v1/auth/signup", json={"id_token": "fake"})
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
 
@@ -222,3 +226,110 @@ async def test_interrupt_marks_stream_interrupted(client: AsyncClient):
 
         final = await _wait_for_status(client, stream_id, "interrupted")
         assert final["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_second_message_includes_prior_turn_in_generation_context(
+    client: AsyncClient,
+):
+    """The agent must be genuinely conversational: a second turn's actual
+    generation call has to see both what was asked AND what the assistant
+    answered in the first turn, not just the new turn's bare query in
+    isolation (which is what caused a follow-up like "continue" to get a
+    contextless, unanswerable prompt)."""
+    await _login(client)
+    thread = (await client.post("/api/v1/threads")).json()
+
+    captured_calls = []
+
+    async def _capturing_stream_generate(resolved, *, system_prompt, messages):
+        captured_calls.append({"system_prompt": system_prompt, "messages": messages})
+        for word in ["Hello", " ", "there", "!"]:
+            yield word
+
+    with (
+        patch(
+            "app.service.llm_client_service.LLMClientService.stream_generate",
+            _capturing_stream_generate,
+        ),
+        patch("app.graph.rag_graph.RetrievalService.retrieve", _fake_retrieve),
+    ):
+        first = await client.post(
+            f"/api/v1/chat/threads/{thread['id']}/messages",
+            json={"query": "What's in my notes?", "knowledge_type": "personal"},
+        )
+        await _wait_for_status(client, first.json()["stream_id"], "completed")
+
+        second = await client.post(
+            f"/api/v1/chat/threads/{thread['id']}/messages",
+            json={"query": "continue", "knowledge_type": "personal"},
+        )
+        await _wait_for_status(client, second.json()["stream_id"], "completed")
+
+    # Distinguish the real `generate` node's call (its system prompt is the
+    # RAG assistant prompt) from `condense_query`'s separate rewrite call.
+    generate_calls = [
+        c for c in captured_calls if "knowledge assistant" in c["system_prompt"]
+    ]
+    assert len(generate_calls) == 2
+    second_turn_contents = [m["content"] for m in generate_calls[1]["messages"]]
+    assert "What's in my notes?" in second_turn_contents
+    assert "Hello there!" in second_turn_contents
+    assert second_turn_contents[-1] == "continue"
+
+
+@pytest.mark.asyncio
+async def test_continue_after_interruption_carries_partial_answer_forward(
+    client: AsyncClient,
+):
+    """After a turn is interrupted mid-stream, a follow-up "continue" must
+    still see the partial answer that was already given -- not treat the
+    interruption as if nothing had been said at all."""
+    await _login(client)
+    thread = (await client.post("/api/v1/threads")).json()
+
+    async def _slow_stream_generate(resolved, *, system_prompt, messages):
+        for word in ["Partial", " ", "answer"]:
+            await asyncio.sleep(0.05)
+            yield word
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            yield " more"
+
+    with (
+        patch(
+            "app.service.llm_client_service.LLMClientService.stream_generate",
+            _slow_stream_generate,
+        ),
+        patch("app.graph.rag_graph.RetrievalService.retrieve", _fake_retrieve),
+    ):
+        first = await client.post(
+            f"/api/v1/chat/threads/{thread['id']}/messages",
+            json={"query": "Tell me something long", "knowledge_type": "personal"},
+        )
+        stream_id = first.json()["stream_id"]
+
+        await asyncio.sleep(0.2)
+        interrupt_response = await client.delete(f"/api/v1/chat/streams/{stream_id}")
+        assert interrupt_response.status_code == 204
+        await _wait_for_status(client, stream_id, "interrupted")
+
+        captured_calls = []
+
+        async def _capturing_stream_generate(resolved, *, system_prompt, messages):
+            captured_calls.append(messages)
+            for word in ["Hello", " ", "there", "!"]:
+                yield word
+
+        with patch(
+            "app.service.llm_client_service.LLMClientService.stream_generate",
+            _capturing_stream_generate,
+        ):
+            second = await client.post(
+                f"/api/v1/chat/threads/{thread['id']}/messages",
+                json={"query": "continue", "knowledge_type": "personal"},
+            )
+            await _wait_for_status(client, second.json()["stream_id"], "completed")
+
+    generate_call_contents = [m["content"] for m in captured_calls[-1]]
+    assert any("Partial answer" in c for c in generate_call_contents)

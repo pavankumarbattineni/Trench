@@ -17,13 +17,69 @@ from app.database.session import get_db
 from app.router.deps import get_current_user
 from app.schemas.auth import (
     AccountDeletionRequest,
+    AdminStatusResponse,
     FirebaseSessionRequest,
     RefreshRequest,
+    SignupRequest,
+    SignupResponse,
     TokenResponse,
 )
 from app.service.auth_service import AuthService
+from app.service.user_service import UserService
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.get("/admin-status", response_model=AdminStatusResponse)
+async def admin_status(db: AsyncSession = Depends(get_db)) -> AdminStatusResponse:
+    """Whether a Trench administrator has already been registered.
+
+    Public (no auth required) -- lets the signup page decide whether to
+    offer the "register as administrator" option at all. This is a UX
+    convenience only: the backend independently re-checks the same
+    condition when signup actually happens, so hiding/showing this option
+    here is never the security boundary.
+    """
+    return AdminStatusResponse(admin_exists=await UserService.admin_exists(db))
+
+
+@router.post("/signup", response_model=SignupResponse)
+async def signup(
+    body: SignupRequest,
+    db: AsyncSession = Depends(get_db),
+) -> SignupResponse:
+    """Registers a new Trench user from a verified Firebase ID token.
+
+    Deliberately issues no session tokens -- signup and signin are separate
+    actions; the frontend sends the user to the sign-in page next rather
+    than logging them in immediately.
+
+    Args:
+        body: The Firebase ID token from the client's just-completed signup,
+            plus an optional username and an admin-registration request.
+        db: An active async SQLAlchemy session.
+
+    Returns:
+        The newly created user's profile (no tokens).
+
+    Raises:
+        HTTPException: 401 if the Firebase ID token is invalid; 409 if an
+            account already exists for this email, or the requested
+            username is taken.
+    """
+    user = await AuthService.signup(
+        db,
+        id_token=body.id_token,
+        username=body.username,
+        register_as_admin=body.register_as_admin,
+    )
+    return SignupResponse(
+        id=user.id,
+        email=user.email,
+        username=user.username,
+        role=user.role,
+        created_at=user.created_at,
+    )
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -34,13 +90,13 @@ async def login(
     """Exchanges a verified Firebase ID token for a Trench access/refresh
     token pair.
 
-    Verifies the Firebase ID token and lazily provisions the matching
-    Postgres user on first sign-in. The frontend calls GET /users/me
-    afterward to fetch the profile -- this endpoint returns tokens only.
+    Verifies the Firebase ID token and resolves the matching Postgres user
+    -- signin only, never creates one (see /auth/signup for that). The
+    frontend calls GET /users/me afterward to fetch the profile -- this
+    endpoint returns tokens only.
 
     Args:
-        body: The Firebase ID token obtained by the frontend after sign-in,
-            plus an optional username (used only on first sign-in).
+        body: The Firebase ID token obtained by the frontend after sign-in.
         db: An active async SQLAlchemy session.
 
     Returns:
@@ -48,11 +104,11 @@ async def login(
 
     Raises:
         HTTPException: 401 if the Firebase ID token is missing, invalid,
-            expired, or revoked; 409 if the requested username (on first
-            sign-in) is already taken.
+            expired, or revoked; 404 if no Trench account exists yet for
+            this email (sign up first).
     """
     _user, access_token, refresh_token = await AuthService.create_session(
-        db, body.id_token, body.username
+        db, body.id_token
     )
     return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
