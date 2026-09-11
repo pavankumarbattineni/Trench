@@ -1,4 +1,10 @@
-"""Business logic for provisioning and retrieving Trench's application users."""
+"""Business logic for provisioning and retrieving Trench's application users.
+
+Firebase still owns identity/passwords, but a Trench user row is now
+correlated to a Firebase account by email rather than Firebase UID (the
+`users` table has no firebase_uid column) -- email is Trench's own
+identity key, matching a typical "your email is your account" model.
+"""
 
 import secrets
 import uuid
@@ -28,15 +34,13 @@ class UserService:
         cls,
         db: AsyncSession,
         *,
-        firebase_uid: str,
         email: str,
         desired_username: str | None = None,
     ) -> User:
-        """Looks up a user by Firebase UID, creating one on first sign-in (lazy upsert).
+        """Looks up a user by email, creating one on first sign-in (lazy upsert).
 
         Args:
             db: An active async SQLAlchemy session.
-            firebase_uid: The Firebase Authentication UID from a verified ID token.
             email: The user's email address, as claimed by Firebase.
             desired_username: A username the frontend collected at signup (e.g. the
                 email/password signup form). Only used the first time a user is
@@ -51,27 +55,18 @@ class UserService:
             HTTPException: 409 if `desired_username` is already taken.
             RuntimeError: If no unique generated username could be allocated.
         """
-        result = await db.execute(select(User).where(User.firebase_uid == firebase_uid))
+        result = await db.execute(select(User).where(User.email == email))
         user = result.scalar_one_or_none()
-
         if user is not None:
-            if user.email != email:
-                user.email = email
-                await db.commit()
             return user
 
         if desired_username is not None:
-            return await cls._create_user(
-                db, firebase_uid=firebase_uid, email=email, username=desired_username
-            )
+            return await cls._create_user(db, email=email, username=desired_username)
 
         for candidate_username in cls._generated_username_candidates(email):
             try:
                 return await cls._create_user(
-                    db,
-                    firebase_uid=firebase_uid,
-                    email=email,
-                    username=candidate_username,
+                    db, email=email, username=candidate_username
                 )
             except HTTPException:
                 continue
@@ -79,10 +74,8 @@ class UserService:
         raise RuntimeError(f"Could not allocate a unique username for {email}")
 
     @staticmethod
-    async def _create_user(
-        db: AsyncSession, *, firebase_uid: str, email: str, username: str
-    ) -> User:
-        user = User(firebase_uid=firebase_uid, email=email, username=username)
+    async def _create_user(db: AsyncSession, *, email: str, username: str) -> User:
+        user = User(email=email, username=username)
         db.add(user)
         try:
             await db.commit()
@@ -104,4 +97,9 @@ class UserService:
             The User row, or None if not found.
         """
         result = await db.execute(select(User).where(User.id == user_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_username(db: AsyncSession, username: str) -> User | None:
+        result = await db.execute(select(User).where(User.username == username))
         return result.scalar_one_or_none()

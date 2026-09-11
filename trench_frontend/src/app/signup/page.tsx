@@ -12,6 +12,7 @@ import { GoogleSignInButton } from "@/components/google-signin-button";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { PasswordInput } from "@/components/ui/password-input";
 import { useAuthSuccess } from "@/hooks/use-auth-success";
 import { signUp } from "@/lib/auth-service";
 import { getErrorMessage } from "@/lib/errors";
@@ -92,9 +93,8 @@ export default function SignupPage() {
         </div>
         <div className="space-y-2">
           <Label htmlFor="password">Password</Label>
-          <Input
+          <PasswordInput
             id="password"
-            type="password"
             autoComplete="new-password"
             {...register("password")}
           />
@@ -104,9 +104,8 @@ export default function SignupPage() {
         </div>
         <div className="space-y-2">
           <Label htmlFor="confirmPassword">Confirm password</Label>
-          <Input
+          <PasswordInput
             id="confirmPassword"
-            type="password"
             autoComplete="new-password"
             {...register("confirmPassword")}
           />

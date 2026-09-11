@@ -16,6 +16,18 @@ _ALLOWED_MIME_TYPES = {
     "text/markdown",
 }
 
+_DOCUMENT_TYPE_BY_MIME = {
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "text/plain": "txt",
+    "text/markdown": "md",
+}
+
+
+def document_type_for(mime_type: str) -> str:
+    """Maps a sniffed mime type to the short category stored on Document."""
+    return _DOCUMENT_TYPE_BY_MIME[mime_type]
+
 
 def _sniff_mime_type(filename: str, content: bytes) -> str | None:
     if content.startswith(b"%PDF-"):

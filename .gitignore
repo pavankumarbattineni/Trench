@@ -24,3 +24,6 @@ trench_frontend/.env.local
 # Playwright MCP review artifacts (screenshots, snapshots, console logs)
 .playwright-mcp/
 /*.png
+
+# LangGraph dev server local cache (langgraph.json / `langgraph dev`)
+trench_backend/.langgraph_api/

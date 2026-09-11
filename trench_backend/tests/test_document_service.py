@@ -5,18 +5,17 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.database.models import Document, KnowledgeBase, UsageCounter, User
+from app.database.models import Document, UsageCounter, User
 from app.database.session import async_session_factory
 from app.service.credential_service import CredentialService
 from app.service.document_service import DocumentService
 from app.service.document_storage_service import LocalFilesystemStorageProvider
 
-TEST_FIREBASE_UID_PREFIX = "test-documents"
+TEST_EMAIL_PREFIX = "test-documents"
 
 
 async def _make_user(session, suffix: str) -> User:
     user = User(
-        firebase_uid=f"{TEST_FIREBASE_UID_PREFIX}-{suffix}",
         email=f"test-documents-{suffix}@example.com",
         username=f"test_documents_{suffix}",
     )
@@ -34,11 +33,24 @@ def _local_storage(tmp_path: Path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_ingestion(monkeypatch):
+    """upload_document fires a real background asyncio task for ingestion
+    -- these tests are about upload/list/get/delete business logic, not
+    the ingestion pipeline (see test_document_ingestion_service.py), so
+    replace it with a no-op to avoid real Pinecone/LlamaParse calls."""
+
+    async def _noop(document_id) -> None:
+        return None
+
+    monkeypatch.setattr(DocumentService, "_run_ingestion", staticmethod(_noop))
+
+
+@pytest.fixture(autouse=True)
 async def cleanup():
     yield
     async with async_session_factory() as session:
         result = await session.execute(
-            select(User).where(User.firebase_uid.like(f"{TEST_FIREBASE_UID_PREFIX}%"))
+            select(User).where(User.email.like(f"{TEST_EMAIL_PREFIX}%"))
         )
         for user in result.scalars().all():
             await session.delete(user)
@@ -46,7 +58,7 @@ async def cleanup():
 
 
 @pytest.mark.asyncio
-async def test_upload_creates_pending_document_and_default_knowledge_base(tmp_path):
+async def test_upload_creates_pending_document(tmp_path):
     async with async_session_factory() as session:
         user = await _make_user(session, "upload")
 
@@ -56,18 +68,14 @@ async def test_upload_creates_pending_document_and_default_knowledge_base(tmp_pa
                 user=user,
                 filename="notes.txt",
                 content=b"hello knowledge base",
-                chunking_strategy="recursive",
-                chunk_size=512,
             )
 
         assert document.status == "pending"
         assert document.mime_type == "text/plain"
-
-        kb_result = await session.execute(
-            select(KnowledgeBase).where(KnowledgeBase.user_id == user.id)
-        )
-        kb = kb_result.scalar_one()
-        assert kb.embedding_model == "BAAI/bge-small-en-v1.5"
+        assert document.document_type == "txt"
+        assert document.knowledge_type == "personal"
+        assert document.knowledge_base == "own"
+        assert document.file_size == len(b"hello knowledge base")
 
         stored_path = tmp_path / document.storage_path
         assert stored_path.read_bytes() == b"hello knowledge base"
@@ -80,20 +88,10 @@ async def test_duplicate_upload_short_circuits_without_new_row(tmp_path):
 
         with _local_storage(tmp_path):
             first = await DocumentService.upload_document(
-                session,
-                user=user,
-                filename="a.txt",
-                content=b"same content",
-                chunking_strategy="recursive",
-                chunk_size=512,
+                session, user=user, filename="a.txt", content=b"same content"
             )
             second = await DocumentService.upload_document(
-                session,
-                user=user,
-                filename="b.txt",
-                content=b"same content",
-                chunking_strategy="recursive",
-                chunk_size=512,
+                session, user=user, filename="b.txt", content=b"same content"
             )
 
         assert first.id == second.id
@@ -113,12 +111,7 @@ async def test_upload_blocked_at_free_tier_limit_without_pinecone_credential():
 
         with pytest.raises(HTTPException) as exc_info:
             await DocumentService.upload_document(
-                session,
-                user=user,
-                filename="one-more.txt",
-                content=b"over the limit",
-                chunking_strategy="recursive",
-                chunk_size=512,
+                session, user=user, filename="one-more.txt", content=b"over the limit"
             )
         assert exc_info.value.status_code == 403
 
@@ -147,10 +140,49 @@ async def test_upload_allowed_past_limit_with_pinecone_credential(tmp_path):
                 user=user,
                 filename="past-limit.txt",
                 content=b"allowed via byok",
-                chunking_strategy="recursive",
-                chunk_size=512,
             )
         assert document.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_upload_blocked_while_another_document_is_processing(tmp_path):
+    async with async_session_factory() as session:
+        user = await _make_user(session, "concurrent")
+
+        with _local_storage(tmp_path):
+            first = await DocumentService.upload_document(
+                session, user=user, filename="first.txt", content=b"first content"
+            )
+        assert first.status == "pending"
+
+        with (
+            _local_storage(tmp_path),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await DocumentService.upload_document(
+                session, user=user, filename="second.txt", content=b"second content"
+            )
+        assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_upload_allowed_again_once_prior_document_completed(tmp_path):
+    async with async_session_factory() as session:
+        user = await _make_user(session, "sequential")
+
+        with _local_storage(tmp_path):
+            first = await DocumentService.upload_document(
+                session, user=user, filename="first.txt", content=b"first content"
+            )
+        first.status = "completed"
+        await session.commit()
+
+        with _local_storage(tmp_path):
+            second = await DocumentService.upload_document(
+                session, user=user, filename="second.txt", content=b"second content"
+            )
+        assert second.status == "pending"
+        assert second.id != first.id
 
 
 @pytest.mark.asyncio
@@ -160,22 +192,41 @@ async def test_delete_removes_row_and_file(tmp_path):
 
         with _local_storage(tmp_path):
             document = await DocumentService.upload_document(
-                session,
-                user=user,
-                filename="to-delete.txt",
-                content=b"temporary",
-                chunking_strategy="recursive",
-                chunk_size=512,
+                session, user=user, filename="to-delete.txt", content=b"temporary"
             )
             stored_path = tmp_path / document.storage_path
             assert stored_path.exists()
 
+            # delete_document refuses to remove a pending/processing
+            # document (it would race the background ingestion task) -- so
+            # move it to a terminal status first, as real ingestion would.
+            document.status = "completed"
+            await session.commit()
+
             await DocumentService.delete_document(
-                session, user_id=user.id, document_id=document.id
+                session, user=user, document_id=document.id
             )
 
         assert not stored_path.exists()
         with pytest.raises(HTTPException):
             await DocumentService.get_document(
-                session, user_id=user.id, document_id=document.id
+                session, user=user, document_id=document.id
             )
+
+
+@pytest.mark.asyncio
+async def test_personal_document_not_visible_to_another_user(tmp_path):
+    async with async_session_factory() as session:
+        owner = await _make_user(session, "owner")
+        other = await _make_user(session, "other")
+
+        with _local_storage(tmp_path):
+            document = await DocumentService.upload_document(
+                session, user=owner, filename="private.txt", content=b"owner only"
+            )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await DocumentService.get_document(
+                session, user=other, document_id=document.id
+            )
+        assert exc_info.value.status_code == 404

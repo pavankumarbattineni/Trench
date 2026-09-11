@@ -7,7 +7,8 @@ import type { UserProfile } from "@/lib/api";
 
 /**
  * Shared "an auth action just completed" handler: records the profile in
- * AuthProvider's state and returns to the home page. Used identically after
+ * AuthProvider's state and goes straight to the main chat page -- there's
+ * no intermediate landing step after signup/signin. Used identically after
  * email/password signup/signin and after Google sign-in, on both auth pages.
  */
 export function useAuthSuccess() {
@@ -16,6 +17,6 @@ export function useAuthSuccess() {
 
   return (profile: UserProfile) => {
     setUser(profile);
-    router.push("/");
+    router.push("/chat");
   };
 }

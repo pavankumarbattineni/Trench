@@ -12,6 +12,7 @@ import { GoogleSignInButton } from "@/components/google-signin-button";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { PasswordInput } from "@/components/ui/password-input";
 import { useAuthSuccess } from "@/hooks/use-auth-success";
 import { signIn } from "@/lib/auth-service";
 import { getErrorMessage } from "@/lib/errors";
@@ -79,9 +80,8 @@ export default function SigninPage() {
               Forgot password?
             </Link>
           </div>
-          <Input
+          <PasswordInput
             id="password"
-            type="password"
             autoComplete="current-password"
             {...register("password")}
           />

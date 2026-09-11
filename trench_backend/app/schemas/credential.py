@@ -3,12 +3,9 @@ from datetime import datetime
 from pydantic import BaseModel
 
 VALID_PROVIDER_TYPES = {
-    "llamaparse",
-    "openai_embed",
     "openai_llm",
     "anthropic_llm",
     "gemini_llm",
-    "cohere_rerank",
     "pinecone",
 }
 

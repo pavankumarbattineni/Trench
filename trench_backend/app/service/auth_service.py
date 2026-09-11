@@ -84,10 +84,7 @@ class AuthService:
         """
         claims = cls.verify_firebase_token(id_token)
         user = await UserService.get_or_create_user(
-            db,
-            firebase_uid=claims["uid"],
-            email=claims["email"],
-            desired_username=username,
+            db, email=claims["email"], desired_username=username
         )
         return user, create_access_token(user.id), create_refresh_token(user.id)
 
@@ -169,13 +166,14 @@ class AuthService:
             id_token: A freshly issued Firebase ID token proving recent auth.
 
         Raises:
-            HTTPException: 403 if the token belongs to a different account,
+            HTTPException: 403 if the token belongs to a different account
+                (matched by email -- Trench has no stored Firebase UID),
                 401 if the token is stale, 500 if Firebase deletion fails
                 after Postgres data was already removed.
         """
         claims = cls.verify_firebase_token(id_token)
 
-        if claims["uid"] != current_user.firebase_uid:
+        if claims["email"] != current_user.email:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "Token does not match this account"
             )
@@ -185,7 +183,7 @@ class AuthService:
         if age_seconds > _RECENT_LOGIN_WINDOW_SECONDS:
             raise _RECENT_LOGIN_REQUIRED
 
-        firebase_uid = current_user.firebase_uid
+        firebase_uid = claims["uid"]
         await db.delete(current_user)
         await db.commit()
 

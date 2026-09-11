@@ -1,0 +1,10 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "trench_rag": {
+      "path": "./app/graph/rag_graph.py:graph",
+      "description": "Trench's RAG chat workflow: load thread state -> validate knowledge access -> (denied -> persist) | (condense query -> hybrid retrieve -> generate -> build citations -> persist)."
+    }
+  },
+  "env": ".env"
+}

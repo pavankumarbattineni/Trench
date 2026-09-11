@@ -2,13 +2,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.database.models import (
-    Document,
-    DocumentChunk,
-    KnowledgeBase,
-    UsageCounter,
-    User,
-)
+from app.database.models import Document, UsageCounter, User
 from app.database.session import async_session_factory
 
 
@@ -17,40 +11,36 @@ async def cleanup():
     yield
     async with async_session_factory() as session:
         result = await session.execute(
-            select(User).where(User.firebase_uid.like("test-rag-models%"))
+            select(User).where(User.email.like("test-rag-models%"))
         )
         for user in result.scalars().all():
             await session.delete(user)
         await session.commit()
 
 
+async def _make_user(session, suffix: str) -> User:
+    user = User(
+        email=f"test-rag-models-{suffix}@example.com",
+        username=f"test_rag_models_{suffix}",
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 @pytest.mark.asyncio
-async def test_knowledge_base_document_and_chunk_cascade():
+async def test_document_cascades_on_user_delete():
     async with async_session_factory() as session:
-        user = User(
-            firebase_uid="test-rag-models-uid",
-            email="test-rag-models@example.com",
-            username="test_rag_models",
-        )
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
-
-        kb = KnowledgeBase(user_id=user.id)
-        session.add(kb)
-        await session.commit()
-        await session.refresh(kb)
-
-        assert kb.embedding_dimensions == 384
-        assert kb.vector_store_provider == "pinecone"
+        user = await _make_user(session, "cascade")
 
         document = Document(
             user_id=user.id,
-            knowledge_base_id=kb.id,
-            filename="notes.md",
-            storage_path="users/x/notes.md",
+            document_name="notes.md",
+            document_type="md",
             mime_type="text/markdown",
-            file_size_bytes=1024,
+            storage_path="personal/x/notes.md",
+            file_size=1024,
             content_hash="a" * 64,
         )
         session.add(document)
@@ -58,55 +48,38 @@ async def test_knowledge_base_document_and_chunk_cascade():
         await session.refresh(document)
 
         assert document.status == "pending"
-
-        chunk = DocumentChunk(
-            document_id=document.id,
-            knowledge_base_id=kb.id,
-            chunk_index=0,
-            content="hello world",
-            token_count=2,
-        )
-        session.add(chunk)
-        await session.commit()
+        assert document.knowledge_type == "personal"
+        assert document.knowledge_base == "own"
+        assert document.chunk_count == 0
 
         counter = UsageCounter(user_id=user.id, documents_uploaded_count=1)
         session.add(counter)
         await session.commit()
 
-        # Deleting the user cascades through knowledge_base -> document -> chunk.
+        # Deleting the user cascades through documents.
         await session.delete(user)
         await session.commit()
 
-        remaining_chunks = await session.execute(select(DocumentChunk))
-        assert remaining_chunks.scalars().all() == []
+        remaining = await session.execute(
+            select(Document).where(Document.id == document.id)
+        )
+        assert remaining.scalar_one_or_none() is None
 
 
 @pytest.mark.asyncio
 async def test_document_content_hash_unique_per_user():
     async with async_session_factory() as session:
-        user = User(
-            firebase_uid="test-rag-models-uid-2",
-            email="test-rag-models-2@example.com",
-            username="test_rag_models_2",
-        )
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
-
-        kb = KnowledgeBase(user_id=user.id)
-        session.add(kb)
-        await session.commit()
-        await session.refresh(kb)
+        user = await _make_user(session, "dup")
 
         dup_hash = "b" * 64
         session.add(
             Document(
                 user_id=user.id,
-                knowledge_base_id=kb.id,
-                filename="a.txt",
-                storage_path="a",
+                document_name="a.txt",
+                document_type="txt",
                 mime_type="text/plain",
-                file_size_bytes=10,
+                storage_path="a",
+                file_size=10,
                 content_hash=dup_hash,
             )
         )
@@ -115,11 +88,11 @@ async def test_document_content_hash_unique_per_user():
         session.add(
             Document(
                 user_id=user.id,
-                knowledge_base_id=kb.id,
-                filename="b.txt",
-                storage_path="b",
+                document_name="b.txt",
+                document_type="txt",
                 mime_type="text/plain",
-                file_size_bytes=10,
+                storage_path="b",
+                file_size=10,
                 content_hash=dup_hash,
             )
         )

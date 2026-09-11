@@ -14,8 +14,9 @@ import {
 } from "firebase/auth";
 
 import {
-  createSession,
   deleteAccountSession,
+  getCurrentUser,
+  loginWithFirebase,
   logoutSession,
   type UserProfile,
 } from "@/lib/api";
@@ -23,7 +24,8 @@ import { firebaseAuth, googleProvider } from "@/lib/firebase";
 
 async function establishSession(user: FirebaseUser, username?: string): Promise<UserProfile> {
   const idToken = await user.getIdToken();
-  return createSession(idToken, username);
+  await loginWithFirebase(idToken, username);
+  return getCurrentUser();
 }
 
 export async function signUp(
@@ -46,7 +48,7 @@ export async function signInWithGoogle(): Promise<UserProfile> {
 }
 
 export async function signOutEverywhere(): Promise<void> {
-  await logoutSession();
+  logoutSession();
   await firebaseSignOut(firebaseAuth);
 }
 
@@ -92,6 +94,7 @@ export async function changePassword(
 async function finishAccountDeletion(user: FirebaseUser): Promise<void> {
   const idToken = await user.getIdToken(true);
   await deleteAccountSession(idToken);
+  logoutSession();
   await firebaseSignOut(firebaseAuth);
 }
 

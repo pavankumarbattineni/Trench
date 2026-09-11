@@ -13,7 +13,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base
@@ -40,55 +40,135 @@ class BaseModel(Base):
 
 
 class User(BaseModel):
+    """No firebase_uid: Firebase still owns identity/passwords, but a
+    Trench user row is correlated to a Firebase account by email (see
+    UserService.get_or_create_user), not by storing Firebase's own UID."""
+
     __tablename__ = "users"
 
-    firebase_uid: Mapped[str] = mapped_column(
-        String(128), unique=True, nullable=False, index=True
-    )
     email: Mapped[str] = mapped_column(
         String(255), unique=True, nullable=False, index=True
     )
     username: Mapped[str] = mapped_column(
         String(64), unique=True, nullable=False, index=True
     )
+    # The user's currently selected LLM, surfaced through GET /users/me.
+    # Nullable: resolved lazily to the platform default the first time it
+    # matters (see UserPreferenceService) rather than being required at
+    # signup. Embedding/chunking are fixed, code-level choices now (see
+    # EmbeddingService/ChunkingService) -- not user-selectable, so there's
+    # no equivalent column for either.
+    model_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("provider_models.id"), nullable=True
+    )
 
 
-class KnowledgeBase(BaseModel):
-    __tablename__ = "knowledge_bases"
+class Organization(BaseModel):
+    """An organization's identity is its email domain (see
+    app/utils/email_domain.py) -- derived from its creator's email at
+    creation time, never user-entered directly, and used to gate which
+    users can subsequently be added as members."""
 
+    __tablename__ = "organizations"
+
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    domain: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    # The creator, permanently -- unlike role="admin" (which any admin can
+    # grant/revoke on any other member), the owner can never be changed,
+    # downgraded, or removed by anyone, including other admins. See
+    # OrganizationService.require_not_owner.
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+
+
+class OrganizationMember(BaseModel):
+    """A user's membership in an organization.
+
+    A user belongs to at most one organization (enforced by the unique
+    constraint on user_id alone), so "the user's organization" is always an
+    unambiguous single lookup -- no need to disambiguate which org a
+    `knowledge_type=company` request refers to.
+    """
+
+    __tablename__ = "organization_members"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_organization_members_user"),)
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
-    name: Mapped[str] = mapped_column(
-        String(128), nullable=False, default="My Knowledge Base"
+    # "admin" | "member"
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")
+
+
+class KnowledgeAccess(BaseModel):
+    """Grants a user permission to query an organization's company knowledge.
+
+    Membership in an organization does not itself grant company-knowledge
+    access -- that must be explicitly granted by an org admin. The
+    knowledge_type column is forward-looking (currently always "company";
+    personal knowledge needs no grant since ownership is the check).
+    """
+
+    __tablename__ = "knowledge_access"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "user_id",
+            "knowledge_type",
+            name="uq_knowledge_access_org_user_type",
+        ),
     )
-    embedding_provider: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="local"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
-    embedding_model: Mapped[str] = mapped_column(
-        String(128), nullable=False, default="BAAI/bge-small-en-v1.5"
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
-    embedding_dimensions: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=384
+    knowledge_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="company"
     )
-    # Pinecone for both tiers -- operator-owned project/index for free
-    # users, the user's own credentials/index once they BYOK. See
-    # docs/superpowers/specs/2026-09-10-agentic-rag-design.md.
-    vector_store_provider: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="pinecone"
-    )
-    vector_store_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    is_locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class Document(BaseModel):
+    """No chunk_strategy_id/embedding_model_id/chunk_size: chunking and
+    embedding are fixed, code-level choices (see ChunkingService,
+    EmbeddingService), not per-document configuration. No chunk rows
+    either -- each chunk's text and dense+sparse vectors live only in
+    Pinecone (see VectorStoreService), keyed by a deterministic
+    f"{document_id}:{chunk_index}" id so a delete can reconstruct exactly
+    which vectors to purge from `chunk_count` alone.
+    """
+
     __tablename__ = "documents"
     __table_args__ = (
         UniqueConstraint(
             "user_id", "content_hash", name="uq_documents_user_content_hash"
+        ),
+        # Ignored for personal documents (organization_id is NULL there, and
+        # Postgres treats NULLs as distinct) -- this only dedupes company
+        # documents re-uploaded by a different org admin than the original
+        # uploader, which the per-user constraint above wouldn't catch.
+        UniqueConstraint(
+            "organization_id",
+            "content_hash",
+            name="uq_documents_organization_content_hash",
         ),
     )
 
@@ -98,49 +178,41 @@ class Document(BaseModel):
         nullable=False,
         index=True,
     )
-    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(
+    # Set only for knowledge_type="company" documents -- the organization
+    # this document's company knowledge belongs to (and the vector store
+    # namespace it's indexed under). NULL for personal documents.
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
         index=True,
     )
-    filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    storage_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    document_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Friendly category derived from the sniffed content type at upload
+    # time ("pdf" | "docx" | "txt" | "md") -- mime_type is kept alongside
+    # it for storage/serving purposes.
+    document_type: Mapped[str] = mapped_column(String(16), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
-    file_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_size: Mapped[int] = mapped_column(Integer, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    chunking_strategy: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="recursive"
+    # "company" | "personal"
+    knowledge_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="personal"
     )
-    chunk_size: Mapped[int] = mapped_column(Integer, nullable=False, default=512)
+    # "default" (the org's shared company base) | "own" (a user's personal
+    # base). Currently fully determined by knowledge_type (company->default,
+    # personal->own) but kept as its own column so future sub-scopes (e.g.
+    # per-department company bases) don't require a Document schema change.
+    knowledge_base: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="own"
+    )
     chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-
-
-class DocumentChunk(BaseModel):
-    __tablename__ = "document_chunks"
-
-    document_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("documents.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    token_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    # No embedding column -- the vector lives only in Pinecone, keyed by
-    # this row's own id. Postgres never stores embeddings.
 
 
 class UsageCounter(Base):
@@ -162,12 +234,13 @@ class Provider(BaseModel):
 
 
 class ProviderModel(BaseModel):
-    """A specific model offered by a Provider.
+    """A specific chat/LLM model offered by a Provider.
 
-    All model configuration Trench's code needs (which model is the
-    platform default for a given purpose, embedding dimensions, etc.) is
-    read from this table -- never hardcoded as a string literal in
-    application code.
+    All LLM configuration Trench's code needs (which model is the platform
+    default, etc.) is read from this table -- never hardcoded as a string
+    literal in application code. Embedding/rerank models are NOT stored
+    here -- both are fixed, code-level choices (see EmbeddingService),
+    since Trench doesn't offer per-user embedding/rerank selection.
     """
 
     __tablename__ = "provider_models"
@@ -175,12 +248,13 @@ class ProviderModel(BaseModel):
         UniqueConstraint(
             "provider_id", "model_name", name="uq_provider_models_provider_model"
         ),
-        # At most one platform default per model_type (the partial index
-        # only covers rows where is_platform_default is true, so it
-        # enforces "one default per type" rather than global uniqueness).
+        # At most one platform default (the partial index only covers rows
+        # where is_platform_default is true, so it enforces "one default"
+        # rather than global uniqueness). Only "llm" models exist in this
+        # table now, so there's no need to scope the uniqueness by type.
         Index(
-            "uq_provider_models_default_per_type",
-            "model_type",
+            "uq_provider_models_default",
+            "is_platform_default",
             unique=True,
             postgresql_where=text("is_platform_default"),
         ),
@@ -192,11 +266,8 @@ class ProviderModel(BaseModel):
         nullable=False,
         index=True,
     )
-    # "llm" | "embedding" | "rerank" | "parsing"
-    model_type: Mapped[str] = mapped_column(String(16), nullable=False)
     model_name: Mapped[str] = mapped_column(String(128), nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_platform_default: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
@@ -217,10 +288,41 @@ class UserCredential(BaseModel):
         nullable=False,
         index=True,
     )
-    # llamaparse | openai_embed | openai_llm | anthropic_llm | gemini_llm |
-    # cohere_rerank | pinecone
+    # openai_llm | anthropic_llm | gemini_llm | pinecone
     provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
     encrypted_credential: Mapped[str] = mapped_column(Text, nullable=False)
     validated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class Thread(BaseModel):
+    __tablename__ = "threads"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class ChatHistory(BaseModel):
+    __tablename__ = "chat_history"
+
+    thread_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("threads.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # "user" | "assistant"
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Retrieved chunks/citation metadata behind this response -- e.g.
+    # [{"document_id", "document_name", "chunk_index", "content", "score"}].
+    # Empty for user-role rows.
+    chunks: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # "pending" | "running" | "completed" | "failed" | "interrupted"
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="completed")

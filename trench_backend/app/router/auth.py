@@ -1,106 +1,106 @@
-"""Authentication endpoints: session exchange, refresh, logout, account deletion."""
+"""Authentication endpoints: session exchange, refresh, account deletion.
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+Bearer-token auth, mirroring abyss_backend/abyss_frontend exactly: no
+cookies, no server-side session -- the frontend receives an access/refresh
+token pair in the response body, stores them itself, and attaches
+`Authorization: Bearer <access_token>` on every subsequent request. There's
+nothing for the backend to invalidate on "logout"; that's handled entirely
+client-side (clear the stored tokens, sign out of Firebase), so there's no
+corresponding endpoint here.
+"""
+
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import User
 from app.database.session import get_db
 from app.router.deps import get_current_user
-from app.schemas.auth import AccountDeletionRequest, FirebaseSessionRequest
-from app.schemas.user import UserResponse
-from app.service.auth_service import AuthService
-from app.utils.cookies import (
-    REFRESH_TOKEN_COOKIE,
-    clear_auth_cookies,
-    set_auth_cookies,
+from app.schemas.auth import (
+    AccountDeletionRequest,
+    FirebaseSessionRequest,
+    RefreshRequest,
+    TokenResponse,
 )
+from app.service.auth_service import AuthService
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/session", response_model=UserResponse)
-async def create_session(
+@router.post("/login", response_model=TokenResponse)
+async def login(
     body: FirebaseSessionRequest,
-    response: Response,
     db: AsyncSession = Depends(get_db),
-) -> User:
-    """Exchanges a verified Firebase ID token for a Trench session.
+) -> TokenResponse:
+    """Exchanges a verified Firebase ID token for a Trench access/refresh
+    token pair.
 
-    Verifies the Firebase ID token, lazily provisions the matching Postgres
-    user on first sign-in, and sets httpOnly access/refresh token cookies.
+    Verifies the Firebase ID token and lazily provisions the matching
+    Postgres user on first sign-in. The frontend calls GET /users/me
+    afterward to fetch the profile -- this endpoint returns tokens only.
 
     Args:
         body: The Firebase ID token obtained by the frontend after sign-in,
             plus an optional username (used only on first sign-in).
-        response: Used to set the resulting auth cookies.
         db: An active async SQLAlchemy session.
 
     Returns:
-        The authenticated user's profile.
+        A fresh access_token/refresh_token pair.
+
+    Raises:
+        HTTPException: 401 if the Firebase ID token is missing, invalid,
+            expired, or revoked; 409 if the requested username (on first
+            sign-in) is already taken.
     """
-    user, access_token, refresh_token = await AuthService.create_session(
+    _user, access_token, refresh_token = await AuthService.create_session(
         db, body.id_token, body.username
     )
-    set_auth_cookies(response, access_token, refresh_token)
-    return user
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
 
-@router.post("/refresh", response_model=UserResponse)
+@router.post("/refresh", response_model=TokenResponse)
 async def refresh_session(
-    request: Request,
-    response: Response,
+    body: RefreshRequest,
     db: AsyncSession = Depends(get_db),
-) -> User:
-    """Rotates the refresh_token cookie into a fresh access/refresh pair.
+) -> TokenResponse:
+    """Rotates a refresh_token into a fresh access/refresh pair.
 
     Args:
-        request: Read for its refresh_token cookie.
-        response: Used to set the rotated auth cookies.
+        body: The refresh_token the frontend currently holds.
         db: An active async SQLAlchemy session.
 
     Returns:
-        The authenticated user's profile.
+        A fresh access_token/refresh_token pair.
+
+    Raises:
+        HTTPException: 401 if the refresh_token is missing, invalid, or
+            belongs to a missing/inactive user.
     """
-    token = request.cookies.get(REFRESH_TOKEN_COOKIE)
-    try:
-        user, access_token, refresh_token = await AuthService.refresh_session(db, token)
-    except HTTPException:
-        clear_auth_cookies(response)
-        raise
-    set_auth_cookies(response, access_token, refresh_token)
-    return user
+    _user, access_token, refresh_token = await AuthService.refresh_session(
+        db, body.refresh_token
+    )
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(response: Response) -> None:
-    """Clears Trench's auth cookies for this browser.
-
-    There is no server-side session to invalidate (tokens are stateless
-    JWTs); the frontend also signs out of Firebase separately.
-
-    Args:
-        response: Used to clear the auth cookies.
-    """
-    clear_auth_cookies(response)
-
-
-@router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/account", status_code=204)
 async def delete_account(
     body: AccountDeletionRequest,
-    response: Response,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Permanently deletes the authenticated user's account.
 
     Requires a freshly issued Firebase ID token as proof of recent
-    authentication, in addition to a valid Trench session.
+    authentication, in addition to a valid Trench access token.
 
     Args:
         body: A freshly issued Firebase ID token for the same account.
-        response: Used to clear the auth cookies once deletion succeeds.
         current_user: The authenticated user requesting deletion.
         db: An active async SQLAlchemy session.
+
+    Raises:
+        HTTPException: 401 if not authenticated, or if the Firebase token
+            isn't recent enough; 403 if the token belongs to a different
+            account (matched by email); 500 if Postgres data was deleted
+            but removing the Firebase identity itself failed.
     """
     await AuthService.delete_account(db, current_user, body.id_token)
-    clear_auth_cookies(response)

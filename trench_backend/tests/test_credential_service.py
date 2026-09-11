@@ -28,7 +28,7 @@ async def cleanup():
     yield
     async with async_session_factory() as session:
         result = await session.execute(
-            select(User).where(User.firebase_uid.like("test-credentials%"))
+            select(User).where(User.email.like("test-credentials%"))
         )
         for user in result.scalars().all():
             await session.delete(user)
@@ -39,7 +39,6 @@ async def cleanup():
 async def test_save_list_and_delete_credential():
     async with async_session_factory() as session:
         user = User(
-            firebase_uid="test-credentials-uid",
             email="test-credentials@example.com",
             username="test_credentials",
         )
@@ -78,7 +77,6 @@ async def test_save_list_and_delete_credential():
 async def test_saving_again_for_same_provider_overwrites_not_duplicates():
     async with async_session_factory() as session:
         user = User(
-            firebase_uid="test-credentials-uid-2",
             email="test-credentials-2@example.com",
             username="test_credentials_2",
         )

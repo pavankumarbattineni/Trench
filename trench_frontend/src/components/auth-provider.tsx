@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
 
-import { getCurrentUser, type UserProfile } from "@/lib/api";
+import { getCurrentUser, isAuthenticated, type UserProfile } from "@/lib/api";
 
 interface AuthContextValue {
   user: UserProfile | null;
@@ -18,6 +18,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   const refreshUser = useCallback(async () => {
+    // Skip the network call entirely when there's no access_token cookie
+    // -- a fresh/logged-out visitor is the common case, not an error, and
+    // hitting a protected endpoint anyway would 401, which the response
+    // interceptor treats as "session died" and reacts to by redirecting
+    // to /signin -- looping forever if we're already there.
+    if (!isAuthenticated()) {
+      setUser(null);
+      return;
+    }
     try {
       setUser(await getCurrentUser());
     } catch {

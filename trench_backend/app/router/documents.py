@@ -1,22 +1,21 @@
-"""Document upload/list/get/delete endpoints.
+"""Personal-knowledge document upload/list/get/delete endpoints.
 
 Only creates a `pending` Document and stores the raw file -- parsing,
-chunking, embedding, and indexing happen in a separate background job.
+chunking, embedding, and indexing happen in a background asyncio task
+(see DocumentService.upload_document). Company-knowledge documents are
+managed under /organizations instead (see app/router/organizations.py)
+since they require admin authorization.
 """
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile, status
+from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Document, User
 from app.database.session import get_db
 from app.router.deps import get_current_user
-from app.schemas.document import (
-    ChunkingStrategy,
-    DocumentListResponse,
-    DocumentResponse,
-)
+from app.schemas.document import DocumentListResponse, DocumentResponse
 from app.service.document_service import DocumentService
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -25,17 +24,16 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 @router.post("", response_model=DocumentResponse)
 async def upload_document(
     file: UploadFile = File(...),
-    chunking_strategy: ChunkingStrategy = Form("recursive"),
-    chunk_size: int = Form(512, ge=100, le=4000),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Document:
-    """Uploads a document for processing.
+    """Uploads a personal-knowledge document for processing.
 
     Args:
         file: The document file (PDF, DOCX, TXT, or Markdown).
-        chunking_strategy: One of "recursive" | "markdown" | "semantic".
-        chunk_size: Target chunk size in tokens (100-4000).
+        current_user: The authenticated uploader; the document is scoped
+            to this user's personal knowledge base.
+        db: An active async SQLAlchemy session.
 
     Returns:
         The created (or, if this exact file was already uploaded, the
@@ -43,7 +41,8 @@ async def upload_document(
 
     Raises:
         HTTPException: 422 on an invalid file; 403 if the free-tier
-            document limit is reached and no Pinecone BYOK credential is set.
+            document limit is reached and no Pinecone BYOK credential is
+            set; 409 if the user already has a document pending/processing.
     """
     content = await file.read()
     return await DocumentService.upload_document(
@@ -51,8 +50,7 @@ async def upload_document(
         user=current_user,
         filename=file.filename or "untitled",
         content=content,
-        chunking_strategy=chunking_strategy,
-        chunk_size=chunk_size,
+        knowledge_type="personal",
     )
 
 
@@ -61,8 +59,18 @@ async def list_documents(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentListResponse:
-    """Lists the authenticated user's documents."""
-    documents = await DocumentService.list_documents(db, user_id=current_user.id)
+    """Lists the authenticated user's personal documents.
+
+    Args:
+        current_user: The authenticated user whose documents to list.
+        db: An active async SQLAlchemy session.
+
+    Returns:
+        Every personal document owned by the authenticated user.
+    """
+    documents = await DocumentService.list_personal_documents(
+        db, user_id=current_user.id
+    )
     return DocumentListResponse(documents=documents)
 
 
@@ -72,9 +80,22 @@ async def get_document(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Document:
-    """Fetches a single document owned by the authenticated user."""
+    """Fetches a single document the authenticated user is authorized to see.
+
+    Args:
+        document_id: The document to fetch.
+        current_user: The authenticated user requesting it.
+        db: An active async SQLAlchemy session.
+
+    Returns:
+        The requested document.
+
+    Raises:
+        HTTPException: 404 if the document doesn't exist or isn't owned by
+            the requester.
+    """
     return await DocumentService.get_document(
-        db, user_id=current_user.id, document_id=document_id
+        db, user=current_user, document_id=document_id
     )
 
 
@@ -84,11 +105,20 @@ async def delete_document(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Deletes a document owned by the authenticated user.
+    """Deletes a personal document owned by the authenticated user.
 
     Never decrements the user's free-tier upload count -- the limit
     represents total documents ever processed, not currently existing ones.
+
+    Args:
+        document_id: The document to delete.
+        current_user: The authenticated user requesting deletion.
+        db: An active async SQLAlchemy session.
+
+    Raises:
+        HTTPException: 404 if the document doesn't exist or isn't owned by
+            the requester.
     """
     await DocumentService.delete_document(
-        db, user_id=current_user.id, document_id=document_id
+        db, user=current_user, document_id=document_id
     )

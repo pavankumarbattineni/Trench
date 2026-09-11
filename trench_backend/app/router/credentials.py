@@ -27,6 +27,8 @@ async def save_credential(
 
     Args:
         body: The provider to save a credential for, and the raw API key.
+        current_user: The authenticated user the credential belongs to.
+        db: An active async SQLAlchemy session.
 
     Raises:
         HTTPException: 422 if provider_type is unknown, or if the key
@@ -52,6 +54,14 @@ async def list_credentials(
     """Lists the authenticated user's saved BYOK credentials.
 
     Returns only a masked preview per credential -- never the full key.
+
+    Args:
+        current_user: The authenticated user whose credentials to list.
+        db: An active async SQLAlchemy session.
+
+    Returns:
+        Every provider_type the user has a stored credential for, each
+        with a masked preview and when it was last validated.
     """
     credentials = await CredentialService.list_credentials(db, user_id=current_user.id)
     return CredentialListResponse(
@@ -72,7 +82,13 @@ async def delete_credential(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Removes a BYOK credential for the authenticated user."""
+    """Removes a BYOK credential for the authenticated user.
+
+    Args:
+        provider_type: Which stored credential to remove (e.g. "openai_llm").
+        current_user: The authenticated user whose credential to remove.
+        db: An active async SQLAlchemy session.
+    """
     await CredentialService.delete_credential(
         db, user_id=current_user.id, provider_type=provider_type
     )
