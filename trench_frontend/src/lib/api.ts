@@ -19,7 +19,7 @@ export async function getHealth(): Promise<HealthResponse> {
 export interface UserOrganization {
   id: string;
   name: string;
-  role: string;
+  role: "owner" | "admin" | "member";
 }
 
 export interface UserProfile {
@@ -30,20 +30,17 @@ export interface UserProfile {
   created_at: string;
   model_id: string | null;
   model_name: string | null;
+  // Every user belongs to exactly one organization under the
+  // invitation-only model -- still nullable in the type only for a brief
+  // transitional window (see Task 13's NOT NULL migration, not yet
+  // applied), never a state new code should expect to handle.
   organization: UserOrganization | null;
   has_company_access: boolean;
-  /** The Trench *application* role ("admin" | "user") -- separate from
-   * `organization.role`, an org's own admin/member role. Only a Trench
-   * admin can create an organization. */
+  /** The Trench *application* role ("admin" | "user") -- vestigial since
+   * the invitation-only redesign (there is no more app-wide admin
+   * bootstrap flow); always "user" for any account created going
+   * forward. Separate from `organization.role`, an org's own role. */
   role: "admin" | "user";
-}
-
-export interface SignupProfile {
-  id: string;
-  email: string;
-  username: string;
-  role: "admin" | "user";
-  created_at: string;
 }
 
 // Trench uses Bearer-token auth, not cookies for the API itself: the
@@ -85,6 +82,16 @@ export function clearAuthTokens(): void {
   Cookies.remove(REFRESH_TOKEN_COOKIE, { path: "/" });
 }
 
+/**
+ * Stores a token pair obtained from a flow that lives outside this file
+ * (e.g. invitations.ts's acceptInvitation) -- `setAuthTokens` above isn't
+ * exported, so this is the seam other modules use to persist a session
+ * without duplicating the cookie-writing logic.
+ */
+export function persistTokens(tokens: TokenResponse): void {
+  setAuthTokens(tokens);
+}
+
 export function isAuthenticated(): boolean {
   return Boolean(getAccessToken());
 }
@@ -104,35 +111,34 @@ export async function loginWithFirebase(idToken: string): Promise<TokenResponse>
   return data;
 }
 
-/**
- * Registers a new Trench user. Deliberately does NOT set any session
- * tokens -- signup never logs the user in; the frontend sends them to
- * /signin next.
- */
-export async function signupWithFirebase(
-  idToken: string,
-  username?: string,
-  registerAsAdmin?: boolean
-): Promise<SignupProfile> {
-  const { data } = await apiClient.post<SignupProfile>("/api/v1/auth/signup", {
-    id_token: idToken,
-    username,
-    register_as_admin: registerAsAdmin ?? false,
-  });
-  return data;
+export interface OwnerSignupOrganization {
+  id: string;
+  name: string;
+  domain: string;
+}
+
+export interface OwnerSignupProfile {
+  organization: OwnerSignupOrganization;
 }
 
 /**
- * Whether a Trench administrator has already been registered -- lets the
- * signup page decide whether to offer "register as administrator" at all.
- * Purely a UX convenience: the backend independently re-checks the same
- * condition when signup actually happens.
+ * Registers a new Trench user as the Owner of a brand-new organization --
+ * the only way an account (and its organization) now comes into being,
+ * other than accepting an invitation (see invitations.ts). No session is
+ * established here: the Owner signs in separately via loginWithFirebase
+ * afterward, same as every other account-creation path except
+ * invite-accept.
  */
-export async function getAdminStatus(): Promise<boolean> {
-  const { data } = await apiClient.get<{ admin_exists: boolean }>(
-    "/api/v1/auth/admin-status"
+export async function signupOwner(
+  idToken: string,
+  organizationName: string,
+  username?: string
+): Promise<OwnerSignupProfile> {
+  const { data } = await apiClient.post<OwnerSignupProfile>(
+    "/api/v1/auth/signup/owner",
+    { id_token: idToken, username, organization_name: organizationName }
   );
-  return data.admin_exists;
+  return data;
 }
 
 export async function getCurrentUser(): Promise<UserProfile> {
@@ -164,15 +170,42 @@ async function refreshAccessToken(): Promise<string | null> {
   }
 }
 
+/**
+ * Calls the backend's logout endpoint -- stateless JWTs mean there's
+ * nothing server-side for it to actually invalidate, but it's still the
+ * one authoritative "goodbye" call made before clearing local state. Best
+ * effort: a network failure here must never block the user from
+ * completing sign-out locally, so callers should swallow errors from this.
+ */
+export async function logoutRemote(): Promise<void> {
+  await apiClient.post("/api/v1/auth/logout");
+}
+
 export function logoutSession(): void {
-  // Stateless JWTs, no server-side session to invalidate -- logout is
-  // purely a client-side action (clearing these tokens is all "logout"
-  // means to the backend).
+  // Stateless JWTs, no server-side session to invalidate beyond the
+  // best-effort logoutRemote() call above -- clearing these tokens is the
+  // only thing that actually matters to this browser.
   clearAuthTokens();
 }
 
 export async function deleteAccountSession(idToken: string): Promise<void> {
   await apiClient.delete("/api/v1/auth/account", { data: { id_token: idToken } });
+}
+
+export async function requestPasswordResetEmail(email: string): Promise<void> {
+  await apiClient.post("/api/v1/auth/password-reset/request", { email });
+}
+
+export async function confirmPasswordResetToken(
+  token: string,
+  newPassword: string,
+  confirmPassword: string
+): Promise<void> {
+  await apiClient.post("/api/v1/auth/password-reset/confirm", {
+    token,
+    new_password: newPassword,
+    confirm_password: confirmPassword,
+  });
 }
 
 // Attaches the stored access token to every outgoing request. Reads the
@@ -194,7 +227,7 @@ function isAuthExchange(url: string | undefined): boolean {
   return (
     url === "/api/v1/auth/login" ||
     url === "/api/v1/auth/refresh" ||
-    url === "/api/v1/auth/signup"
+    url === "/api/v1/auth/signup/owner"
   );
 }
 

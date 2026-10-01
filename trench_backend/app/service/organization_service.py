@@ -8,11 +8,11 @@ is always a single unambiguous lookup.
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Organization, OrganizationMember, User
+from app.database.models import KnowledgeAccess, Organization, OrganizationMember, User
 from app.utils.email_domain import extract_domain, is_public_email_domain
 
 _ALREADY_IN_ORG = HTTPException(
@@ -35,17 +35,13 @@ _NOT_FOUND = HTTPException(status.HTTP_404_NOT_FOUND, "Organization not found")
 _NOT_ADMIN = HTTPException(
     status.HTTP_403_FORBIDDEN, "Only an organization admin can do that"
 )
+_NOT_OWNER = HTTPException(
+    status.HTTP_403_FORBIDDEN, "Only the organization owner can do that"
+)
 _NOT_A_MEMBER = HTTPException(
     status.HTTP_403_FORBIDDEN, "You don't belong to this organization"
 )
 _USER_NOT_FOUND = HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
-_ALREADY_MEMBER = HTTPException(
-    status.HTTP_409_CONFLICT, "That user already belongs to an organization"
-)
-_WRONG_DOMAIN = HTTPException(
-    status.HTTP_422_UNPROCESSABLE_CONTENT,
-    "That user's email domain doesn't match this organization's domain",
-)
 _MEMBER_NOT_FOUND = HTTPException(status.HTTP_404_NOT_FOUND, "Member not found")
 _CANNOT_REMOVE_SELF = HTTPException(
     status.HTTP_409_CONFLICT,
@@ -58,19 +54,42 @@ _OWNER_PROTECTED = HTTPException(
 
 
 class OrganizationService:
+    @classmethod
+    async def validate_domain_eligible_for_org(
+        cls, db: AsyncSession, email: str
+    ) -> str:
+        """Returns the extracted domain if it's eligible to anchor a new
+        organization, raising the same errors `create` would.
+
+        Callers (AuthService.signup_owner) use this to validate BEFORE
+        creating the user row the organization will be owned by --
+        otherwise a domain-ineligible signup attempt would still commit a
+        User with no organization, violating "every user belongs to
+        exactly one organization." `create` re-checks the same conditions
+        itself (cheap, and the only defense against a TOCTOU race between
+        this check and the user actually being created).
+
+        Raises:
+            HTTPException: 422 if the domain is a public/personal
+                provider; 409 if an organization already exists for it.
+        """
+        domain = extract_domain(email)
+        if is_public_email_domain(domain):
+            raise _PUBLIC_DOMAIN
+        if await cls.get_by_domain(db, domain) is not None:
+            raise _DOMAIN_TAKEN
+        return domain
+
     @staticmethod
     async def create(
         db: AsyncSession, *, creator: User, name: str
-    ) -> tuple[Organization, OrganizationMember, int]:
-        """Creates an organization with `creator` as its first admin and
-        permanent owner.
+    ) -> tuple[Organization, OrganizationMember]:
+        """Creates an organization with `creator` as its permanent Owner.
 
-        The organization's domain is derived from the creator's own email
-        (never user-entered) -- see app/utils/email_domain.py. Any
-        existing Trench user whose email already matches that domain is
-        automatically added as a plain member (no company-knowledge
-        access, no admin role -- the owner grants those explicitly
-        afterward), since they're provably part of the same company.
+        Invitation-only from here on: no existing user is ever auto-added
+        by matching domain (that was the pre-RBAC self-service model --
+        see docs/superpowers/specs/2026-10-01-multi-tenant-rbac-design.md).
+        Employees join only via InvitationService.accept.
 
         Raises:
             HTTPException: 409 if the caller already belongs to an
@@ -79,8 +98,8 @@ class OrganizationService:
                 provider (Gmail, Yahoo, etc.) rather than a work domain.
 
         Returns:
-            The organization, the creator's own membership row, and how
-            many other existing users were auto-added as members.
+            The organization and the creator's own (role="owner")
+            membership row.
         """
         existing_membership = await OrganizationService.get_membership_for_user(
             db, creator.id
@@ -103,66 +122,16 @@ class OrganizationService:
             raise _NAME_TAKEN from exc
 
         member = OrganizationMember(
-            organization_id=organization.id, user_id=creator.id, role="admin"
+            organization_id=organization.id, user_id=creator.id, role="owner"
         )
         db.add(member)
 
-        auto_added = await OrganizationService._auto_add_domain_users(
-            db, organization=organization, exclude_user_id=creator.id
-        )
+        creator.organization_id = organization.id
 
         await db.commit()
         await db.refresh(organization)
         await db.refresh(member)
-        return organization, member, auto_added
-
-    @staticmethod
-    async def _auto_add_domain_users(
-        db: AsyncSession, *, organization: Organization, exclude_user_id: uuid.UUID
-    ) -> int:
-        """Adds every existing user whose email domain matches, as a plain
-        member with no company-knowledge access -- the owner explicitly
-        grants roles/access afterward (see add_member for the same rule
-        applied to one user at a time). Skips anyone who (oddly) already
-        belongs to some other organization, since membership is 1:1.
-        """
-        escaped = organization.domain.replace("\\", "\\\\").replace(
-            "%", "\\%"
-        ).replace("_", "\\_")
-        result = await db.execute(
-            select(User).where(User.email.ilike(f"%@{escaped}", escape="\\"))
-        )
-        candidates = [
-            user
-            for user in result.scalars().all()
-            if user.id != exclude_user_id
-            and extract_domain(user.email) == organization.domain
-        ]
-        if not candidates:
-            return 0
-
-        existing_member_user_ids = {
-            row[0]
-            for row in (
-                await db.execute(
-                    select(OrganizationMember.user_id).where(
-                        OrganizationMember.user_id.in_([u.id for u in candidates])
-                    )
-                )
-            ).all()
-        }
-
-        added = 0
-        for user in candidates:
-            if user.id in existing_member_user_ids:
-                continue
-            db.add(
-                OrganizationMember(
-                    organization_id=organization.id, user_id=user.id, role="member"
-                )
-            )
-            added += 1
-        return added
+        return organization, member
 
     @staticmethod
     async def get_membership_for_user(
@@ -189,12 +158,27 @@ class OrganizationService:
         )
         return result.scalar_one_or_none()
 
+    @staticmethod
+    async def get_owned_organization(
+        db: AsyncSession, user_id: uuid.UUID
+    ) -> Organization | None:
+        """Returns the organization `user_id` is the permanent Owner of,
+        or None. Used to block account deletion for an Owner (see
+        AuthService.delete_account) -- Organization.owner_user_id has no
+        cascading delete, and silently cascading it would destroy every
+        other member's access to the organization's knowledge, which a
+        plain "delete my account" action must never do unannounced."""
+        result = await db.execute(
+            select(Organization).where(Organization.owner_user_id == user_id)
+        )
+        return result.scalar_one_or_none()
+
     @classmethod
-    async def require_admin(
+    async def require_admin_or_owner(
         cls, db: AsyncSession, *, user: User, organization_id: uuid.UUID
     ) -> OrganizationMember:
-        """Returns the caller's membership row iff they're an admin of
-        `organization_id`; raises 403/404 otherwise."""
+        """Returns the caller's membership row iff they're an Admin or the
+        Owner of `organization_id`; raises 403/404 otherwise."""
         organization = await cls.get_by_id(db, organization_id)
         if organization is None:
             raise _NOT_FOUND
@@ -203,9 +187,30 @@ class OrganizationService:
         if (
             membership is None
             or membership.organization_id != organization_id
-            or membership.role != "admin"
+            or membership.role not in ("admin", "owner")
         ):
             raise _NOT_ADMIN
+        return membership
+
+    @classmethod
+    async def require_owner(
+        cls, db: AsyncSession, *, user: User, organization_id: uuid.UUID
+    ) -> OrganizationMember:
+        """Returns the caller's membership row iff they're the Owner of
+        `organization_id`; raises 403/404 otherwise. Used for Owner-only
+        actions: promoting a Member to Admin, removing an Admin, setting
+        the organization's shared BYOK credential."""
+        organization = await cls.get_by_id(db, organization_id)
+        if organization is None:
+            raise _NOT_FOUND
+
+        membership = await cls.get_membership_for_user(db, user.id)
+        if (
+            membership is None
+            or membership.organization_id != organization_id
+            or membership.role != "owner"
+        ):
+            raise _NOT_OWNER
         return membership
 
     @classmethod
@@ -292,36 +297,6 @@ class OrganizationService:
         )
         return result.scalar_one_or_none()
 
-    @staticmethod
-    async def add_member(
-        db: AsyncSession,
-        *,
-        organization: Organization,
-        target_user: User,
-        role: str = "member",
-    ) -> OrganizationMember:
-        """Raises:
-        HTTPException: 409 if the target user already belongs to an
-            organization (any organization, not just this one -- a user
-            belongs to at most one); 422 if their email domain doesn't
-            match this organization's domain.
-        """
-        existing = await OrganizationService.get_membership_for_user(
-            db, target_user.id
-        )
-        if existing is not None:
-            raise _ALREADY_MEMBER
-        if extract_domain(target_user.email) != organization.domain:
-            raise _WRONG_DOMAIN
-
-        member = OrganizationMember(
-            organization_id=organization.id, user_id=target_user.id, role=role
-        )
-        db.add(member)
-        await db.commit()
-        await db.refresh(member)
-        return member
-
     @classmethod
     async def update_role(
         cls,
@@ -330,13 +305,16 @@ class OrganizationService:
         organization_id: uuid.UUID,
         target_user_id: uuid.UUID,
         role: str,
+        acting_membership: OrganizationMember,
     ) -> OrganizationMember:
         """Raises:
         HTTPException: 404 if the member doesn't exist; 403 if
-            `target_user_id` is the organization's permanent owner --
-            their role can never be changed, by anyone, including other
-            admins.
+            `target_user_id` is the organization's permanent owner, if
+            `role` is "owner" (never settable this way), or if the caller
+            isn't the Owner (only the Owner promotes/demotes).
         """
+        if role == "owner" or acting_membership.role != "owner":
+            raise _NOT_OWNER
         await cls._require_not_owner(db, organization_id, target_user_id)
         result = await db.execute(
             select(OrganizationMember).where(
@@ -359,15 +337,16 @@ class OrganizationService:
         *,
         organization_id: uuid.UUID,
         target_user_id: uuid.UUID,
-        acting_user_id: uuid.UUID,
+        acting_membership: OrganizationMember,
     ) -> None:
         """Raises:
         HTTPException: 409 if the caller is trying to remove themself;
             403 if `target_user_id` is the organization's permanent
-            owner -- they can never be removed, by anyone; 404 if the
-            member doesn't exist.
+            owner, or if the caller is an Admin trying to remove another
+            Admin (only the Owner may do that); 404 if the member doesn't
+            exist.
         """
-        if target_user_id == acting_user_id:
+        if target_user_id == acting_membership.user_id:
             raise _CANNOT_REMOVE_SELF
         await cls._require_not_owner(db, organization_id, target_user_id)
         result = await db.execute(
@@ -379,7 +358,20 @@ class OrganizationService:
         member = result.scalar_one_or_none()
         if member is None:
             raise _MEMBER_NOT_FOUND
+        if member.role == "admin" and acting_membership.role != "owner":
+            raise _NOT_OWNER
         await db.delete(member)
+        await db.execute(
+            delete(KnowledgeAccess).where(
+                KnowledgeAccess.organization_id == organization_id,
+                KnowledgeAccess.user_id == target_user_id,
+            )
+        )
+        await db.execute(
+            update(User)
+            .where(User.id == target_user_id, User.organization_id == organization_id)
+            .values(organization_id=None)
+        )
         await db.commit()
 
     @classmethod
@@ -404,11 +396,26 @@ class OrganizationService:
                 OrganizationMember.user_id != organization.owner_user_id,
                 OrganizationMember.user_id != acting_user_id,
             )
-            .returning(OrganizationMember.id)
+            .returning(OrganizationMember.user_id)
         )
-        removed_ids = result.scalars().all()
+        removed_user_ids = result.scalars().all()
+        if removed_user_ids:
+            await db.execute(
+                delete(KnowledgeAccess).where(
+                    KnowledgeAccess.organization_id == organization_id,
+                    KnowledgeAccess.user_id.in_(removed_user_ids),
+                )
+            )
+            await db.execute(
+                update(User)
+                .where(
+                    User.id.in_(removed_user_ids),
+                    User.organization_id == organization_id,
+                )
+                .values(organization_id=None)
+            )
         await db.commit()
-        return len(removed_ids)
+        return len(removed_user_ids)
 
     @classmethod
     async def require_not_owner(

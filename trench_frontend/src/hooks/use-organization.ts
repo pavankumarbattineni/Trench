@@ -3,23 +3,24 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 
-import { useAuth } from "@/components/auth-provider";
 import {
-  addMember,
-  createOrganization,
-  getMyOrganization,
+  createInvitation,
   grantAllKnowledgeAccess,
+  listInvitations,
   listMembers,
   removeAllKnowledgeAccess,
   removeAllMembers,
   removeMember,
+  resendInvitation,
+  revokeInvitation,
   revokeKnowledgeAccess,
   updateKnowledgeAccess,
   updateMemberRole,
+  getMyOrganization,
+  type InvitationRole,
   type ListMembersParams,
   type OrganizationRole,
 } from "@/lib/organizations";
-import { getCurrentUser } from "@/lib/api";
 
 export const myOrganizationQueryKey = ["organization", "me"] as const;
 
@@ -63,28 +64,46 @@ function invalidateMembers(
   });
 }
 
-export function useCreateOrganization() {
-  const queryClient = useQueryClient();
-  const { setUser } = useAuth();
-  return useMutation({
-    mutationFn: createOrganization,
-    onSuccess: async () => {
-      queryClient.invalidateQueries({ queryKey: myOrganizationQueryKey });
-      // The user's own profile (organization, has_company_access) is now
-      // stale -- refresh it so the rest of the app (e.g. the chat
-      // composer's knowledge-type selector) reflects membership right
-      // away, not just after a full page reload.
-      setUser(await getCurrentUser());
-    },
+function invitationsQueryKey(organizationId: string) {
+  return ["organization", organizationId, "invitations"] as const;
+}
+
+function invalidateInvitations(
+  queryClient: ReturnType<typeof useQueryClient>,
+  organizationId: string
+) {
+  queryClient.invalidateQueries({ queryKey: invitationsQueryKey(organizationId) });
+}
+
+export function useInvitations(organizationId: string) {
+  return useQuery({
+    queryKey: invitationsQueryKey(organizationId),
+    queryFn: () => listInvitations(organizationId),
   });
 }
 
-export function useAddMember(organizationId: string) {
+export function useCreateInvitation(organizationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ username, role }: { username: string; role: OrganizationRole }) =>
-      addMember(organizationId, username, role),
-    onSuccess: () => invalidateMembers(queryClient, organizationId),
+    mutationFn: ({ email, role }: { email: string; role: InvitationRole }) =>
+      createInvitation(organizationId, email, role),
+    onSuccess: () => invalidateInvitations(queryClient, organizationId),
+  });
+}
+
+export function useResendInvitation(organizationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (invitationId: string) => resendInvitation(organizationId, invitationId),
+    onSuccess: () => invalidateInvitations(queryClient, organizationId),
+  });
+}
+
+export function useRevokeInvitation(organizationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (invitationId: string) => revokeInvitation(organizationId, invitationId),
+    onSuccess: () => invalidateInvitations(queryClient, organizationId),
   });
 }
 

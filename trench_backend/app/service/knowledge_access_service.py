@@ -148,18 +148,6 @@ class KnowledgeAccessService:
         return granted
 
     @staticmethod
-    async def list_for_organization(
-        db: AsyncSession, organization_id: uuid.UUID
-    ) -> list[KnowledgeAccess]:
-        result = await db.execute(
-            select(KnowledgeAccess).where(
-                KnowledgeAccess.organization_id == organization_id,
-                KnowledgeAccess.is_active.is_(True),
-            )
-        )
-        return list(result.scalars().all())
-
-    @staticmethod
     async def has_company_access(
         db: AsyncSession, *, user_id: uuid.UUID, organization_id: uuid.UUID
     ) -> bool:
@@ -191,7 +179,7 @@ class KnowledgeAccessService:
         membership = membership_result.scalar_one_or_none()
         if membership is None:
             return None
-        if membership.role == "admin":
+        if membership.role in ("admin", "owner"):
             return membership.organization_id
 
         has_access = await KnowledgeAccessService.has_company_access(

@@ -2,13 +2,9 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
-OrganizationRole = Literal["admin", "member"]
-
-
-class OrganizationCreateRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=128)
+OrganizationRole = Literal["owner", "admin", "member"]
 
 
 class OrganizationResponse(BaseModel):
@@ -20,13 +16,6 @@ class OrganizationResponse(BaseModel):
     owner_user_id: uuid.UUID
     is_active: bool
     created_at: datetime
-
-
-class OrganizationCreatedResponse(OrganizationResponse):
-    """POST /organizations only -- how many existing users on the same
-    email domain were automatically added as members."""
-
-    auto_added_members: int
 
 
 class MyOrganizationResponse(OrganizationResponse):
@@ -63,22 +52,8 @@ class PaginatedMembersResponse(BaseModel):
     total_pages: int
 
 
-class AddMemberRequest(BaseModel):
-    username: str
-    role: OrganizationRole = "member"
-
-
 class UpdateMemberRoleRequest(BaseModel):
     role: OrganizationRole
-
-
-class KnowledgeAccessResponse(BaseModel):
-    id: uuid.UUID
-    user_id: uuid.UUID
-    username: str
-    knowledge_type: str
-    is_active: bool
-    created_at: datetime
 
 
 class KnowledgeAccessBulkRevokeResponse(BaseModel):

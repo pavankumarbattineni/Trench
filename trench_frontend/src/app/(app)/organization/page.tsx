@@ -2,10 +2,7 @@
 
 import { Suspense } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { isAxiosError } from "axios";
-import { Building2, FileText, Users } from "lucide-react";
-
-import { ShieldAlert } from "lucide-react";
+import { Building2, FileText, Mail, Users } from "lucide-react";
 
 import { useAuth } from "@/components/auth-provider";
 import { Badge } from "@/components/ui/badge";
@@ -13,16 +10,15 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "cn";
 import { useMyOrganization } from "@/hooks/use-organization";
 import { getErrorMessage } from "@/lib/errors";
-import { CreateOrganizationForm } from "./create-organization-form";
+import { InvitationsTab } from "./invitations-tab";
 import { MembersPanel } from "./members-panel";
 import { OrganizationDocumentsPanel } from "./organization-documents-panel";
 
-type OrgTab = "members" | "documents";
+type OrgTab = "invitations" | "members" | "documents";
 
 export default function OrganizationPage() {
   const { user } = useAuth();
   const orgQuery = useMyOrganization();
-  const notInOrg = isAxiosError(orgQuery.error) && orgQuery.error.response?.status === 404;
 
   if (orgQuery.isLoading) {
     return (
@@ -35,33 +31,13 @@ export default function OrganizationPage() {
     );
   }
 
-  if (notInOrg) {
-    // Only a Trench *application* admin (User.role -- entirely separate
-    // from any organization's own admin role) can create an organization.
-    // Backend-enforced (require_trench_admin on POST /organizations) --
-    // this is purely so a regular user isn't shown a form they can't
-    // submit.
-    if (user?.role !== "admin") {
-      return (
-        <main className="mx-auto flex h-full max-w-3xl items-center justify-center px-4">
-          <div className="flex max-w-md flex-col items-center gap-3 rounded-2xl border border-dashed border-border p-8 text-center">
-            <ShieldAlert className="size-8 text-muted-foreground" />
-            <p className="text-sm text-muted-foreground">
-              You&apos;re not part of an organization yet, and only a Trench
-              administrator can create one. Ask your administrator to create an
-              organization and add you as a member.
-            </p>
-          </div>
-        </main>
-      );
-    }
-    return (
-      <main className="mx-auto h-full max-w-3xl overflow-y-auto px-4">
-        <CreateOrganizationForm />
-      </main>
-    );
-  }
-
+  // Every authenticated user now belongs to exactly one organization --
+  // owner-signup and invite-accept both guarantee this, so there's no
+  // more "not in an org yet" state to design for. A 404 here would mean
+  // a genuine data inconsistency, not an expected product state; show the
+  // same generic error path as any other failure rather than a bespoke
+  // "create your organization" flow (that self-service path no longer
+  // exists -- organizations are created only via owner-signup).
   if (orgQuery.isError || !orgQuery.data) {
     return (
       <main className="mx-auto flex h-full max-w-3xl items-center justify-center px-4 text-center">
@@ -71,7 +47,8 @@ export default function OrganizationPage() {
   }
 
   const organization = orgQuery.data;
-  const isAdmin = organization.my_role === "admin";
+  const isOwner = organization.my_role === "owner";
+  const isAdmin = isOwner || organization.my_role === "admin";
 
   return (
     <OrganizationDetail
@@ -80,6 +57,7 @@ export default function OrganizationPage() {
       domain={organization.domain}
       createdAt={organization.created_at}
       isAdmin={isAdmin}
+      isOwner={isOwner}
       hasCompanyAccess={Boolean(user?.has_company_access)}
       currentUserId={user?.id}
     />
@@ -92,6 +70,7 @@ interface OrganizationDetailProps {
   domain: string;
   createdAt: string;
   isAdmin: boolean;
+  isOwner: boolean;
   hasCompanyAccess: boolean;
   currentUserId: string | undefined;
 }
@@ -121,6 +100,7 @@ function OrganizationDetailContent({
   domain,
   createdAt,
   isAdmin,
+  isOwner,
   hasCompanyAccess,
   currentUserId,
 }: OrganizationDetailProps) {
@@ -133,7 +113,12 @@ function OrganizationDetailContent({
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
-  const tab: OrgTab = searchParams.get("tab") === "documents" ? "documents" : "members";
+  // "members" is the default landing tab -- anything other than an exact
+  // "documents" or "invitations" match (including no param at all) falls
+  // back to it.
+  const rawTab = searchParams.get("tab");
+  const tab: OrgTab =
+    rawTab === "documents" ? "documents" : rawTab === "invitations" ? "invitations" : "members";
 
   const setTab = (next: OrgTab) => {
     const params = new URLSearchParams(searchParams.toString());
@@ -153,7 +138,12 @@ function OrganizationDetailContent({
             {domain} · Created {new Date(createdAt).toLocaleDateString()}
           </p>
         </div>
-        {isAdmin && (
+        {isOwner && (
+          <Badge variant="default" data-icon="inline-start">
+            Owner
+          </Badge>
+        )}
+        {isAdmin && !isOwner && (
           <Badge variant="default" data-icon="inline-start">
             Admin
           </Badge>
@@ -161,6 +151,19 @@ function OrganizationDetailContent({
       </div>
 
       <div className="flex gap-1 border-b border-border">
+        <button
+          type="button"
+          onClick={() => setTab("invitations")}
+          className={cn(
+            "flex items-center gap-2 border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+            tab === "invitations"
+              ? "border-primary text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground"
+          )}
+        >
+          <Mail className="size-4" />
+          Invitations
+        </button>
         <button
           type="button"
           onClick={() => setTab("members")}
@@ -189,11 +192,13 @@ function OrganizationDetailContent({
         </button>
       </div>
 
-      {tab === "members" ? (
+      {tab === "invitations" ? (
+        <InvitationsTab organizationId={organizationId} isAdmin={isAdmin} isOwner={isOwner} />
+      ) : tab === "members" ? (
         <MembersPanel
           organizationId={organizationId}
-          domain={domain}
           isAdmin={isAdmin}
+          isOwner={isOwner}
           currentUserId={currentUserId}
         />
       ) : (

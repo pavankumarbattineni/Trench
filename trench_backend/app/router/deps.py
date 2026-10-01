@@ -16,10 +16,6 @@ _COMPANY_ACCESS_DENIED = HTTPException(
     status.HTTP_403_FORBIDDEN,
     "You don't have access to this organization's company knowledge",
 )
-_TRENCH_ADMIN_REQUIRED = HTTPException(
-    status.HTTP_403_FORBIDDEN,
-    "Only a Trench administrator can create an organization",
-)
 
 # A real FastAPI/OpenAPI security scheme (not just a raw header read) --
 # this is what makes Swagger show a lock icon and an "Authorize" button on
@@ -52,33 +48,36 @@ async def get_current_user(
     return await AuthService.resolve_access_token(db, token)
 
 
-async def require_trench_admin(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    """Ensures the caller is a Trench *application* administrator
-    (`User.role == "admin"`) -- entirely separate from any organization's
-    own admin role. Gates organization creation.
-
-    Raises:
-        HTTPException: 403 if the caller isn't a Trench admin.
-    """
-    if current_user.role != "admin":
-        raise _TRENCH_ADMIN_REQUIRED
-    return current_user
-
-
-async def require_org_admin(
+async def require_org_admin_or_owner(
     organization_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> OrganizationMember:
-    """Resolves the caller's admin membership for `organization_id`.
+    """Resolves the caller's admin-or-owner membership for
+    `organization_id`.
 
     Raises:
         HTTPException: 404 if the organization doesn't exist, 403 if the
-            caller isn't an admin of it.
+            caller is neither an Admin nor the Owner of it.
     """
-    return await OrganizationService.require_admin(
+    return await OrganizationService.require_admin_or_owner(
+        db, user=current_user, organization_id=organization_id
+    )
+
+
+async def require_org_owner(
+    organization_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> OrganizationMember:
+    """Resolves the caller's membership for `organization_id`, requiring
+    they're specifically the Owner (not just any Admin).
+
+    Raises:
+        HTTPException: 404 if the organization doesn't exist, 403 if the
+            caller isn't the Owner of it.
+    """
+    return await OrganizationService.require_owner(
         db, user=current_user, organization_id=organization_id
     )
 

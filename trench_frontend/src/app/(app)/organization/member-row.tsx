@@ -27,6 +27,10 @@ interface MemberRowProps {
   organizationId: string;
   isCurrentUser: boolean;
   isAdmin: boolean;
+  /** Only the Owner may promote a Member to Admin, demote an Admin back
+   * to Member, or remove an Admin -- an Admin viewer can only remove
+   * Members (see the permission matrix in the design spec). */
+  isOwner: boolean;
   onRequestRemove: (member: OrganizationMember) => void;
 }
 
@@ -35,6 +39,7 @@ export function MemberRow({
   organizationId,
   isCurrentUser,
   isAdmin,
+  isOwner,
   onRequestRemove,
 }: MemberRowProps) {
   const updateRole = useUpdateMemberRole(organizationId);
@@ -108,34 +113,51 @@ export function MemberRow({
         </Tooltip>
       )}
 
-      {isAdmin && !member.is_owner && (
-        <DropdownMenu>
-          <DropdownMenuTrigger
-            render={
-              <Button variant="ghost" size="icon-sm" aria-label="Member options">
-                <MoreHorizontal className="size-4" />
-              </Button>
-            }
-          />
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem onClick={handleToggleRole} disabled={updateRole.isPending}>
-              <ShieldCheck className="size-4" />
-              {member.role === "admin" ? "Make member" : "Make admin"}
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              variant="destructive"
-              disabled={isCurrentUser}
-              onClick={() => onRequestRemove(member)}
-            >
-              <UserMinus className="size-4" />
-              Remove
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
-      {/* Reserve the options button's width for the owner row too, so
-          columns stay aligned across all rows. */}
-      {isAdmin && member.is_owner && <div className="size-7" />}
+      {(() => {
+        // Permission matrix: only the Owner may promote/demote anyone, or
+        // remove an Admin. A plain Admin may only remove a Member -- they
+        // have no action at all on another Admin's row, and no role
+        // control on anyone's row.
+        const canRemove = isOwner || (isAdmin && member.role === "member");
+        const hasAnyAction = !member.is_owner && canRemove;
+
+        if (!hasAnyAction) {
+          // Reserve the options button's width even with no menu, so
+          // columns stay aligned across every row (owner row, and an
+          // Admin viewer looking at another Admin's row).
+          return <div className="size-7" />;
+        }
+
+        return (
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button variant="ghost" size="icon-sm" aria-label="Member options">
+                  <MoreHorizontal className="size-4" />
+                </Button>
+              }
+            />
+            <DropdownMenuContent align="end">
+              {isOwner && (
+                <DropdownMenuItem onClick={handleToggleRole} disabled={updateRole.isPending}>
+                  <ShieldCheck className="size-4" />
+                  {member.role === "admin" ? "Make member" : "Make admin"}
+                </DropdownMenuItem>
+              )}
+              {canRemove && (
+                <DropdownMenuItem
+                  variant="destructive"
+                  disabled={isCurrentUser}
+                  onClick={() => onRequestRemove(member)}
+                >
+                  <UserMinus className="size-4" />
+                  Remove
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        );
+      })()}
     </div>
   );
 }

@@ -1,9 +1,11 @@
 import time
-from unittest.mock import patch
+import uuid
+from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.database.models import Document, Organization, User
 from app.database.session import async_session_factory
@@ -30,46 +32,27 @@ def _claims(uid: str, email: str) -> dict:
     return {"uid": uid, "email": email, "iat": int(time.time())}
 
 
-async def _promote_to_trench_admin(email: str) -> None:
-    """Directly sets role="admin" for a test user, bypassing the app-level
-    "only while no admin exists yet" bootstrap gate (see
-    UserService.create_user) -- the same kind of direct, ops-only
-    provisioning a real deployment would use to seed its first admin(s),
-    just done here so every identity in this org-focused test file can
-    create its own organization regardless of signup order. This file is
-    about organization-level roles, not Trench-level ones -- separate,
-    dedicated tests (test_auth_flow.py) cover the Trench-admin bootstrap
-    and non-admin restriction themselves."""
-    async with async_session_factory() as session:
-        result = await session.execute(select(User).where(User.email == email))
-        user = result.scalar_one()
-        user.role = "admin"
-        await session.commit()
-
-
-async def _login(client: AsyncClient, uid: str, email: str) -> None:
-    """Signs up (idempotently -- a 409 for an already-registered email is
-    fine here), promotes to Trench admin (see `_promote_to_trench_admin`)
-    so this identity can create organizations, then signs in. Sets the
-    client's default Authorization header so every subsequent request on
-    this client is sent as this user -- until the next `_login()` call
-    overwrites it with a different user's token."""
-    with patch(
-        "app.utils.firebase.verify_firebase_id_token", return_value=_claims(uid, email)
-    ):
-        await client.post("/api/v1/auth/signup", json={"id_token": "fake"})
-        await _promote_to_trench_admin(email)
-        response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
-    client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
+def _auth_headers(access_token: str) -> dict:
+    return {"Authorization": f"Bearer {access_token}"}
 
 
 @pytest.fixture(autouse=True)
 async def cleanup():
     yield
     async with async_session_factory() as session:
-        # Organizations first -- Organization.owner_user_id FK-references
-        # users, so deleting a user while their organization still
-        # references them as owner would violate that constraint.
+        # users.organization_id FK-references organizations, and
+        # organizations.owner_user_id FK-references users -- a circular
+        # reference, so a user's organization_id must be cleared before
+        # the organization itself can be deleted. Invitation/
+        # OrganizationCredential/KnowledgeAccess rows cascade-delete with
+        # their organization, so no separate cleanup is needed for those.
+        await session.execute(
+            update(User)
+            .where(User.email.like(f"%{PREFIX}%"))
+            .values(organization_id=None)
+        )
+        await session.commit()
+
         org_result = await session.execute(
             select(Organization).where(Organization.name.like(f"{PREFIX}%"))
         )
@@ -85,821 +68,651 @@ async def cleanup():
         await session.commit()
 
 
-@pytest.mark.asyncio
-async def test_create_organization_makes_creator_admin(client: AsyncClient):
-    domain = f"{PREFIX}-1.com"
-    await _login(client, f"{PREFIX}-admin-1", f"admin@{domain}")
+async def _signup_owner_and_create_org(client: AsyncClient) -> tuple[str, str]:
+    """Signs up a new Owner (and their organization) via the invitation-only
+    flow's entry point, POST /auth/signup/owner -- which no longer issues a
+    session itself, so this logs in separately -- returns
+    (owner_access_token, organization_id)."""
+    email = f"{PREFIX}-owner-{uuid.uuid4().hex[:8]}@{PREFIX}.example.com"
+    with patch(
+        "app.utils.firebase.verify_firebase_id_token",
+        return_value=_claims(email, email),
+    ):
+        response = await client.post(
+            "/api/v1/auth/signup/owner",
+            json={
+                "id_token": "fake",
+                "username": f"{PREFIX}-owner-{uuid.uuid4().hex[:6]}",
+                "organization_name": f"{PREFIX}-org-{uuid.uuid4().hex[:8]}",
+            },
+        )
+        assert response.status_code == 200, response.text
+        login_response = await client.post(
+            "/api/v1/auth/login", json={"id_token": "fake"}
+        )
+    assert login_response.status_code == 200, login_response.text
+    return login_response.json()["access_token"], response.json()["organization"]["id"]
 
-    create_response = await client.post(
-        "/api/v1/organizations", json={"name": f"{PREFIX}-org-1"}
+
+async def _invite_and_accept(
+    client: AsyncClient,
+    organization_id: str,
+    inviter_token: str,
+    *,
+    role: str = "member",
+    return_user_id: bool = False,
+):
+    """Invites a fresh email to the organization (as whoever `inviter_token`
+    belongs to) and accepts it, returning the new member's access token
+    (and, if requested, their user id). Reads the raw token out of the
+    mocked send_email call's accept_url, since the raw token is never
+    returned over HTTP (by design)."""
+    email = f"{PREFIX}-invitee-{uuid.uuid4().hex[:8]}@{PREFIX}.example.com"
+    with patch(
+        "app.service.invitation_service.send_email", new=AsyncMock()
+    ) as mock_send:
+        invite_response = await client.post(
+            f"/api/v1/organizations/{organization_id}/invitations",
+            data={"email": email, "role": role},
+            headers=_auth_headers(inviter_token),
+        )
+    assert invite_response.status_code == 200, invite_response.text
+
+    html_body = mock_send.call_args.kwargs["html_body"]
+    accept_url = html_body.split('href="')[1].split('"')[0]
+    raw_token = parse_qs(urlparse(accept_url).query)["token"][0]
+
+    with patch(
+        "app.utils.firebase.verify_firebase_id_token",
+        return_value=_claims(email, email),
+    ):
+        accept_response = await client.post(
+            "/api/v1/auth/invitations/accept",
+            json={
+                "token": raw_token,
+                "id_token": "fake",
+                "username": f"{PREFIX}-invitee-{uuid.uuid4().hex[:6]}",
+            },
+        )
+    assert accept_response.status_code == 200, accept_response.text
+    access_token = accept_response.json()["access_token"]
+
+    if return_user_id:
+        me = await client.get("/api/v1/users/me", headers=_auth_headers(access_token))
+        return access_token, me.json()["id"]
+    return access_token
+
+
+# --- Role matrix (Task 3) ----------------------------------------------------
+#
+# These depend on POST /auth/signup/owner (Task 8) and the invitation
+# endpoints (Task 5) + accept endpoint (Task 6) -- skipped until Task 8
+# lands, then un-skipped.
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_promote_a_member_to_admin(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    admin_token = await _invite_and_accept(client, org_id, owner_token, role="admin")
+    _member_token, member_user_id = await _invite_and_accept(
+        client, org_id, owner_token, role="member", return_user_id=True
     )
-    assert create_response.status_code == 200
-    organization = create_response.json()
-    assert organization["domain"] == domain
 
-    me_response = await client.get("/api/v1/users/me")
-    profile = me_response.json()
-    assert profile["organization"]["id"] == organization["id"]
-    assert profile["organization"]["role"] == "admin"
-    assert profile["has_company_access"] is True
-
-    my_org_response = await client.get("/api/v1/organizations/me")
-    assert my_org_response.json()["my_role"] == "admin"
+    response = await client.patch(
+        f"/api/v1/organizations/{org_id}/members/{member_user_id}",
+        json={"role": "admin"},
+        headers=_auth_headers(admin_token),
+    )
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_creating_a_second_organization_while_already_in_one_is_rejected(
+async def test_owner_can_promote_a_member_to_admin(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    _member_token, member_user_id = await _invite_and_accept(
+        client, org_id, owner_token, role="member", return_user_id=True
+    )
+
+    response = await client.patch(
+        f"/api/v1/organizations/{org_id}/members/{member_user_id}",
+        json={"role": "admin"},
+        headers=_auth_headers(owner_token),
+    )
+    assert response.status_code == 200
+    assert response.json()["role"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_remove_another_admin(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    admin_one_token = await _invite_and_accept(
+        client, org_id, owner_token, role="admin"
+    )
+    _admin_two_token, admin_two_user_id = await _invite_and_accept(
+        client, org_id, owner_token, role="admin", return_user_id=True
+    )
+
+    response = await client.delete(
+        f"/api/v1/organizations/{org_id}/members",
+        params={"user_id": admin_two_user_id},
+        headers=_auth_headers(admin_one_token),
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_can_remove_a_member(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    admin_token = await _invite_and_accept(client, org_id, owner_token, role="admin")
+    _member_token, member_user_id = await _invite_and_accept(
+        client, org_id, owner_token, role="member", return_user_id=True
+    )
+
+    response = await client.delete(
+        f"/api/v1/organizations/{org_id}/members",
+        params={"user_id": member_user_id},
+        headers=_auth_headers(admin_token),
+    )
+    # Single-member removal has always returned 200 (with a null body),
+    # not 204 -- the route sets no explicit status_code (see
+    # app/router/organizations.py's remove_member).
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_removed_member_loses_knowledge_access_and_organization_id(
     client: AsyncClient,
 ):
-    domain = f"{PREFIX}-2.com"
-    await _login(client, f"{PREFIX}-admin-2", f"admin@{domain}")
-    await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-2"})
+    """Removing a member must clear their stale KnowledgeAccess grant and
+    User.organization_id, not just delete the OrganizationMember row --
+    otherwise a future code path reading either of those directly (rather
+    than going through OrganizationMember) would see a removed user as
+    still belonging to the organization."""
+    from app.database.models import KnowledgeAccess
 
-    second_response = await client.post(
-        "/api/v1/organizations", json={"name": f"{PREFIX}-org-2b"}
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    _member_token, member_user_id = await _invite_and_accept(
+        client, org_id, owner_token, role="member", return_user_id=True
     )
-    assert second_response.status_code == 409
+
+    response = await client.delete(
+        f"/api/v1/organizations/{org_id}/members",
+        params={"user_id": member_user_id},
+        headers=_auth_headers(owner_token),
+    )
+    assert response.status_code == 200
+
+    async with async_session_factory() as session:
+        user = await session.get(User, member_user_id)
+        assert user.organization_id is None
+
+        access_result = await session.execute(
+            select(KnowledgeAccess).where(
+                KnowledgeAccess.user_id == member_user_id,
+                KnowledgeAccess.organization_id == org_id,
+            )
+        )
+        assert access_result.scalar_one_or_none() is None
 
 
 @pytest.mark.asyncio
-async def test_creating_organization_with_public_email_domain_is_rejected(
+async def test_owner_role_cannot_be_changed_or_removed_by_another_admin(
     client: AsyncClient,
 ):
-    await _login(client, f"{PREFIX}-public", f"{PREFIX}-public@gmail.com")
-
-    response = await client.post(
-        "/api/v1/organizations", json={"name": f"{PREFIX}-org-public"}
-    )
-    assert response.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_creating_organization_for_an_already_claimed_domain_is_rejected(
-    client: AsyncClient,
-):
-    domain = f"{PREFIX}-dup.com"
-    await _login(client, f"{PREFIX}-dup-admin-1", f"first@{domain}")
-    first_response = await client.post(
-        "/api/v1/organizations", json={"name": f"{PREFIX}-org-dup-1"}
-    )
-    assert first_response.status_code == 200
-
-    await _login(client, f"{PREFIX}-dup-admin-2", f"second@{domain}")
-    second_response = await client.post(
-        "/api/v1/organizations", json={"name": f"{PREFIX}-org-dup-2"}
-    )
-    assert second_response.status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_adding_member_with_mismatched_domain_is_rejected(client: AsyncClient):
-    domain = f"{PREFIX}-5.com"
-    await _login(client, f"{PREFIX}-admin-5", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-5"})
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    owner_profile = (
+        await client.get("/api/v1/users/me", headers=_auth_headers(owner_token))
     ).json()
+    admin_token = await _invite_and_accept(client, org_id, owner_token, role="admin")
 
-    outsider_email = f"{PREFIX}-outsider-5@other-{PREFIX}.com"
-    await _login(client, f"{PREFIX}-outsider-5", outsider_email)
-    outsider_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login(client, f"{PREFIX}-admin-5", f"admin@{domain}")
-    response = await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": outsider_profile["username"], "role": "member"},
-    )
-    assert response.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_non_admin_cannot_grant_knowledge_access(client: AsyncClient):
-    domain = f"{PREFIX}-3.com"
-    await _login(client, f"{PREFIX}-admin-3", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-3"})
-    ).json()
-
-    await _login(client, f"{PREFIX}-member-3", f"member@{domain}")
-    member_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login(client, f"{PREFIX}-admin-3", f"admin@{domain}")
-    add_response = await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": member_profile["username"], "role": "member"},
-    )
-    assert add_response.status_code == 200
-
-    await _login(client, f"{PREFIX}-member-3", f"member@{domain}")
-    denied_response = await client.post(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
-        params={"user_id": member_profile["id"], "allow_access": True},
-    )
-    assert denied_response.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_any_member_can_list_members_but_outsiders_cannot(client: AsyncClient):
-    domain = f"{PREFIX}-6.com"
-    await _login(client, f"{PREFIX}-admin-6", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-6"})
-    ).json()
-
-    await _login(client, f"{PREFIX}-member-6", f"member@{domain}")
-    member_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login(client, f"{PREFIX}-admin-6", f"admin@{domain}")
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": member_profile["username"]},
-    )
-
-    await _login(client, f"{PREFIX}-member-6", f"member@{domain}")
-    member_list_response = await client.get(
-        f"/api/v1/organizations/{organization['id']}/members"
-    )
-    assert member_list_response.status_code == 200
-    member_list_body = member_list_response.json()
-    assert member_list_body["total"] == 2
-    assert len(member_list_body["items"]) == 2
-
-    await _login(
-        client, f"{PREFIX}-outsider-6", f"{PREFIX}-outsider-6@other-{PREFIX}.com"
-    )
-    outsider_response = await client.get(
-        f"/api/v1/organizations/{organization['id']}/members"
-    )
-    assert outsider_response.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_admin_grants_access_then_member_can_query_company_knowledge(
-    client: AsyncClient,
-):
-    domain = f"{PREFIX}-4.com"
-    await _login(client, f"{PREFIX}-admin-4", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-4"})
-    ).json()
-
-    await _login(client, f"{PREFIX}-member-4", f"member@{domain}")
-    member_profile = (await client.get("/api/v1/users/me")).json()
-    assert member_profile["has_company_access"] is False
-
-    await _login(client, f"{PREFIX}-admin-4", f"admin@{domain}")
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": member_profile["username"]},
-    )
-    grant_response = await client.post(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
-        params={"user_id": member_profile["id"], "allow_access": True},
-    )
-    assert grant_response.status_code == 200
-
-    await _login(client, f"{PREFIX}-member-4", f"member@{domain}")
-    refreshed_profile = (await client.get("/api/v1/users/me")).json()
-    assert refreshed_profile["has_company_access"] is True
-
-
-@pytest.mark.asyncio
-async def test_creating_organization_auto_adds_existing_same_domain_users(
-    client: AsyncClient,
-):
-    domain = f"{PREFIX}-7.com"
-    # Two existing users on the domain, signed up before the org exists.
-    await _login(client, f"{PREFIX}-early-7a", f"early-a@{domain}")
-    await _login(client, f"{PREFIX}-early-7b", f"early-b@{domain}")
-
-    await _login(client, f"{PREFIX}-admin-7", f"admin@{domain}")
-    create_response = await client.post(
-        "/api/v1/organizations", json={"name": f"{PREFIX}-org-7"}
-    )
-    assert create_response.status_code == 200
-    body = create_response.json()
-    assert body["auto_added_members"] == 2
-
-    members_response = await client.get(
-        f"/api/v1/organizations/{body['id']}/members"
-    )
-    members = members_response.json()["items"]
-    assert len(members) == 3
-    auto_added = [m for m in members if m["email"] != f"admin@{domain}"]
-    assert len(auto_added) == 2
-    for member in auto_added:
-        assert member["role"] == "member"
-        assert member["has_company_access"] is False
-
-
-@pytest.mark.asyncio
-async def test_owner_role_cannot_be_changed_by_another_admin(client: AsyncClient):
-    domain = f"{PREFIX}-8.com"
-    await _login(client, f"{PREFIX}-owner-8", f"owner@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-8"})
-    ).json()
-    owner_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login(client, f"{PREFIX}-other-admin-8", f"other-admin@{domain}")
-    other_admin_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login(client, f"{PREFIX}-owner-8", f"owner@{domain}")
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": other_admin_profile["username"], "role": "admin"},
-    )
-
-    # The other admin tries to demote the owner -- must be rejected even
-    # though they themselves are an admin.
-    await _login(client, f"{PREFIX}-other-admin-8", f"other-admin@{domain}")
     demote_response = await client.patch(
-        f"/api/v1/organizations/{organization['id']}/members/{owner_profile['id']}",
+        f"/api/v1/organizations/{org_id}/members/{owner_profile['id']}",
         json={"role": "member"},
+        headers=_auth_headers(admin_token),
     )
     assert demote_response.status_code == 403
 
     remove_response = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/members",
+        f"/api/v1/organizations/{org_id}/members",
         params={"user_id": owner_profile["id"]},
+        headers=_auth_headers(admin_token),
     )
     assert remove_response.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_owner_knowledge_access_cannot_be_revoked(client: AsyncClient):
-    domain = f"{PREFIX}-9.com"
-    await _login(client, f"{PREFIX}-owner-9", f"owner@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-9"})
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    owner_profile = (
+        await client.get("/api/v1/users/me", headers=_auth_headers(owner_token))
     ).json()
-    owner_profile = (await client.get("/api/v1/users/me")).json()
 
     revoke_response = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
+        f"/api/v1/organizations/{org_id}/knowledge-access",
         params={"user_id": owner_profile["id"]},
+        headers=_auth_headers(owner_token),
     )
     assert revoke_response.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_regular_member_cannot_upload_list_or_delete_company_documents(
+async def test_member_invited_gets_default_company_knowledge_access(
     client: AsyncClient,
 ):
-    domain = f"{PREFIX}-10.com"
-    await _login(client, f"{PREFIX}-admin-10", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-10"})
-    ).json()
-
-    await _login(client, f"{PREFIX}-member-10", f"member@{domain}")
-    member_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login(client, f"{PREFIX}-admin-10", f"admin@{domain}")
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": member_profile["username"]},
+    """New behavior (spec change from the old opt-in model): a Member gets
+    company-knowledge access by default at accept time, revocable by an
+    Owner/Admin afterward -- not an opt-in grant an admin must remember to
+    make."""
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    _member_token, member_user_id = await _invite_and_accept(
+        client, org_id, owner_token, role="member", return_user_id=True
     )
 
-    await _login(client, f"{PREFIX}-member-10", f"member@{domain}")
-    upload_response = await client.post(
-        f"/api/v1/organizations/{organization['id']}/documents",
-        files={"file": ("notes.txt", b"hello", "text/plain")},
-    )
-    assert upload_response.status_code == 403
-
-    list_response = await client.get(
-        f"/api/v1/organizations/{organization['id']}/documents"
-    )
-    assert list_response.status_code == 403
-
-    delete_response = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/documents/{member_profile['id']}"
-    )
-    assert delete_response.status_code == 403
+    members = (
+        await client.get(
+            f"/api/v1/organizations/{org_id}/members",
+            headers=_auth_headers(owner_token),
+        )
+    ).json()["items"]
+    member = next(m for m in members if m["user_id"] == member_user_id)
+    assert member["has_company_access"] is True
 
 
 @pytest.mark.asyncio
-async def test_admin_can_upload_list_and_delete_company_documents(
+async def test_standalone_list_knowledge_access_endpoint_was_removed(
+    client: AsyncClient,
+):
+    """The GET .../knowledge-access list endpoint duplicated data
+    list_members already carries per-member (has_company_access) and had
+    no caller (frontend or test) that actually used it as a GET -- removed
+    in favor of the single list_members response. The path still has
+    POST/DELETE registered, so a GET against it is a 405, not a 404."""
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+
+    response = await client.get(
+        f"/api/v1/organizations/{org_id}/knowledge-access",
+        headers=_auth_headers(owner_token),
+    )
+    assert response.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_admin_and_member_can_upload_or_be_denied_company_documents(
     client: AsyncClient, tmp_path
 ):
-    domain = f"{PREFIX}-11.com"
-    await _login(client, f"{PREFIX}-admin-11", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-11"})
-    ).json()
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    _member_token = await _invite_and_accept(client, org_id, owner_token, role="member")
 
     with patch(
         "app.service.document_service.get_storage_provider",
         return_value=LocalFilesystemStorageProvider(tmp_path),
     ):
-        upload_response = await client.post(
-            f"/api/v1/organizations/{organization['id']}/documents",
-            files={"file": ("notes.txt", b"hello from the admin", "text/plain")},
+        member_upload = await client.post(
+            f"/api/v1/organizations/{org_id}/documents",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+            headers=_auth_headers(_member_token),
         )
-        assert upload_response.status_code == 200
-        document_id = upload_response.json()["id"]
+        assert member_upload.status_code == 403
 
-        list_response = await client.get(
-            f"/api/v1/organizations/{organization['id']}/documents"
+        owner_upload = await client.post(
+            f"/api/v1/organizations/{org_id}/documents",
+            files={"file": ("notes.txt", b"hello from the owner", "text/plain")},
+            headers=_auth_headers(owner_token),
         )
-        assert list_response.status_code == 200
-        assert len(list_response.json()["documents"]) == 1
+        assert owner_upload.status_code == 200
+        document_id = owner_upload.json()["id"]
 
-        # Ingestion is stubbed out (see `_no_real_ingestion` above), so
-        # move the document to a terminal status first, as the real
-        # pipeline eventually would -- delete refuses a pending document.
         async with async_session_factory() as session:
             db_document = await session.get(Document, document_id)
             db_document.status = "completed"
             await session.commit()
 
         delete_response = await client.delete(
-            f"/api/v1/organizations/{organization['id']}/documents/{document_id}"
+            f"/api/v1/organizations/{org_id}/documents/{document_id}",
+            headers=_auth_headers(owner_token),
         )
         assert delete_response.status_code == 204
 
 
+# --- Invitation router endpoints (Task 5) ------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_knowledge_access_lets_a_member_list_but_not_upload_or_delete(
+async def test_admin_can_invite_a_member_but_not_an_admin(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    admin_token = await _invite_and_accept(client, org_id, owner_token, role="admin")
+
+    with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+        member_invite = await client.post(
+            f"/api/v1/organizations/{org_id}/invitations",
+            data={
+                "email": f"{PREFIX}-newmember@{PREFIX}.example.com",
+                "role": "member",
+            },
+            headers=_auth_headers(admin_token),
+        )
+        admin_invite = await client.post(
+            f"/api/v1/organizations/{org_id}/invitations",
+            data={"email": f"{PREFIX}-newadmin@{PREFIX}.example.com", "role": "admin"},
+            headers=_auth_headers(admin_token),
+        )
+    assert member_invite.status_code == 200
+    assert admin_invite.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_create_invitation_requires_either_email_or_a_file(
     client: AsyncClient,
 ):
-    """Document management has no delegation path: a member granted
-    company-knowledge (query) access can view/list company documents, but
-    can never upload or delete them -- that stays admin-only."""
-    domain = f"{PREFIX}-12.com"
-    await _login(client, f"{PREFIX}-admin-12", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-12"})
-    ).json()
+    owner_token, org_id = await _signup_owner_and_create_org(client)
 
-    await _login(client, f"{PREFIX}-member-12", f"member@{domain}")
-    member_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login(client, f"{PREFIX}-admin-12", f"admin@{domain}")
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": member_profile["username"]},
+    response = await client.post(
+        f"/api/v1/organizations/{org_id}/invitations",
+        headers=_auth_headers(owner_token),
     )
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
-        params={"user_id": member_profile["id"], "allow_access": True},
-    )
-
-    await _login(client, f"{PREFIX}-member-12", f"member@{domain}")
-    list_response = await client.get(
-        f"/api/v1/organizations/{organization['id']}/documents"
-    )
-    assert list_response.status_code == 200
-
-    upload_response = await client.post(
-        f"/api/v1/organizations/{organization['id']}/documents",
-        files={"file": ("notes.txt", b"hello", "text/plain")},
-    )
-    assert upload_response.status_code == 403
-
-    delete_response = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/documents/{member_profile['id']}"
-    )
-    assert delete_response.status_code == 403
-
-
-# --- Trench admin vs organization admin (independent axes) -----------------
-
-
-async def _login_without_trench_admin(
-    client: AsyncClient, uid: str, email: str
-) -> None:
-    """Like `_login`, but does NOT promote to Trench admin -- for tests
-    specifically about the ordinary (role="user") case."""
-    with patch(
-        "app.utils.firebase.verify_firebase_id_token", return_value=_claims(uid, email)
-    ):
-        await client.post("/api/v1/auth/signup", json={"id_token": "fake"})
-        response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
-    client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
-async def test_non_trench_admin_cannot_create_an_organization(client: AsyncClient):
-    domain = f"{PREFIX}-15.com"
-    await _login_without_trench_admin(client, f"{PREFIX}-plain-15", f"plain@{domain}")
-
-    me = (await client.get("/api/v1/users/me")).json()
-    assert me["role"] == "user"
+async def test_create_invitation_rejects_both_email_and_a_file(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    csv_content = f"email,role\n{PREFIX}-both@{PREFIX}.example.com,member\n".encode()
 
     response = await client.post(
-        "/api/v1/organizations", json={"name": f"{PREFIX}-org-15"}
+        f"/api/v1/organizations/{org_id}/invitations",
+        data={"email": f"{PREFIX}-both@{PREFIX}.example.com", "role": "member"},
+        files={"file": ("employees.csv", csv_content, "text/csv")},
+        headers=_auth_headers(owner_token),
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_invitations_requires_admin_or_owner(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    _member_token, _uid = await _invite_and_accept(
+        client, org_id, owner_token, role="member", return_user_id=True
+    )
+    member_token = _member_token
+
+    response = await client.get(
+        f"/api/v1/organizations/{org_id}/invitations",
+        headers=_auth_headers(member_token),
     )
     assert response.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_trench_admin_and_organization_admin_roles_are_independent(
+async def test_revoke_invitation(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+        invite = await client.post(
+            f"/api/v1/organizations/{org_id}/invitations",
+            data={"email": f"{PREFIX}-revokee@{PREFIX}.example.com", "role": "member"},
+            headers=_auth_headers(owner_token),
+        )
+    invitation_id = invite.json()["id"]
+
+    response = await client.delete(
+        f"/api/v1/organizations/{org_id}/invitations/{invitation_id}",
+        headers=_auth_headers(owner_token),
+    )
+    assert response.status_code == 204
+
+    listing = await client.get(
+        f"/api/v1/organizations/{org_id}/invitations",
+        headers=_auth_headers(owner_token),
+    )
+    revoked = next(i for i in listing.json() if i["id"] == invitation_id)
+    assert revoked["status"] == "revoked"
+
+
+# --- Bulk CSV/Excel invitation upload (Task 7) -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bulk_upload_succeeds_when_every_row_is_valid(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    csv_content = (
+        "email,role\n"
+        f"{PREFIX}-bulk1@{PREFIX}.example.com,member\n"
+        f"{PREFIX}-bulk2@{PREFIX}.example.com,admin\n"  # fine -- owner uploading
+    ).encode()
+
+    with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+        response = await client.post(
+            f"/api/v1/organizations/{org_id}/invitations",
+            files={"file": ("employees.csv", csv_content, "text/csv")},
+            headers=_auth_headers(owner_token),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["succeeded"]) == 2
+    assert len(body["failed"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_upload_rejects_the_entire_file_if_any_row_is_invalid(
     client: AsyncClient,
 ):
-    domain = f"{PREFIX}-16.com"
-    # Owner is a Trench admin (via _login's promotion) -- creates the org
-    # and becomes its owner/org-admin.
-    await _login(client, f"{PREFIX}-owner-16", f"owner@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-16"})
-    ).json()
+    """A file with even one invalid row is rejected wholesale -- no
+    invitations are created for ANY row, valid or not."""
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    valid_email = f"{PREFIX}-bulk-valid@{PREFIX}.example.com"
+    csv_content = (
+        f"email,role\n{valid_email},member\nnot-an-email,member\n"
+    ).encode()
 
-    # A second user signs up as an ordinary Trench user (role="user"), not
-    # a Trench admin.
-    await _login_without_trench_admin(client, f"{PREFIX}-plain-16", f"plain@{domain}")
-    plain_profile = (await client.get("/api/v1/users/me")).json()
-    assert plain_profile["role"] == "user"
+    with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+        response = await client.post(
+            f"/api/v1/organizations/{org_id}/invitations",
+            files={"file": ("employees.csv", csv_content, "text/csv")},
+            headers=_auth_headers(owner_token),
+        )
 
-    # The owner (Trench admin) makes this ordinary Trench user an *org*
-    # admin -- an org-level role, granted independently of their Trench
-    # role.
-    await _login(client, f"{PREFIX}-owner-16", f"owner@{domain}")
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": plain_profile["username"], "role": "admin"},
+    assert response.status_code == 422
+    assert "row 2" in response.text.lower()
+
+    listing = await client.get(
+        f"/api/v1/organizations/{org_id}/invitations",
+        headers=_auth_headers(owner_token),
     )
-
-    # From the plain user's own perspective: Trench role stays "user", but
-    # their organization role is now "admin" -- the two are independent
-    # fields on the same profile.
-    await _login_without_trench_admin(client, f"{PREFIX}-plain-16", f"plain@{domain}")
-    refreshed_profile = (await client.get("/api/v1/users/me")).json()
-    assert refreshed_profile["role"] == "user"
-    assert refreshed_profile["organization"]["role"] == "admin"
-
-    # Being an org admin does NOT make them a Trench admin: they still
-    # can't create a (second, unrelated) organization at the Trench level
-    # -- this 403 fires from require_trench_admin before OrganizationService
-    # ever gets to check "you already belong to one".
-    denied = await client.post(
-        "/api/v1/organizations", json={"name": f"{PREFIX}-org-16-second"}
-    )
-    assert denied.status_code == 403
-
-    # But being an org admin (despite role="user" at the Trench level) DOES
-    # let them perform org-admin actions, e.g. adding another member.
-    await _login_without_trench_admin(
-        client, f"{PREFIX}-third-16", f"third@{domain}"
-    )
-    third_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login_without_trench_admin(client, f"{PREFIX}-plain-16", f"plain@{domain}")
-    add_response = await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": third_profile["username"]},
-    )
-    assert add_response.status_code == 200
-
-
-# --- Members pagination and search ------------------------------------------
+    assert not any(i["email"] == valid_email for i in listing.json())
 
 
 @pytest.mark.asyncio
-async def test_list_members_defaults_to_a_page_size_of_10(client: AsyncClient):
-    domain = f"{PREFIX}-17.com"
-    await _login(client, f"{PREFIX}-admin-17", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-17"})
-    ).json()
-
-    for i in range(11):
-        await _login_without_trench_admin(
-            client, f"{PREFIX}-m17-{i}", f"m17-{i}-{PREFIX}@{domain}"
-        )
-    await _login(client, f"{PREFIX}-admin-17", f"admin@{domain}")
-    for i in range(11):
-        await client.post(
-            f"/api/v1/organizations/{organization['id']}/members",
-            json={"username": f"m17-{i}-{PREFIX}"},
-        )
-
-    first_page = (
-        await client.get(f"/api/v1/organizations/{organization['id']}/members")
-    ).json()
-    assert first_page["page"] == 1
-    assert first_page["page_size"] == 10
-    assert first_page["total"] == 12  # admin + 11 members
-    assert len(first_page["items"]) == 10
-    assert first_page["total_pages"] == 2
-
-    second_page = (
-        await client.get(
-            f"/api/v1/organizations/{organization['id']}/members",
-            params={"page": 2},
-        )
-    ).json()
-    assert len(second_page["items"]) == 2
-
-
-@pytest.mark.asyncio
-async def test_list_members_search_matches_username_or_email(client: AsyncClient):
-    domain = f"{PREFIX}-18.com"
-    await _login(client, f"{PREFIX}-admin-18", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-18"})
-    ).json()
-
-    await _login_without_trench_admin(
-        client, f"{PREFIX}-alice-18", f"alice-18-{PREFIX}@{domain}"
-    )
-    await _login_without_trench_admin(
-        client, f"{PREFIX}-bob-18", f"unique-bob-mailbox-18-{PREFIX}@{domain}"
-    )
-    await _login(client, f"{PREFIX}-admin-18", f"admin@{domain}")
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": f"alice-18-{PREFIX}"},
-    )
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": f"unique-bob-mailbox-18-{PREFIX}"},
-    )
-
-    by_username = (
-        await client.get(
-            f"/api/v1/organizations/{organization['id']}/members",
-            params={"search": "alice-18"},
-        )
-    ).json()
-    assert by_username["total"] == 1
-    assert by_username["items"][0]["username"] == f"alice-18-{PREFIX}"
-
-    by_email = (
-        await client.get(
-            f"/api/v1/organizations/{organization['id']}/members",
-            params={"search": "unique-bob-mailbox"},
-        )
-    ).json()
-    assert by_email["total"] == 1
-    assert by_email["items"][0]["username"] == f"unique-bob-mailbox-18-{PREFIX}"
-
-    no_match = (
-        await client.get(
-            f"/api/v1/organizations/{organization['id']}/members",
-            params={"search": f"{PREFIX}-nobody-matches-this"},
-        )
-    ).json()
-    assert no_match["total"] == 0
-    assert no_match["items"] == []
-
-
-# --- Bulk knowledge-access revocation ----------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_remove_access_revokes_every_members_knowledge_access(
+async def test_bulk_upload_rejects_the_entire_file_for_an_invalid_role(
     client: AsyncClient,
 ):
-    domain = f"{PREFIX}-19.com"
-    await _login(client, f"{PREFIX}-admin-19", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-19"})
-    ).json()
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    csv_content = (
+        f"email,role\n{PREFIX}-bulkrole@{PREFIX}.example.com,superadmin\n"
+    ).encode()
 
-    member_ids = []
-    for i in range(2):
-        await _login_without_trench_admin(
-            client, f"{PREFIX}-m19-{i}", f"m19-{i}@{domain}"
-        )
-        profile = (await client.get("/api/v1/users/me")).json()
-        member_ids.append(profile["id"])
-
-    await _login(client, f"{PREFIX}-admin-19", f"admin@{domain}")
-    for i, member_id in enumerate(member_ids):
-        await client.post(
-            f"/api/v1/organizations/{organization['id']}/members",
-            json={"username": f"{PREFIX}-m19-{i}"},
-        )
-        await client.post(
-            f"/api/v1/organizations/{organization['id']}/knowledge-access",
-            params={"user_id": member_id, "allow_access": True},
-        )
-
-    members_before = (
-        await client.get(f"/api/v1/organizations/{organization['id']}/members")
-    ).json()["items"]
-    granted_before = [m for m in members_before if m["user_id"] in member_ids]
-    assert all(m["has_company_access"] for m in granted_before)
-
-    bulk_response = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
-        params={"remove_access": True},
+    response = await client.post(
+        f"/api/v1/organizations/{org_id}/invitations",
+        files={"file": ("employees.csv", csv_content, "text/csv")},
+        headers=_auth_headers(owner_token),
     )
-    assert bulk_response.status_code == 200
-    assert bulk_response.json()["revoked_count"] == 2
 
-    members_after = (
-        await client.get(f"/api/v1/organizations/{organization['id']}/members")
-    ).json()["items"]
-    for member in members_after:
-        if member["user_id"] in member_ids:
-            assert member["has_company_access"] is False
+    assert response.status_code == 422
+    assert "role" in response.text.lower()
 
 
 @pytest.mark.asyncio
-async def test_revoke_knowledge_access_rejects_ambiguous_or_missing_params(
+async def test_bulk_upload_rejects_the_entire_file_for_a_mismatched_domain(
     client: AsyncClient,
 ):
-    domain = f"{PREFIX}-20.com"
-    await _login(client, f"{PREFIX}-admin-20", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-20"})
-    ).json()
-    admin_profile = (await client.get("/api/v1/users/me")).json()
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    csv_content = b"email,role\nsomeone@othercompany.example.com,member\n"
 
-    both_given = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
-        params={"user_id": admin_profile["id"], "remove_access": True},
+    response = await client.post(
+        f"/api/v1/organizations/{org_id}/invitations",
+        files={"file": ("employees.csv", csv_content, "text/csv")},
+        headers=_auth_headers(owner_token),
     )
-    assert both_given.status_code == 422
 
-    neither_given = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access"
-    )
-    assert neither_given.status_code == 422
-
-
-# --- Bulk knowledge-access grant, bulk member removal, sort order -----------
+    assert response.status_code == 422
+    assert "domain" in response.text.lower()
 
 
 @pytest.mark.asyncio
-async def test_access_all_grants_every_current_member(client: AsyncClient):
-    domain = f"{PREFIX}-21.com"
-    await _login(client, f"{PREFIX}-admin-21", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-21"})
-    ).json()
-
-    member_ids = []
-    for i in range(2):
-        await _login_without_trench_admin(
-            client, f"{PREFIX}-m21-{i}", f"m21-{i}-{PREFIX}@{domain}"
-        )
-        profile = (await client.get("/api/v1/users/me")).json()
-        member_ids.append(profile["id"])
-
-    await _login(client, f"{PREFIX}-admin-21", f"admin@{domain}")
-    for i in range(2):
-        await client.post(
-            f"/api/v1/organizations/{organization['id']}/members",
-            json={"username": f"m21-{i}-{PREFIX}"},
-        )
-
-    members_before = (
-        await client.get(f"/api/v1/organizations/{organization['id']}/members")
-    ).json()["items"]
-    targeted_before = [m for m in members_before if m["user_id"] in member_ids]
-    assert all(not m["has_company_access"] for m in targeted_before)
-
-    grant_response = await client.post(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
-        params={"access_all": True},
-    )
-    assert grant_response.status_code == 200
-    # 2 members + the admin (who gets a harmless grant row too, even
-    # though their effective access already came from their role).
-    assert grant_response.json()["granted_count"] == 3
-
-    members_after = (
-        await client.get(f"/api/v1/organizations/{organization['id']}/members")
-    ).json()["items"]
-    targeted_after = [m for m in members_after if m["user_id"] in member_ids]
-    assert all(m["has_company_access"] for m in targeted_after)
-
-
-@pytest.mark.asyncio
-async def test_update_knowledge_access_rejects_ambiguous_or_missing_params(
+async def test_bulk_upload_rejects_the_entire_file_for_admin_rows_from_an_admin(
     client: AsyncClient,
 ):
-    domain = f"{PREFIX}-22.com"
-    await _login(client, f"{PREFIX}-admin-22", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-22"})
-    ).json()
-    admin_profile = (await client.get("/api/v1/users/me")).json()
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    admin_token = await _invite_and_accept(client, org_id, owner_token, role="admin")
 
-    both_given = await client.post(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
-        params={
-            "user_id": admin_profile["id"],
-            "allow_access": True,
-            "access_all": True,
-        },
-    )
-    assert both_given.status_code == 422
-
-    neither_given = await client.post(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access"
-    )
-    assert neither_given.status_code == 422
-
-    missing_allow_access = await client.post(
-        f"/api/v1/organizations/{organization['id']}/knowledge-access",
-        params={"user_id": admin_profile["id"]},
-    )
-    assert missing_allow_access.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_remove_all_removes_every_member_except_owner_and_caller(
-    client: AsyncClient,
-):
-    domain = f"{PREFIX}-23.com"
-    await _login(client, f"{PREFIX}-owner-23", f"owner@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-23"})
-    ).json()
-    owner_profile = (await client.get("/api/v1/users/me")).json()
-
-    for i in range(2):
-        await _login_without_trench_admin(
-            client, f"{PREFIX}-m23-{i}", f"m23-{i}-{PREFIX}@{domain}"
-        )
-    await _login(client, f"{PREFIX}-owner-23", f"owner@{domain}")
-    for i in range(2):
-        await client.post(
-            f"/api/v1/organizations/{organization['id']}/members",
-            json={"username": f"m23-{i}-{PREFIX}"},
-        )
-
-    before = (
-        await client.get(f"/api/v1/organizations/{organization['id']}/members")
-    ).json()
-    assert before["total"] == 3  # owner + 2 members
-
-    bulk_response = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/members",
-        params={"remove_all": True},
-    )
-    assert bulk_response.status_code == 200
-    assert bulk_response.json()["removed_count"] == 2
-
-    after = (
-        await client.get(f"/api/v1/organizations/{organization['id']}/members")
-    ).json()
-    assert after["total"] == 1
-    assert after["items"][0]["user_id"] == owner_profile["id"]
-
-
-@pytest.mark.asyncio
-async def test_remove_member_rejects_ambiguous_or_missing_params(client: AsyncClient):
-    domain = f"{PREFIX}-24.com"
-    await _login(client, f"{PREFIX}-admin-24", f"admin@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-24"})
-    ).json()
-    admin_profile = (await client.get("/api/v1/users/me")).json()
-
-    both_given = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/members",
-        params={"user_id": admin_profile["id"], "remove_all": True},
-    )
-    assert both_given.status_code == 422
-
-    neither_given = await client.delete(
-        f"/api/v1/organizations/{organization['id']}/members"
-    )
-    assert neither_given.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_members_are_sorted_owner_then_admins_then_members(client: AsyncClient):
-    domain = f"{PREFIX}-25.com"
-    await _login(client, f"{PREFIX}-owner-25", f"owner@{domain}")
-    organization = (
-        await client.post("/api/v1/organizations", json={"name": f"{PREFIX}-org-25"})
-    ).json()
-    owner_profile = (await client.get("/api/v1/users/me")).json()
-
-    # A regular member added first (so insertion order alone would put
-    # them ahead of an admin added later, if not for the explicit sort).
-    await _login_without_trench_admin(
-        client, f"{PREFIX}-early-member-25", f"early-member-{PREFIX}@{domain}"
-    )
-    early_member_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login_without_trench_admin(
-        client, f"{PREFIX}-later-admin-25", f"later-admin-{PREFIX}@{domain}"
-    )
-    later_admin_profile = (await client.get("/api/v1/users/me")).json()
-
-    await _login(client, f"{PREFIX}-owner-25", f"owner@{domain}")
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": f"early-member-{PREFIX}"},
-    )
-    await client.post(
-        f"/api/v1/organizations/{organization['id']}/members",
-        json={"username": f"later-admin-{PREFIX}", "role": "admin"},
+    csv_content = (
+        f"email,role\n{PREFIX}-bulkadmin@{PREFIX}.example.com,admin\n"
+    ).encode()
+    response = await client.post(
+        f"/api/v1/organizations/{org_id}/invitations",
+        files={"file": ("employees.csv", csv_content, "text/csv")},
+        headers=_auth_headers(admin_token),
     )
 
-    members = (
-        await client.get(f"/api/v1/organizations/{organization['id']}/members")
-    ).json()["items"]
-    ordered_user_ids = [m["user_id"] for m in members]
-    assert ordered_user_ids == [
-        owner_profile["id"],
-        later_admin_profile["id"],
-        early_member_profile["id"],
+    assert response.status_code == 422
+    assert "admin" in response.text.lower()
+
+
+# --- Bulk upload row parsing (unit-level, no HTTP/owner-signup needed) -------
+
+
+def test_parse_bulk_rows_from_csv():
+    from app.router.organizations import _parse_bulk_rows
+
+    content = b"email,role\nalice@example.com,member\nbob@example.com,admin\n"
+    rows = _parse_bulk_rows("employees.csv", content)
+    assert rows == [
+        (1, "alice@example.com", "member"),
+        (2, "bob@example.com", "admin"),
     ]
+
+
+def test_parse_bulk_rows_rejects_csv_missing_required_columns():
+    from app.router.organizations import _parse_bulk_rows
+
+    content = b"name,title\nalice,engineer\n"
+    with pytest.raises(ValueError, match="email.*role"):
+        _parse_bulk_rows("employees.csv", content)
+
+
+def test_parse_bulk_rows_rejects_more_than_fifty_rows():
+    from app.router.organizations import _parse_bulk_rows
+
+    rows = "email,role\n" + "".join(
+        f"user{i}@example.com,member\n" for i in range(51)
+    )
+    with pytest.raises(ValueError, match="50"):
+        _parse_bulk_rows("employees.csv", rows.encode())
+
+
+def test_parse_bulk_rows_accepts_exactly_fifty_rows():
+    from app.router.organizations import _parse_bulk_rows
+
+    rows = "email,role\n" + "".join(
+        f"user{i}@example.com,member\n" for i in range(50)
+    )
+    assert len(_parse_bulk_rows("employees.csv", rows.encode())) == 50
+
+
+def test_parse_bulk_rows_rejects_unsupported_file_type():
+    from app.router.organizations import _parse_bulk_rows
+
+    with pytest.raises(ValueError, match="Unsupported file type"):
+        _parse_bulk_rows("employees.pdf", b"whatever")
+
+
+def test_parse_bulk_rows_from_xlsx():
+    import io
+
+    import openpyxl
+
+    from app.router.organizations import _parse_bulk_rows
+
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["email", "role"])
+    sheet.append(["alice@example.com", "member"])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+
+    rows = _parse_bulk_rows("employees.xlsx", buffer.getvalue())
+    assert rows == [(1, "alice@example.com", "member")]
+
+
+# --- Invitation email-delivery failure handling (Task 16 finding) -----------
+
+
+@pytest.mark.asyncio
+async def test_create_invitation_returns_502_when_email_delivery_fails(
+    client: AsyncClient,
+):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+
+    with patch(
+        "app.service.invitation_service.send_email",
+        new=AsyncMock(side_effect=OSError("smtp unreachable")),
+    ):
+        response = await client.post(
+            f"/api/v1/organizations/{org_id}/invitations",
+            data={
+                "email": f"{PREFIX}-delivery-fail@{PREFIX}.example.com",
+                "role": "member",
+            },
+            headers=_auth_headers(owner_token),
+        )
+
+    assert response.status_code == 502
+
+    # The invitation still exists (pending) despite the 502, so Resend
+    # can recover it without the Owner re-entering the email.
+    listing = await client.get(
+        f"/api/v1/organizations/{org_id}/invitations",
+        headers=_auth_headers(owner_token),
+    )
+    emails = [i["email"] for i in listing.json()]
+    assert f"{PREFIX}-delivery-fail@{PREFIX}.example.com" in emails
+
+
+@pytest.mark.asyncio
+async def test_bulk_upload_reports_email_delivery_failure_as_a_row_failure(
+    client: AsyncClient,
+):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    csv_content = (
+        f"email,role\n{PREFIX}-bulk-delivery-fail@{PREFIX}.example.com,member\n"
+    ).encode()
+
+    with patch(
+        "app.service.invitation_service.send_email",
+        new=AsyncMock(side_effect=OSError("smtp unreachable")),
+    ):
+        response = await client.post(
+            f"/api/v1/organizations/{org_id}/invitations",
+            files={"file": ("employees.csv", csv_content, "text/csv")},
+            headers=_auth_headers(owner_token),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["succeeded"]) == 0
+    assert len(body["failed"]) == 1
+    assert "email" in body["failed"][0]["reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_list_invitations_includes_accepted_at_once_accepted(client: AsyncClient):
+    owner_token, org_id = await _signup_owner_and_create_org(client)
+    _member_token, _uid = await _invite_and_accept(
+        client, org_id, owner_token, role="member", return_user_id=True
+    )
+
+    listing = await client.get(
+        f"/api/v1/organizations/{org_id}/invitations",
+        headers=_auth_headers(owner_token),
+    )
+    accepted = next(i for i in listing.json() if i["status"] == "accepted")
+    assert accepted["accepted_at"] is not None

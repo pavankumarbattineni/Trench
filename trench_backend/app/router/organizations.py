@@ -1,18 +1,20 @@
-"""Organization creation, membership management, company-knowledge access
-grants, and company-document management.
+"""Membership management, company-knowledge access grants, and
+company-document management for an organization.
 
-Every mutation here (add/remove member, change role, grant/revoke
-knowledge access, upload/delete a company document) requires the caller
-to be an admin of the organization in question -- enforced by the
-`require_org_admin` dependency, never by trusting a frontend's decision
-to hide a button. Document management (upload/delete) is admin-only with
-no delegation path -- a member can only ever be granted read/query access
-via `knowledge-access`, never the ability to manage documents.
+Organization creation now happens only via POST /auth/signup/owner (see
+app/router/auth.py) -- invitation-only onboarding means there is no
+longer a self-service "create an organization" endpoint here.
 
-Creating an organization additionally requires the caller to be a Trench
-*application* administrator (`require_trench_admin`) -- a separate,
-unrelated concept from an organization's own admin role (see
-app/database/models.py::User.role and app/router/deps.py).
+Most mutations here (grant/revoke knowledge access, upload/delete a
+company document, remove a Member) require the caller to be an Admin or
+the Owner of the organization in question -- enforced by the
+`require_org_admin_or_owner` dependency, never by trusting a frontend's
+decision to hide a button. A smaller set (promoting a Member to Admin,
+removing an Admin, bulk-removing every member) is Owner-only, enforced by
+`require_org_owner` or an explicit role check. Document management
+(upload/delete) has no delegation path -- a member can only ever be
+granted read/query access via `knowledge-access`, never the ability to
+manage documents.
 
 Knowledge-access grant/revoke and member removal both take their target as
 a query parameter (not a path segment), and both support a bulk "apply to
@@ -33,36 +35,60 @@ Each of these four bulk/single pairs rejects a request that gives neither
 target, and rejects one that gives both (ambiguous) with a 422.
 """
 
+import csv
+import io
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+import openpyxl
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from pydantic import EmailStr, TypeAdapter, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Document, OrganizationMember, User
+from app.database.models import (
+    Document,
+    Invitation,
+    Organization,
+    OrganizationMember,
+    User,
+)
 from app.database.session import get_db
 from app.router.deps import (
     get_current_organization_membership,
     get_current_user,
     require_company_knowledge_access,
-    require_org_admin,
+    require_org_admin_or_owner,
     require_org_member,
-    require_trench_admin,
 )
 from app.schemas.document import DocumentListResponse, DocumentResponse
+from app.schemas.invitation import (
+    BulkInvitationResult,
+    BulkInvitationRowError,
+    InvitationResponse,
+)
 from app.schemas.organization import (
-    AddMemberRequest,
     KnowledgeAccessBulkGrantResponse,
     KnowledgeAccessBulkRevokeResponse,
-    KnowledgeAccessResponse,
     MemberBulkRemoveResponse,
     MyOrganizationResponse,
-    OrganizationCreatedResponse,
-    OrganizationCreateRequest,
     OrganizationMemberResponse,
     PaginatedMembersResponse,
     UpdateMemberRoleRequest,
 )
 from app.service.document_service import DocumentService
+from app.service.invitation_service import (
+    DomainMismatchError,
+    InvitationService,
+    TooManyRoleError,
+)
 from app.service.knowledge_access_service import KnowledgeAccessService
 from app.service.organization_service import OrganizationService
 from app.service.user_service import UserService
@@ -70,51 +96,7 @@ from app.service.user_service import UserService
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
 _USER_NOT_FOUND = HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
-
-
-@router.post("", response_model=OrganizationCreatedResponse)
-async def create_organization(
-    body: OrganizationCreateRequest,
-    current_user: User = Depends(require_trench_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Creates an organization with the caller as its first admin and
-    permanent owner. Requires the caller to be a Trench application
-    administrator (User.role == "admin") -- an entirely separate concept
-    from any organization's own admin role (see require_trench_admin).
-
-    Args:
-        body: The new organization's name.
-        current_user: The authenticated Trench admin, who becomes the new
-            organization's first admin and owner.
-        db: An active async SQLAlchemy session.
-
-    Returns:
-        The newly created organization, plus how many existing users on
-        the same email domain were automatically added as members. Its
-        domain is derived from the creator's own email address, not
-        supplied by the caller.
-
-    Raises:
-        HTTPException: 403 if the caller isn't a Trench admin; 409 if the
-            caller already belongs to an organization, if the name is
-            already taken, or if an organization already exists for the
-            caller's email domain; 422 if the caller's email is a
-            public/personal provider (Gmail, Yahoo, etc.) rather than a
-            work domain.
-    """
-    organization, _member, auto_added = await OrganizationService.create(
-        db, creator=current_user, name=body.name
-    )
-    return OrganizationCreatedResponse(
-        id=organization.id,
-        name=organization.name,
-        domain=organization.domain,
-        owner_user_id=organization.owner_user_id,
-        is_active=organization.is_active,
-        created_at=organization.created_at,
-        auto_added_members=auto_added,
-    )
+_email_adapter = TypeAdapter(EmailStr)
 
 
 @router.get("/me", response_model=MyOrganizationResponse)
@@ -164,7 +146,7 @@ async def _member_response(
         username=user.username,
         email=user.email,
         role=member.role,
-        has_company_access=has_access or member.role == "admin",
+        has_company_access=has_access or member.role in ("admin", "owner"),
         is_owner=organization is not None and organization.owner_user_id == user.id,
         created_at=member.created_at,
     )
@@ -213,46 +195,6 @@ async def list_members(
     )
 
 
-@router.post("/{organization_id}/members", response_model=OrganizationMemberResponse)
-async def add_member(
-    organization_id: uuid.UUID,
-    body: AddMemberRequest,
-    _admin: OrganizationMember = Depends(require_org_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Adds an existing user to the organization. Admin only.
-
-    Args:
-        organization_id: The organization to add the user to.
-        body: The target user's username and their initial role.
-        _admin: The caller's admin membership (only used to enforce the
-            admin-only requirement).
-        db: An active async SQLAlchemy session.
-
-    Returns:
-        The new member record.
-
-    Raises:
-        HTTPException: 404 if the organization doesn't exist or no user
-            has that username; 403 if the caller isn't an admin; 422 if
-            that user's email domain doesn't match the organization's;
-            409 if that user already belongs to an organization.
-    """
-    organization = await OrganizationService.get_by_id(db, organization_id)
-    if organization is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Organization not found")
-    target_user = await UserService.get_by_username(db, body.username)
-    if target_user is None:
-        raise _USER_NOT_FOUND
-    member = await OrganizationService.add_member(
-        db,
-        organization=organization,
-        target_user=target_user,
-        role=body.role,
-    )
-    return await _member_response(db, member)
-
-
 @router.patch(
     "/{organization_id}/members/{user_id}", response_model=OrganizationMemberResponse
 )
@@ -260,17 +202,17 @@ async def update_member_role(
     organization_id: uuid.UUID,
     user_id: uuid.UUID,
     body: UpdateMemberRoleRequest,
-    _admin: OrganizationMember = Depends(require_org_admin),
+    acting_membership: OrganizationMember = Depends(require_org_admin_or_owner),
     db: AsyncSession = Depends(get_db),
 ):
-    """Promotes/demotes a member's role. Admin only.
+    """Promotes/demotes a member's role. Owner only.
 
     Args:
         organization_id: The organization the member belongs to.
         user_id: The member whose role to change.
         body: The new role ("admin" | "member").
-        _admin: The caller's admin membership (only used to enforce the
-            admin-only requirement).
+        acting_membership: The caller's own membership (used to enforce
+            the Owner-only requirement).
         db: An active async SQLAlchemy session.
 
     Returns:
@@ -278,11 +220,15 @@ async def update_member_role(
 
     Raises:
         HTTPException: 404 if the organization or member doesn't exist;
-            403 if the caller isn't an admin of it, or if `user_id` is
+            403 if the caller isn't the Owner of it, or if `user_id` is
             the organization's owner (whose role can never be changed).
     """
     member = await OrganizationService.update_role(
-        db, organization_id=organization_id, target_user_id=user_id, role=body.role
+        db,
+        organization_id=organization_id,
+        target_user_id=user_id,
+        role=body.role,
+        acting_membership=acting_membership,
     )
     return await _member_response(db, member)
 
@@ -295,19 +241,21 @@ async def remove_member(
     organization_id: uuid.UUID,
     user_id: uuid.UUID | None = None,
     remove_all: bool = False,
-    admin: OrganizationMember = Depends(require_org_admin),
+    acting_membership: OrganizationMember = Depends(require_org_admin_or_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """Removes a member from the organization -- either one (`user_id`),
-    or every member at once (`remove_all=true`). Admin only.
+    or every member at once (`remove_all=true`). Admin or Owner for a
+    single Member; Owner only for removing an Admin or for the bulk
+    `remove_all` mode.
 
     Args:
         organization_id: The organization to remove member(s) from.
         user_id: The single member to remove, when `remove_all` is false.
             Must be omitted when `remove_all` is true.
         remove_all: `true` removes every member except the permanent
-            owner and the caller themself.
-        admin: The caller's admin membership.
+            owner and the caller themself. Owner only.
+        acting_membership: The caller's own membership.
         db: An active async SQLAlchemy session.
 
     Returns:
@@ -317,21 +265,28 @@ async def remove_member(
     Raises:
         HTTPException: 422 if both/neither `user_id` and `remove_all` are
             meaningfully set; 404 if the organization or (single-member
-            mode) member doesn't exist; 403 if the caller isn't an admin
-            of it, or (single-member mode) `user_id` is the organization's
-            owner (who can never be removed); 409 if an admin tries to
-            remove themself in single-member mode (transfer admin to
-            someone else first, or use `remove_all`, which skips them
-            automatically).
+            mode) member doesn't exist; 403 if the caller isn't an Admin
+            or Owner of it, if `remove_all` is requested by a non-Owner,
+            if (single-member mode) `user_id` is the organization's owner
+            (who can never be removed), or if an Admin tries to remove
+            another Admin (Owner only); 409 if the caller tries to remove
+            themself in single-member mode.
     """
     if remove_all:
+        if acting_membership.role != "owner":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Only the organization owner can remove all members at once",
+            )
         if user_id is not None:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
                 "Provide either user_id or remove_all=true, not both",
             )
         removed_count = await OrganizationService.remove_all_members(
-            db, organization_id=organization_id, acting_user_id=admin.user_id
+            db,
+            organization_id=organization_id,
+            acting_user_id=acting_membership.user_id,
         )
         return MemberBulkRemoveResponse(removed_count=removed_count)
 
@@ -344,49 +299,9 @@ async def remove_member(
         db,
         organization_id=organization_id,
         target_user_id=user_id,
-        acting_user_id=admin.user_id,
+        acting_membership=acting_membership,
     )
     return None
-
-
-@router.get(
-    "/{organization_id}/knowledge-access", response_model=list[KnowledgeAccessResponse]
-)
-async def list_knowledge_access(
-    organization_id: uuid.UUID,
-    _admin: OrganizationMember = Depends(require_org_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Lists who currently has company-knowledge access. Admin only.
-
-    Args:
-        organization_id: The organization to list grants for.
-        _admin: The caller's admin membership (only used to enforce the
-            admin-only requirement).
-        db: An active async SQLAlchemy session.
-
-    Returns:
-        Every active company-knowledge-access grant for the organization.
-
-    Raises:
-        HTTPException: 404 if the organization doesn't exist; 403 if the
-            caller isn't an admin of it.
-    """
-    grants = await KnowledgeAccessService.list_for_organization(db, organization_id)
-    responses = []
-    for grant in grants:
-        user = await UserService.get_by_id(db, grant.user_id)
-        responses.append(
-            KnowledgeAccessResponse(
-                id=grant.id,
-                user_id=grant.user_id,
-                username=user.username,
-                knowledge_type=grant.knowledge_type,
-                is_active=grant.is_active,
-                created_at=grant.created_at,
-            )
-        )
-    return responses
 
 
 @router.post(
@@ -398,7 +313,7 @@ async def update_knowledge_access(
     user_id: uuid.UUID | None = None,
     allow_access: bool | None = None,
     access_all: bool = False,
-    _admin: OrganizationMember = Depends(require_org_admin),
+    _admin: OrganizationMember = Depends(require_org_admin_or_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """Grants or revokes one member's company-knowledge access (depending
@@ -481,7 +396,7 @@ async def revoke_knowledge_access(
     organization_id: uuid.UUID,
     user_id: uuid.UUID | None = None,
     remove_access: bool = False,
-    _admin: OrganizationMember = Depends(require_org_admin),
+    _admin: OrganizationMember = Depends(require_org_admin_or_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """Revokes company-knowledge access -- either for one member, or (with
@@ -546,7 +461,7 @@ async def upload_company_document(
     organization_id: uuid.UUID,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
-    admin: OrganizationMember = Depends(require_org_admin),
+    admin: OrganizationMember = Depends(require_org_admin_or_owner),
     db: AsyncSession = Depends(get_db),
 ) -> Document:
     """Uploads a company-knowledge document. Admin only -- document
@@ -617,7 +532,7 @@ async def list_company_documents(
 async def delete_company_document(
     organization_id: uuid.UUID,
     document_id: uuid.UUID,
-    _admin: OrganizationMember = Depends(require_org_admin),
+    _admin: OrganizationMember = Depends(require_org_admin_or_owner),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Deletes a company document. Admin only.
@@ -637,3 +552,357 @@ async def delete_company_document(
     await DocumentService.delete_company_document(
         db, organization_id=organization_id, document_id=document_id
     )
+
+
+def _invitation_response(invitation: Invitation) -> InvitationResponse:
+    return InvitationResponse(
+        id=invitation.id,
+        email=invitation.email,
+        role=invitation.role,
+        status=invitation.status,
+        expires_at=invitation.expires_at,
+        created_at=invitation.created_at,
+        accepted_at=invitation.accepted_at,
+    )
+
+
+@router.post(
+    "/{organization_id}/invitations",
+    response_model=InvitationResponse | BulkInvitationResult,
+)
+async def create_invitation(
+    organization_id: uuid.UUID,
+    email: str | None = Form(default=None),
+    role: str = Form(default="member"),
+    file: UploadFile | None = File(default=None),
+    acting_membership: OrganizationMember = Depends(require_org_admin_or_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """Invites one employee by email, or many at once from an uploaded
+    CSV/XLSX file -- exactly one of `email` or `file` must be given.
+    Admin or Owner. Admins may only set role="member"; only the Owner may
+    invite as "admin" (single mode) or include admin rows (file mode).
+
+    Args:
+        organization_id: The organization to invite into.
+        email: The single invitee's address. Mutually exclusive with
+            `file`.
+        role: The single invitee's role ("admin" | "member", default
+            "member"). Ignored in file mode, where each row supplies its
+            own role.
+        file: A CSV/XLSX upload (columns: email, role) inviting up to
+            MAX_BULK_INVITATION_ROWS people at once. Mutually exclusive
+            with `email`.
+        acting_membership: The caller's own membership.
+        db: An active async SQLAlchemy session.
+
+    Returns:
+        In single mode, the created/reused invitation. In file mode, a
+        BulkInvitationResult with a succeeded/failed entry per row --
+        one invalid or disallowed row never blocks the others in the
+        same file.
+
+    Raises:
+        HTTPException: 422 if neither or both of `email`/`file` are
+            given, if `role` isn't "admin"/"member" (single mode), or if
+            the file itself is unreadable, missing required columns, or
+            has too many rows (a whole-file problem, distinct from a
+            per-row one reported in the response body instead); 403 if
+            the caller isn't an Admin/Owner of the organization, or (Admin
+            caller, single mode) tries to set role="admin"; 404 if the
+            organization doesn't exist; 502 if the invitation was created
+            but the email itself couldn't be sent (single mode -- use the
+            resend endpoint; file mode reports this per-row instead).
+    """
+    if (email is None) == (file is None):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Provide either email or file, not both/neither",
+        )
+
+    organization = await OrganizationService.get_by_id(db, organization_id)
+    if organization is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Organization not found")
+
+    if file is not None:
+        content = await file.read()
+        try:
+            rows = _parse_bulk_rows(file.filename or "", content)
+            validated_rows = _validate_bulk_rows(
+                rows, organization=organization, acting_membership=acting_membership
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
+            ) from exc
+        return await _bulk_create_invitations(
+            db,
+            organization=organization,
+            acting_membership=acting_membership,
+            rows=validated_rows,
+        )
+
+    if role not in ("admin", "member"):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, f"Invalid role: {role!r}"
+        )
+    try:
+        validated_email = str(_email_adapter.validate_python(email))
+    except ValidationError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid email address"
+        ) from exc
+    try:
+        invitation, _raw_token = await InvitationService.create(
+            db,
+            organization=organization,
+            inviter_membership=acting_membership,
+            email=validated_email,
+            role=role,
+        )
+    except TooManyRoleError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except DomainMismatchError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except InvitationService.EmailDeliveryError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return _invitation_response(invitation)
+
+
+@router.get("/{organization_id}/invitations", response_model=list[InvitationResponse])
+async def list_invitations(
+    organization_id: uuid.UUID,
+    _acting: OrganizationMember = Depends(require_org_admin_or_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lists every invitation (pending, accepted, revoked, expired) for
+    the organization. Admin or Owner."""
+    invitations = await InvitationService.list_for_organization(db, organization_id)
+    return [_invitation_response(i) for i in invitations]
+
+
+async def _require_invitation_in_org(
+    db: AsyncSession, *, organization_id: uuid.UUID, invitation_id: uuid.UUID
+):
+    invitation = await InvitationService.get_by_id(db, invitation_id)
+    if invitation is None or invitation.organization_id != organization_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invitation not found")
+    return invitation
+
+
+@router.post(
+    "/{organization_id}/invitations/{invitation_id}/resend",
+    response_model=InvitationResponse,
+)
+async def resend_invitation(
+    organization_id: uuid.UUID,
+    invitation_id: uuid.UUID,
+    _acting: OrganizationMember = Depends(require_org_admin_or_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rotates the token/expiry and re-sends a pending invitation's
+    email. Admin or Owner.
+
+    Raises:
+        HTTPException: 404 if the invitation doesn't exist in this org;
+            409 if it's no longer pending (already accepted/revoked/expired);
+            502 if the token was refreshed but the email couldn't be sent.
+    """
+    invitation = await _require_invitation_in_org(
+        db, organization_id=organization_id, invitation_id=invitation_id
+    )
+    if invitation.status != "pending":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Can't resend a {invitation.status} invitation",
+        )
+    organization = await OrganizationService.get_by_id(db, organization_id)
+    try:
+        await InvitationService.resend(
+            db, invitation=invitation, organization=organization
+        )
+    except InvitationService.EmailDeliveryError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return InvitationResponse(
+        id=invitation.id,
+        email=invitation.email,
+        role=invitation.role,
+        status=invitation.status,
+        expires_at=invitation.expires_at,
+        created_at=invitation.created_at,
+        accepted_at=invitation.accepted_at,
+    )
+
+
+@router.delete(
+    "/{organization_id}/invitations/{invitation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def revoke_invitation(
+    organization_id: uuid.UUID,
+    invitation_id: uuid.UUID,
+    _acting: OrganizationMember = Depends(require_org_admin_or_owner),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Revokes a pending invitation. Admin or Owner.
+
+    Raises:
+        HTTPException: 404 if the invitation doesn't exist in this org.
+    """
+    invitation = await _require_invitation_in_org(
+        db, organization_id=organization_id, invitation_id=invitation_id
+    )
+    await InvitationService.revoke(db, invitation=invitation)
+
+
+MAX_BULK_INVITATION_ROWS = 50
+
+
+def _parse_bulk_rows(filename: str, content: bytes) -> list[tuple[int, str, str]]:
+    """Returns a list of (row_number, raw_email, raw_role) tuples, 1-indexed
+    by data row (header excluded). Raises ValueError for an unsupported
+    file type, missing required columns, or more than
+    MAX_BULK_INVITATION_ROWS rows -- caught by the endpoint and turned into
+    a 422, since each of these is a whole-file problem, not a per-row one.
+    """
+    rows = _parse_bulk_rows_unbounded(filename, content)
+    if len(rows) > MAX_BULK_INVITATION_ROWS:
+        raise ValueError(
+            f"A single upload can invite at most {MAX_BULK_INVITATION_ROWS} "
+            f"people at a time (got {len(rows)})"
+        )
+    return rows
+
+
+def _parse_bulk_rows_unbounded(
+    filename: str, content: bytes
+) -> list[tuple[int, str, str]]:
+    if filename.lower().endswith(".csv"):
+        text = content.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        if reader.fieldnames is None or {"email", "role"} - {
+            f.strip().lower() for f in reader.fieldnames
+        }:
+            raise ValueError("CSV must have 'email' and 'role' columns")
+        return [
+            (
+                i + 1,
+                (row.get("email") or "").strip(),
+                (row.get("role") or "member").strip(),
+            )
+            for i, row in enumerate(reader)
+        ]
+    if filename.lower().endswith(".xlsx"):
+        workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+        sheet = workbook.active
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            raise ValueError("Empty spreadsheet")
+        header = [str(c).strip().lower() if c else "" for c in rows[0]]
+        if "email" not in header or "role" not in header:
+            raise ValueError("Spreadsheet must have 'email' and 'role' columns")
+        email_idx, role_idx = header.index("email"), header.index("role")
+        return [
+            (
+                i + 1,
+                str(row[email_idx]).strip() if row[email_idx] else "",
+                str(row[role_idx]).strip().lower()
+                if role_idx < len(row) and row[role_idx]
+                else "member",
+            )
+            for i, row in enumerate(rows[1:])
+        ]
+    raise ValueError("Unsupported file type -- upload a .csv or .xlsx file")
+
+
+def _validate_bulk_rows(
+    rows: list[tuple[int, str, str]],
+    *,
+    organization: Organization,
+    acting_membership: OrganizationMember,
+) -> list[tuple[int, str, str]]:
+    """Validates every row's data up front -- email format, role value,
+    inviter permission, and domain match -- the same checks
+    InvitationService.create would otherwise make one row at a time. If
+    any row fails, the whole file is rejected (ValueError, caught by the
+    endpoint and turned into a 422) with every problem listed, and nothing
+    is written to the database or sent by email. A row that fails only
+    because of something InvitationService.create can't know in advance
+    (e.g. an SMTP outage) is not a data-validity problem and is reported
+    per-row in the response body instead, after this validation passes.
+    """
+    problems: list[str] = []
+    validated: list[tuple[int, str, str]] = []
+    for row_number, raw_email, raw_role in rows:
+        try:
+            email = str(_email_adapter.validate_python(raw_email))
+        except ValidationError:
+            problems.append(f"Row {row_number} ({raw_email}): Invalid email address")
+            continue
+        role = raw_role or "member"
+        if role not in ("admin", "member"):
+            problems.append(f"Row {row_number} ({raw_email}): Invalid role {role!r}")
+            continue
+        if acting_membership.role == "admin" and role != "member":
+            problems.append(
+                f"Row {row_number} ({email}): Admins may only invite members"
+            )
+            continue
+        email_domain = email.rsplit("@", 1)[-1].lower()
+        if email_domain != organization.domain.lower():
+            problems.append(
+                f"Row {row_number} ({email}): doesn't match this organization's "
+                f"domain ({organization.domain})"
+            )
+            continue
+        validated.append((row_number, email, role))
+
+    if problems:
+        raise ValueError(
+            "The file contains invalid rows and was not processed: "
+            + "; ".join(problems)
+        )
+    return validated
+
+
+async def _bulk_create_invitations(
+    db: AsyncSession,
+    *,
+    organization: Organization,
+    acting_membership: OrganizationMember,
+    rows: list[tuple[int, str, str]],
+) -> BulkInvitationResult:
+    """The file-upload branch of POST .../invitations, given rows that
+    have already passed _validate_bulk_rows (the whole file is rejected
+    before this is ever called if any row is invalid). Each row is still
+    processed independently here so a runtime hiccup (e.g. an SMTP outage)
+    for one row never blocks the others in the same file."""
+    succeeded: list[InvitationResponse] = []
+    failed: list[BulkInvitationRowError] = []
+    for row_number, email, role in rows:
+        try:
+            invitation, _raw_token = await InvitationService.create(
+                db,
+                organization=organization,
+                inviter_membership=acting_membership,
+                email=email,
+                role=role,
+            )
+        except TooManyRoleError as exc:
+            failed.append(
+                BulkInvitationRowError(row=row_number, email=email, reason=str(exc))
+            )
+            continue
+        except DomainMismatchError as exc:
+            failed.append(
+                BulkInvitationRowError(row=row_number, email=email, reason=str(exc))
+            )
+            continue
+        except InvitationService.EmailDeliveryError as exc:
+            failed.append(
+                BulkInvitationRowError(row=row_number, email=email, reason=str(exc))
+            )
+            continue
+        succeeded.append(_invitation_response(invitation))
+
+    return BulkInvitationResult(succeeded=succeeded, failed=failed)

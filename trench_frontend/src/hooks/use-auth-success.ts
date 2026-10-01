@@ -6,11 +6,11 @@ import { useAuth } from "@/components/auth-provider";
 import type { UserProfile } from "@/lib/api";
 
 /**
- * "Signin just completed" handler: records the profile in AuthProvider's
- * state and goes straight to the main chat page. Signin-only -- signup
- * deliberately does NOT establish a session (see useSignupSuccess), so
- * this is used only on the /signin page, for both email/password and
- * "Continue with Google".
+ * "Authenticated just now" handler: records the profile in AuthProvider's
+ * state and goes straight to the main chat page. Used on /signin (both
+ * email/password and "Continue with Google") and on /signup, since Owner
+ * signup now establishes a session immediately rather than deferring to a
+ * separate sign-in step.
  */
 export function useAuthSuccess() {
   const router = useRouter();

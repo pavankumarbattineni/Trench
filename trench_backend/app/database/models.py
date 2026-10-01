@@ -67,6 +67,15 @@ class User(BaseModel):
     model_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("provider_models.id"), nullable=True
     )
+    # Every user belongs to exactly one organization -- nullable only
+    # until the one-time data-wipe migration (see
+    # docs/superpowers/plans/2026-10-01-multi-tenant-rbac-plan.md Task 11)
+    # flips this to NOT NULL. There is no more "orgless" user going
+    # forward; this column, not a join through OrganizationMember, is the
+    # primary tenant lookup used by get_current_tenant-style dependencies.
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True
+    )
 
 
 class Organization(BaseModel):
@@ -112,7 +121,10 @@ class OrganizationMember(BaseModel):
         nullable=False,
         index=True,
     )
-    # "admin" | "member"
+    # "owner" | "admin" | "member". Exactly one "owner" row exists per
+    # organization (the creator, set once at org-creation time via the
+    # owner-signup flow -- see AuthService.signup_owner) and it is never
+    # changed or removed by anyone, enforced in OrganizationService.
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")
 
 
@@ -278,6 +290,10 @@ class ProviderModel(BaseModel):
         Boolean, nullable=False, default=False
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # False for a model kept in the catalog as an internal backup/fallback
+    # only (e.g. the Qwen models) -- still is_active and selectable by id,
+    # just excluded from the user-facing GET /config listing.
+    is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
 class UserCredential(BaseModel):
@@ -332,3 +348,99 @@ class ChatHistory(BaseModel):
     chunks: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     # "pending" | "running" | "completed" | "failed" | "interrupted"
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="completed")
+
+
+class Invitation(BaseModel):
+    """An email invitation to join an organization with a specific role.
+
+    The raw token is emailed once and never stored -- only its sha256
+    hash (token_hash) is persisted, the same "secrets are never stored in
+    plaintext" rule BYOK credentials already follow. Role is fixed at
+    invite time by the inviter (never chosen by the invitee at accept
+    time) and is always "admin" or "member" -- an invitation can never
+    carry role="owner" (see InvitationService.create).
+    """
+
+    __tablename__ = "invitations"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_invitations_token_hash"),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # "admin" | "member" -- never "owner"
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # "pending" | "accepted" | "revoked" | "expired"
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    invited_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class OrganizationCredential(BaseModel):
+    """The Owner's BYOK credential, used on behalf of the whole
+    organization for company-knowledge queries -- see
+    LLMClientService.resolve_for_knowledge. Distinct from UserCredential
+    (always per-user, used for personal-knowledge queries and never
+    shared). Only ever set/updated by the organization's Owner -- enforced
+    in OrganizationCredentialService, not by any DB constraint.
+    """
+
+    __tablename__ = "organization_credentials"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "provider_type",
+            name="uq_organization_credentials_org_provider",
+        ),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    encrypted_credential: Mapped[str] = mapped_column(Text, nullable=False)
+    set_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    validated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class PasswordResetToken(BaseModel):
+    """A single-use, time-limited password reset token, replacing
+    reliance on Firebase's own oobCode flow -- see
+    PasswordResetService. Same "store only the hash" rule as Invitation.
+    """
+
+    __tablename__ = "password_reset_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_password_reset_tokens_token_hash"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

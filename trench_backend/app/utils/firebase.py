@@ -25,3 +25,11 @@ def verify_firebase_id_token(id_token: str) -> dict:
 def delete_firebase_user(firebase_uid: str) -> None:
     get_firebase_app()
     firebase_auth.delete_user(firebase_uid)
+
+
+def set_user_password(email: str, new_password: str) -> None:
+    """Updates a Firebase user's password via the Admin SDK, looked up by
+    email (Trench stores no firebase_uid -- see User's docstring)."""
+    get_firebase_app()
+    user_record = firebase_auth.get_user_by_email(email)
+    firebase_auth.update_user(user_record.uid, password=new_password)

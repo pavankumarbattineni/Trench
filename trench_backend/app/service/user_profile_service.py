@@ -27,7 +27,7 @@ class UserProfileService:
                 id=org.id, name=org.name, role=membership.role
             )
             has_company_access = (
-                membership.role == "admin"
+                membership.role in ("admin", "owner")
                 or await KnowledgeAccessService.has_company_access(
                     db, user_id=user.id, organization_id=membership.organization_id
                 )

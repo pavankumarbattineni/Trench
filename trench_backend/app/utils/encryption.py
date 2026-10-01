@@ -1,4 +1,4 @@
-"""Encrypts BYOK credentials at rest using TRENCH_CONFIG.MCP.encryption_key.
+"""Encrypts BYOK credentials at rest using TRENCH_CONFIG.ENCRYPTION.encryption_key.
 
 One root secret is combined with a purpose string via PBKDF2 to derive a
 distinct Fernet key per purpose, so a compromise of one purpose's derived
@@ -21,7 +21,7 @@ class DecryptionError(Exception):
 
 @lru_cache
 def _fernet_for(purpose: str) -> Fernet:
-    root_secret = get_settings().TRENCH_CONFIG.MCP.encryption_key
+    root_secret = get_settings().TRENCH_CONFIG.ENCRYPTION.encryption_key
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,

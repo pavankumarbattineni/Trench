@@ -20,6 +20,12 @@ from app.database.models import Provider, ProviderModel
 # technically text-in/text-out.
 _GROQ_NON_CHAT_MODEL_PATTERNS = ("whisper", "orpheus", "prompt-guard")
 
+# The pruned catalog keeps only these Groq-hosted models (see migration
+# 3873b7cda9af) -- a sync must never resurrect the others Groq's live
+# /models endpoint would otherwise offer.
+_GROQ_ALLOWED_MODELS = {"openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.6-27b"}
+_GROQ_HIDDEN_MODELS = {"qwen/qwen3.8-27b", "qwen/qwen3.6-27b"}
+
 
 class ProviderCatalogService:
     @staticmethod
@@ -42,10 +48,16 @@ class ProviderCatalogService:
     async def list_models_with_provider(
         db: AsyncSession,
     ) -> list[tuple[Provider, ProviderModel]]:
+        """The user-facing model catalog (GET /config) -- excludes models
+        kept only as internal backups/fallbacks (is_visible=False), which
+        remain selectable directly by id but never appear in this list."""
         result = await db.execute(
             select(Provider, ProviderModel)
             .join(ProviderModel, ProviderModel.provider_id == Provider.id)
-            .where(ProviderModel.is_active.is_(True))
+            .where(
+                ProviderModel.is_active.is_(True),
+                ProviderModel.is_visible.is_(True),
+            )
         )
         return [(row[0], row[1]) for row in result.all()]
 
@@ -55,7 +67,10 @@ class ProviderCatalogService:
     ) -> list[ProviderModel]:
         """Refreshes Groq's provider_models rows from Groq's live /models
         endpoint. Safe to run repeatedly -- upserts by model_name, never
-        duplicates.
+        duplicates. Restricted to _GROQ_ALLOWED_MODELS: the catalog was
+        deliberately pruned down to three named Groq-hosted models (see
+        migration 3873b7cda9af), and this sync must never bring the
+        others back just because Groq's API still offers them.
         """
         api_key = get_settings().TRENCH_CONFIG.GROQ.api_key
         async with httpx.AsyncClient(timeout=15) as client:
@@ -75,6 +90,8 @@ class ProviderCatalogService:
 
         for entry in models_data:
             model_id = entry["id"]
+            if model_id not in _GROQ_ALLOWED_MODELS:
+                continue
             if any(pattern in model_id for pattern in _GROQ_NON_CHAT_MODEL_PATTERNS):
                 continue
             if "text" not in entry.get(
@@ -94,11 +111,13 @@ class ProviderCatalogService:
                     provider_id=provider.id,
                     model_name=model_id,
                     display_name=entry.get("name", model_id),
+                    is_visible=model_id not in _GROQ_HIDDEN_MODELS,
                 )
                 db.add(model)
             else:
                 model.display_name = entry.get("name", model_id)
                 model.is_active = True
+                model.is_visible = model_id not in _GROQ_HIDDEN_MODELS
 
             if default_model_name is not None and model_id == default_model_name:
                 await db.execute(

@@ -30,7 +30,12 @@ class JWTConfig(BaseModel):
     refresh_token_expire_days: int = 30
 
 
-class MCPConfig(BaseModel):
+class EncryptionConfig(BaseModel):
+    """Root secret used to derive per-purpose Fernet keys for encrypting
+    BYOK credentials at rest (see app/utils/encryption.py). Named for what
+    it actually is -- not "MCP" (Model Context Protocol), which this has
+    nothing to do with."""
+
     encryption_key: str
 
 
@@ -63,17 +68,27 @@ class GeminiConfig(BaseModel):
     api_key: str
 
 
+class SMTPConfig(BaseModel):
+    host: str
+    port: int = 587
+    username: str
+    password: str
+    from_address: str
+    use_tls: bool = True
+
+
 class TrenchConfig(BaseModel):
     ENVIRONMENT: str = "DEV"
     DB: DBConfig
     JWT: JWTConfig
-    MCP: MCPConfig
+    ENCRYPTION: EncryptionConfig
     FIREBASE: FirebaseConfig
     GROQ: GroqConfig
     STORAGE: StorageConfig
     PINECONE: PineconeConfig
     LLAMAPARSE: LlamaParseConfig
     GEMINI: GeminiConfig
+    SMTP: SMTPConfig
 
 
 class Settings(BaseSettings):

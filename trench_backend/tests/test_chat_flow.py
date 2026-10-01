@@ -4,28 +4,31 @@ from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.database.models import User
+from app.database.models import Organization, User
 from app.database.session import async_session_factory
 
 PREFIX = "test-chat-flow"
+_EMAIL = f"owner@{PREFIX}.example.com"
 
 
 def _claims() -> dict:
     return {
         "uid": f"{PREFIX}-uid",
-        "email": f"{PREFIX}@example.com",
+        "email": _EMAIL,
         "iat": int(time.time()),
     }
 
 
 async def _login(client: AsyncClient) -> None:
-    """Signs up (idempotently -- a 409 for an already-registered email is
-    fine here) then signs in, since login no longer lazily creates a
-    user."""
+    """Signs up as an Owner (idempotently -- a 409 for an already-registered
+    email is fine here) then signs in."""
     with patch("app.utils.firebase.verify_firebase_id_token", return_value=_claims()):
-        await client.post("/api/v1/auth/signup", json={"id_token": "fake"})
+        await client.post(
+            "/api/v1/auth/signup/owner",
+            json={"id_token": "fake", "organization_name": f"{PREFIX}-org"},
+        )
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
 
@@ -34,8 +37,20 @@ async def _login(client: AsyncClient) -> None:
 async def cleanup():
     yield
     async with async_session_factory() as session:
+        await session.execute(
+            update(User)
+            .where(User.email.like(f"%{PREFIX}%"))
+            .values(organization_id=None)
+        )
+        await session.commit()
+        org_result = await session.execute(
+            select(Organization).where(Organization.domain.like(f"%{PREFIX}%"))
+        )
+        for organization in org_result.scalars().all():
+            await session.delete(organization)
+        await session.commit()
         result = await session.execute(
-            select(User).where(User.email.like(f"{PREFIX}%"))
+            select(User).where(User.email.like(f"%{PREFIX}%"))
         )
         for user in result.scalars().all():
             await session.delete(user)
@@ -70,11 +85,18 @@ def _fake_title_generation(monkeypatch):
 
 
 async def _wait_for_status(
-    client: AsyncClient, stream_id: str, target: str, timeout: float = 5.0
+    client: AsyncClient,
+    stream_id: str,
+    target: str,
+    timeout: float = 5.0,
+    *,
+    headers: dict | None = None,
 ):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        response = await client.get(f"/api/v1/chat/streams/{stream_id}/status")
+        response = await client.get(
+            f"/api/v1/chat/streams/{stream_id}/status", headers=headers
+        )
         if response.json()["status"] == target:
             return response.json()
         await asyncio.sleep(0.05)
@@ -176,9 +198,58 @@ async def test_first_message_triggers_title_generation_but_second_does_not(
 
 @pytest.mark.asyncio
 async def test_company_query_denied_without_access(client: AsyncClient):
-    await _login(client)
+    """An Owner always has company-knowledge access (role-derived) --
+    there's no more "orgless" state to test denial against under the
+    invitation-only model, so this exercises a Member whose default
+    knowledge-access grant has been explicitly revoked instead."""
+    from unittest.mock import AsyncMock
+    from urllib.parse import parse_qs, urlparse
 
-    thread = (await client.post("/api/v1/threads")).json()
+    await _login(client)
+    me = await client.get("/api/v1/users/me")
+    organization_id = me.json()["organization"]["id"]
+
+    member_email = f"member@{PREFIX}.example.com"
+    with patch(
+        "app.service.invitation_service.send_email", new=AsyncMock()
+    ) as mock_send:
+        await client.post(
+            f"/api/v1/organizations/{organization_id}/invitations",
+            data={"email": member_email, "role": "member"},
+        )
+    html_body = mock_send.call_args.kwargs["html_body"]
+    accept_url = html_body.split('href="')[1].split('"')[0]
+    raw_token = parse_qs(urlparse(accept_url).query)["token"][0]
+
+    with patch(
+        "app.utils.firebase.verify_firebase_id_token",
+        return_value={
+            "uid": f"{PREFIX}-member-uid",
+            "email": member_email,
+            "iat": int(time.time()),
+        },
+    ):
+        accept_response = await client.post(
+            "/api/v1/auth/invitations/accept",
+            json={
+                "token": raw_token,
+                "id_token": "fake",
+                "username": f"{PREFIX}-member",
+            },
+        )
+    member_token = accept_response.json()["access_token"]
+    member_client_headers = {"Authorization": f"Bearer {member_token}"}
+    member_me = await client.get("/api/v1/users/me", headers=member_client_headers)
+    assert member_me.json()["has_company_access"] is True  # default-on grant
+
+    await client.delete(
+        f"/api/v1/organizations/{organization_id}/knowledge-access",
+        params={"user_id": member_me.json()["id"]},
+    )
+
+    thread = (
+        await client.post("/api/v1/threads", headers=member_client_headers)
+    ).json()
 
     with (
         patch(
@@ -190,9 +261,12 @@ async def test_company_query_denied_without_access(client: AsyncClient):
         send_response = await client.post(
             f"/api/v1/chat/threads/{thread['id']}/messages",
             json={"query": "What's our leave policy?", "knowledge_type": "company"},
+            headers=member_client_headers,
         )
         accepted = send_response.json()
-        final = await _wait_for_status(client, accepted["stream_id"], "failed")
+        final = await _wait_for_status(
+            client, accepted["stream_id"], "failed", headers=member_client_headers
+        )
         assert "access" in final["content"].lower()
 
 

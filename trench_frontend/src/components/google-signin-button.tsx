@@ -3,9 +3,9 @@
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { signInWithGoogle, signUpWithGoogle } from "@/lib/auth-service";
+import { signInWithGoogle, signUpOwnerWithGoogle } from "@/lib/auth-service";
 import { getErrorMessage } from "@/lib/errors";
-import type { SignupProfile, UserProfile } from "@/lib/api";
+import type { OwnerSignupProfile, UserProfile } from "@/lib/api";
 
 function GoogleIcon() {
   return (
@@ -39,22 +39,27 @@ type GoogleSignInButtonProps =
       onError: (message: string) => void;
     }
   | {
-      /** Creates the account (if new) but does NOT log the user in --
-       * mirrors the email/password signup form's behavior. */
+      /** Creates the account AND its organization -- the only way an
+       * organization now comes into existence besides accepting an
+       * invitation. No session is established; the caller sends the
+       * user to /signin afterward. Requires an organization name chosen
+       * before the button can be used, since Google's popup flow
+       * collects no form fields of its own. */
       mode: "signup";
-      registerAsAdmin?: boolean;
-      onSuccess: (profile: SignupProfile) => void;
+      organizationName: string;
+      onSuccess: (profile: OwnerSignupProfile) => void;
       onError: (message: string) => void;
     };
 
 export function GoogleSignInButton(props: GoogleSignInButtonProps) {
   const [loading, setLoading] = useState(false);
+  const disabled = loading || (props.mode === "signup" && !props.organizationName.trim());
 
   const handleClick = async () => {
     setLoading(true);
     try {
       if (props.mode === "signup") {
-        props.onSuccess(await signUpWithGoogle(props.registerAsAdmin));
+        props.onSuccess(await signUpOwnerWithGoogle(props.organizationName));
       } else {
         props.onSuccess(await signInWithGoogle());
       }
@@ -66,15 +71,22 @@ export function GoogleSignInButton(props: GoogleSignInButtonProps) {
   };
 
   return (
-    <Button
-      type="button"
-      variant="outline"
-      className="w-full gap-2"
-      disabled={loading}
-      onClick={handleClick}
-    >
-      <GoogleIcon />
-      {loading ? "Connecting…" : "Continue with Google"}
-    </Button>
+    <div className="space-y-1.5">
+      <Button
+        type="button"
+        variant="outline"
+        className="w-full gap-2"
+        disabled={disabled}
+        onClick={handleClick}
+      >
+        <GoogleIcon />
+        {loading ? "Connecting…" : "Continue with Google"}
+      </Button>
+      {props.mode === "signup" && !props.organizationName.trim() && (
+        <p className="text-xs text-muted-foreground">
+          Enter your organization name below to continue with Google.
+        </p>
+      )}
+    </div>
   );
 }

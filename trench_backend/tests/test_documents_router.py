@@ -3,17 +3,17 @@ from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.database.models import Document, User
+from app.database.models import Document, Organization, User
 from app.database.session import async_session_factory
 from app.service.document_service import DocumentService
 from app.service.document_storage_service import LocalFilesystemStorageProvider
 
 TEST_FIREBASE_UID = "test-documents-router-uid"
-TEST_EMAIL = "test-documents-router@example.com"
+TEST_EMAIL = "owner@test-documents-router.example.com"
 OTHER_FIREBASE_UID = "test-documents-router-other-uid"
-OTHER_EMAIL = "test-documents-router-other@example.com"
+OTHER_EMAIL = "owner@test-documents-router-other.example.com"
 
 
 def _fake_claims(uid: str = TEST_FIREBASE_UID, email: str = TEST_EMAIL) -> dict:
@@ -23,14 +23,18 @@ def _fake_claims(uid: str = TEST_FIREBASE_UID, email: str = TEST_EMAIL) -> dict:
 async def _login(
     client: AsyncClient, uid: str = TEST_FIREBASE_UID, email: str = TEST_EMAIL
 ) -> None:
-    """Signs up (idempotently -- a 409 for an already-registered email is
-    fine here) then signs in, since login no longer lazily creates a
-    user."""
+    """Signs up as an Owner (idempotently -- a 409 for an already-registered
+    email is fine here) then signs in. Each distinct identity gets its own
+    email domain (not just a different local part) since a domain anchors
+    exactly one organization under the invitation-only model."""
     with patch(
         "app.utils.firebase.verify_firebase_id_token",
         return_value=_fake_claims(uid=uid, email=email),
     ):
-        await client.post("/api/v1/auth/signup", json={"id_token": "fake"})
+        await client.post(
+            "/api/v1/auth/signup/owner",
+            json={"id_token": "fake", "organization_name": f"org-{uid}"},
+        )
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
 
@@ -52,8 +56,22 @@ def _no_real_ingestion(monkeypatch):
 async def cleanup():
     yield
     async with async_session_factory() as session:
+        await session.execute(
+            update(User)
+            .where(User.email.like("%test-documents-router%"))
+            .values(organization_id=None)
+        )
+        await session.commit()
+        org_result = await session.execute(
+            select(Organization).where(
+                Organization.domain.like("%test-documents-router%")
+            )
+        )
+        for organization in org_result.scalars().all():
+            await session.delete(organization)
+        await session.commit()
         result = await session.execute(
-            select(User).where(User.email.like("test-documents-router%"))
+            select(User).where(User.email.like("%test-documents-router%"))
         )
         for user in result.scalars().all():
             await session.delete(user)

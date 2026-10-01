@@ -1,6 +1,6 @@
 import { apiClient } from "@/lib/api";
 
-export type OrganizationRole = "admin" | "member";
+export type OrganizationRole = "owner" | "admin" | "member";
 
 export interface Organization {
   id: string;
@@ -9,10 +9,6 @@ export interface Organization {
   owner_user_id: string;
   is_active: boolean;
   created_at: string;
-}
-
-export interface OrganizationCreated extends Organization {
-  auto_added_members: number;
 }
 
 export interface MyOrganization extends Organization {
@@ -38,14 +34,6 @@ export interface PaginatedMembers {
   total_pages: number;
 }
 
-export async function createOrganization(name: string): Promise<OrganizationCreated> {
-  const { data } = await apiClient.post<OrganizationCreated>(
-    "/api/v1/organizations",
-    { name }
-  );
-  return data;
-}
-
 export async function getMyOrganization(): Promise<MyOrganization> {
   const { data } = await apiClient.get<MyOrganization>("/api/v1/organizations/me");
   return data;
@@ -64,18 +52,6 @@ export async function listMembers(
   const { data } = await apiClient.get<PaginatedMembers>(
     `/api/v1/organizations/${organizationId}/members`,
     { params: { page, page_size: pageSize, search: search || undefined } }
-  );
-  return data;
-}
-
-export async function addMember(
-  organizationId: string,
-  username: string,
-  role: OrganizationRole = "member"
-): Promise<OrganizationMember> {
-  const { data } = await apiClient.post<OrganizationMember>(
-    `/api/v1/organizations/${organizationId}/members`,
-    { username, role }
   );
   return data;
 }
@@ -162,6 +138,84 @@ export async function grantAllKnowledgeAccess(
     `/api/v1/organizations/${organizationId}/knowledge-access`,
     null,
     { params: { access_all: true } }
+  );
+  return data;
+}
+
+export type InvitationStatus = "pending" | "accepted" | "revoked" | "expired";
+export type InvitationRole = Exclude<OrganizationRole, "owner">;
+
+export interface Invitation {
+  id: string;
+  email: string;
+  role: InvitationRole;
+  status: InvitationStatus;
+  expires_at: string;
+  created_at: string;
+  accepted_at: string | null;
+}
+
+export async function createInvitation(
+  organizationId: string,
+  email: string,
+  role: InvitationRole = "member"
+): Promise<Invitation> {
+  const formData = new FormData();
+  formData.append("email", email);
+  formData.append("role", role);
+  const { data } = await apiClient.post<Invitation>(
+    `/api/v1/organizations/${organizationId}/invitations`,
+    formData
+  );
+  return data;
+}
+
+export async function listInvitations(organizationId: string): Promise<Invitation[]> {
+  const { data } = await apiClient.get<Invitation[]>(
+    `/api/v1/organizations/${organizationId}/invitations`
+  );
+  return data;
+}
+
+export async function resendInvitation(
+  organizationId: string,
+  invitationId: string
+): Promise<Invitation> {
+  const { data } = await apiClient.post<Invitation>(
+    `/api/v1/organizations/${organizationId}/invitations/${invitationId}/resend`
+  );
+  return data;
+}
+
+export async function revokeInvitation(
+  organizationId: string,
+  invitationId: string
+): Promise<void> {
+  await apiClient.delete(
+    `/api/v1/organizations/${organizationId}/invitations/${invitationId}`
+  );
+}
+
+export interface BulkInvitationRowError {
+  row: number;
+  email: string;
+  reason: string;
+}
+
+export interface BulkInvitationResult {
+  succeeded: Invitation[];
+  failed: BulkInvitationRowError[];
+}
+
+export async function bulkCreateInvitations(
+  organizationId: string,
+  file: File
+): Promise<BulkInvitationResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const { data } = await apiClient.post<BulkInvitationResult>(
+    `/api/v1/organizations/${organizationId}/invitations`,
+    formData
   );
   return data;
 }

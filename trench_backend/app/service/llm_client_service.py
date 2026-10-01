@@ -2,12 +2,18 @@
 
 Groq is the platform-owned free default (its key lives in
 TRENCH_CONFIG.GROQ, never per-user). OpenAI/Anthropic/Gemini require the
-user's own validated BYOK credential (UserCredential) -- if a user's
-selected model belongs to one of those providers but they have no stored
-credential for it, generation falls back to the platform's Groq default
-rather than failing the whole chat turn.
+user's own validated BYOK credential (UserCredential) for a personal-
+knowledge query -- if a user's selected model belongs to one of those
+providers but they have no stored credential for it, resolution raises
+LLMClientService.MissingCredentialError rather than silently falling back
+to the platform default; no provider's models may be used without a
+valid key for that provider. (Company-knowledge queries are different:
+falling back to the platform default when the organization hasn't set a
+shared credential for the resolved provider is expected, normal
+behavior, not a missing-credential error -- see resolve_for_knowledge.)
 """
 
+import uuid
 from collections.abc import AsyncIterator
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database.models import Provider, ProviderModel, User
 from app.service.credential_service import CredentialService
+from app.service.organization_credential_service import OrganizationCredentialService
 from app.service.provider_catalog_service import ProviderCatalogService
 from app.utils.encryption import decrypt_secret
 
@@ -27,6 +34,23 @@ class ResolvedModel:
 
 
 class LLMClientService:
+    class MissingCredentialError(Exception):
+        """Raised when the user's selected model belongs to a BYOK
+        provider they have no saved credential for. Selection-time
+        validation (UserPreferenceService.update_model) normally prevents
+        this from ever happening in practice -- this only fires if a
+        credential is removed after a model using it was already
+        selected. No provider's models may be used without a valid key
+        for that provider, so this is a hard stop, never a silent
+        fallback to the platform default."""
+
+        def __init__(self, provider_display_name: str) -> None:
+            self.provider_display_name = provider_display_name
+            super().__init__(
+                f"Your selected model requires a {provider_display_name} API "
+                "key. Add one in Settings, or switch to a different model."
+            )
+
     @staticmethod
     async def resolve_for_user(db: AsyncSession, user: User) -> ResolvedModel:
         default_model = await ProviderCatalogService.get_default(db)
@@ -55,8 +79,57 @@ class LLMClientService:
                 api_key=decrypt_secret(matching.encrypted_credential, purpose="byok"),
             )
 
-        # No BYOK credential for a non-Groq selection -- fall back to the
-        # platform default rather than failing the chat turn.
+        raise LLMClientService.MissingCredentialError(provider.display_name)
+
+    @staticmethod
+    async def resolve_for_knowledge(
+        db: AsyncSession,
+        user: User,
+        *,
+        knowledge_type: str,
+        organization_id: uuid.UUID | None,
+    ) -> ResolvedModel:
+        """Resolves which model/credential a query should use, branching
+        on knowledge_type:
+
+        - "personal": identical to resolve_for_user (the querying user's
+          own BYOK credential, or the platform default).
+        - "company": the organization's OrganizationCredential if the
+          Owner has set one for the resolved provider; otherwise the
+          platform default. Never falls back to the querying member's
+          own personal UserCredential, even if they have one -- a
+          member's personal key only ever powers their personal KB.
+        """
+        if knowledge_type == "personal" or organization_id is None:
+            return await LLMClientService.resolve_for_user(db, user)
+
+        default_model = await ProviderCatalogService.get_default(db)
+        model = await db.get(ProviderModel, user.model_id) if user.model_id else None
+        model = model or default_model
+        provider = await db.get(Provider, model.provider_id)
+
+        if provider.name == "groq":
+            return ResolvedModel(
+                provider_name="groq",
+                model_name=model.model_name,
+                api_key=get_settings().TRENCH_CONFIG.GROQ.api_key,
+            )
+
+        byok_type = CredentialService.required_credential_type(provider.name)
+        org_key = (
+            await OrganizationCredentialService.get_decrypted(
+                db, organization_id=organization_id, provider_type=byok_type
+            )
+            if byok_type
+            else None
+        )
+        if org_key is not None:
+            return ResolvedModel(
+                provider_name=provider.name,
+                model_name=model.model_name,
+                api_key=org_key,
+            )
+
         return ResolvedModel(
             provider_name="groq",
             model_name=default_model.model_name,

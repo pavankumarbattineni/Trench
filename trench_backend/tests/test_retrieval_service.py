@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.database.models import Organization, User
 from app.database.session import async_session_factory
@@ -17,9 +17,17 @@ PREFIX = "test-retrieval-service"
 async def cleanup():
     yield
     async with async_session_factory() as session:
-        # Organizations first -- Organization.owner_user_id FK-references
-        # users, so deleting a user while their organization still
-        # references them as owner would violate that constraint.
+        # users.organization_id FK-references organizations, and
+        # organizations.owner_user_id FK-references users -- a circular
+        # reference, so a user's organization_id must be cleared before
+        # the organization itself can be deleted.
+        await session.execute(
+            update(User)
+            .where(User.email.like(f"{PREFIX}%"))
+            .values(organization_id=None)
+        )
+        await session.commit()
+
         org_result = await session.execute(
             select(Organization).where(Organization.name.like(f"{PREFIX}%"))
         )
@@ -73,7 +81,7 @@ async def test_resolve_scope_company_denied_without_membership():
 async def test_resolve_scope_company_allowed_for_admin():
     async with async_session_factory() as session:
         admin = await _make_user(session, "org-admin")
-        organization, _member, _auto_added = await OrganizationService.create(
+        organization, _member = await OrganizationService.create(
             session, creator=admin, name=f"{PREFIX}-org"
         )
         scope = await RetrievalService.resolve_scope(

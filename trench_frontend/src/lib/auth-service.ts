@@ -1,25 +1,25 @@
 import {
   EmailAuthProvider,
-  confirmPasswordReset,
   createUserWithEmailAndPassword,
   reauthenticateWithCredential,
   reauthenticateWithPopup,
-  sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signInWithPopup,
   signOut as firebaseSignOut,
   updatePassword,
-  verifyPasswordResetCode,
   type User as FirebaseUser,
 } from "firebase/auth";
 
 import {
+  confirmPasswordResetToken,
   deleteAccountSession,
   getCurrentUser,
   loginWithFirebase,
+  logoutRemote,
   logoutSession,
-  signupWithFirebase,
-  type SignupProfile,
+  requestPasswordResetEmail,
+  signupOwner,
+  type OwnerSignupProfile,
   type UserProfile,
 } from "@/lib/api";
 import { firebaseAuth, googleProvider } from "@/lib/firebase";
@@ -31,32 +31,34 @@ async function establishSession(user: FirebaseUser): Promise<UserProfile> {
 }
 
 /**
- * Registers a new Trench user. Deliberately does NOT sign the user in --
- * signup and signin are separate actions now, so this never sets any
- * session tokens. Callers should send the user to /signin next, not to
- * the authenticated app.
+ * Registers a new Trench user as the Owner of a brand-new organization --
+ * the only way an organization now comes into existence. No session is
+ * established here: the backend returns no tokens, so callers must send
+ * the user to /signin afterward rather than straight into the app.
  */
-export async function signUp(
+export async function signUpOwner(
   username: string,
   email: string,
   password: string,
-  registerAsAdmin?: boolean
-): Promise<SignupProfile> {
+  organizationName: string
+): Promise<OwnerSignupProfile> {
   const credential = await createUserWithEmailAndPassword(firebaseAuth, email, password);
   const idToken = await credential.user.getIdToken();
-  return signupWithFirebase(idToken, username, registerAsAdmin);
+  return signupOwner(idToken, organizationName, username);
 }
 
 /**
  * "Continue with Google" used as a signup action (from the signup page):
- * creates the account (if new) but does NOT log the user in -- mirrors
- * the email/password split above. Google collects no username, so one is
- * auto-generated from the email.
+ * creates the account AND its organization, same as the email/password
+ * path above -- no session is established here either. Google collects
+ * no username, so one is auto-generated from the email.
  */
-export async function signUpWithGoogle(registerAsAdmin?: boolean): Promise<SignupProfile> {
+export async function signUpOwnerWithGoogle(
+  organizationName: string
+): Promise<OwnerSignupProfile> {
   const credential = await signInWithPopup(firebaseAuth, googleProvider);
   const idToken = await credential.user.getIdToken();
-  return signupWithFirebase(idToken, undefined, registerAsAdmin);
+  return signupOwner(idToken, organizationName);
 }
 
 export async function signIn(email: string, password: string): Promise<UserProfile> {
@@ -70,25 +72,34 @@ export async function signInWithGoogle(): Promise<UserProfile> {
 }
 
 export async function signOutEverywhere(): Promise<void> {
+  // Best effort -- a failed network call must never block sign-out, since
+  // there's nothing server-side it could have invalidated anyway.
+  try {
+    await logoutRemote();
+  } catch {
+    // Intentionally ignored.
+  }
   logoutSession();
   await firebaseSignOut(firebaseAuth);
 }
 
+/**
+ * Fully custom, backend-driven password reset -- the backend generates
+ * and validates its own token and updates the password via the Firebase
+ * Admin SDK; this no longer goes through Firebase's own
+ * sendPasswordResetEmail/oobCode flow at all. Firebase remains the
+ * password *store*, not the reset-email/verification owner.
+ */
 export async function requestPasswordReset(email: string): Promise<void> {
-  await sendPasswordResetEmail(firebaseAuth, email, {
-    url: `${window.location.origin}/reset-password`,
-  });
-}
-
-export async function verifyResetCode(oobCode: string): Promise<string> {
-  return verifyPasswordResetCode(firebaseAuth, oobCode);
+  await requestPasswordResetEmail(email);
 }
 
 export async function completePasswordReset(
-  oobCode: string,
-  newPassword: string
+  token: string,
+  newPassword: string,
+  confirmPassword: string
 ): Promise<void> {
-  await confirmPasswordReset(firebaseAuth, oobCode, newPassword);
+  await confirmPasswordResetToken(token, newPassword, confirmPassword);
 }
 
 function requireCurrentUser(): FirebaseUser {

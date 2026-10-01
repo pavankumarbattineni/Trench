@@ -4,28 +4,31 @@ from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.database.models import Provider, ProviderModel, User
+from app.database.models import Organization, Provider, ProviderModel, User
 from app.database.session import async_session_factory
 
 PREFIX = "test-users-router"
+_EMAIL = f"owner@{PREFIX}.example.com"
 
 
 def _claims() -> dict:
     return {
         "uid": f"{PREFIX}-uid",
-        "email": f"{PREFIX}@example.com",
+        "email": _EMAIL,
         "iat": int(time.time()),
     }
 
 
 async def _login(client: AsyncClient) -> None:
-    """Signs up (idempotently -- a 409 for an already-registered email is
-    fine here) then signs in, since login no longer lazily creates a
-    user."""
+    """Signs up as an Owner (idempotently -- a 409 for an already-registered
+    email is fine here) then signs in."""
     with patch("app.utils.firebase.verify_firebase_id_token", return_value=_claims()):
-        await client.post("/api/v1/auth/signup", json={"id_token": "fake"})
+        await client.post(
+            "/api/v1/auth/signup/owner",
+            json={"id_token": "fake", "organization_name": f"{PREFIX}-org"},
+        )
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
 
@@ -34,8 +37,20 @@ async def _login(client: AsyncClient) -> None:
 async def cleanup():
     yield
     async with async_session_factory() as session:
+        await session.execute(
+            update(User)
+            .where(User.email.like(f"%{PREFIX}%"))
+            .values(organization_id=None)
+        )
+        await session.commit()
+        org_result = await session.execute(
+            select(Organization).where(Organization.domain.like(f"%{PREFIX}%"))
+        )
+        for organization in org_result.scalars().all():
+            await session.delete(organization)
+        await session.commit()
         result = await session.execute(
-            select(User).where(User.email.like(f"{PREFIX}%"))
+            select(User).where(User.email.like(f"%{PREFIX}%"))
         )
         for user in result.scalars().all():
             await session.delete(user)
@@ -81,11 +96,14 @@ async def test_get_me_returns_profile_with_lazily_assigned_default_model(
     response = await client.get("/api/v1/users/me")
     assert response.status_code == 200
     body = response.json()
-    assert body["email"] == f"{PREFIX}@example.com"
+    assert body["email"] == _EMAIL
     assert body["model_id"] is not None
     assert body["model_name"] is not None
-    assert body["organization"] is None
-    assert body["has_company_access"] is False
+    # Every user now belongs to an organization (owner-signup creates
+    # one) -- there is no more orgless state under the invitation-only model.
+    assert body["organization"]["role"] == "owner"
+    # Owner access is role-derived, not grant-based.
+    assert body["has_company_access"] is True
 
 
 @pytest.mark.asyncio

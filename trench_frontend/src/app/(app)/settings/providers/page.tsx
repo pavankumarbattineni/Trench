@@ -2,7 +2,9 @@
 
 import { Sparkles } from "lucide-react";
 
+import { useAuth } from "@/components/auth-provider";
 import { ApiKeysSection } from "@/components/settings/api-keys-section";
+import { OrganizationApiKeySection } from "@/components/settings/organization-api-key-section";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -10,7 +12,9 @@ import { useConfig } from "@/hooks/use-config";
 import { getErrorMessage } from "@/lib/errors";
 
 export default function ProvidersPage() {
+  const { user } = useAuth();
   const { data: config, isLoading, isError, error } = useConfig();
+  const isOwner = user?.organization?.role === "owner";
 
   return (
     <div className="flex flex-col gap-6">
@@ -22,6 +26,17 @@ export default function ProvidersPage() {
           <ApiKeysSection />
         </SettingsSection>
       </div>
+
+      {isOwner && user.organization && (
+        <div className="rounded-2xl border border-border bg-card">
+          <SettingsSection
+            title="Organization API key"
+            description="Set a shared key the whole organization uses for queries against its company knowledge base."
+          >
+            <OrganizationApiKeySection organizationId={user.organization.id} />
+          </SettingsSection>
+        </div>
+      )}
 
       <div className="rounded-2xl border border-border bg-card">
         <SettingsSection

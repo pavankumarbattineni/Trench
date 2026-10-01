@@ -9,6 +9,7 @@ import {
   Search,
   ShieldCheck,
   ShieldOff,
+  Upload,
   UserX,
   Users,
 } from "lucide-react";
@@ -33,13 +34,14 @@ import {
 } from "@/hooks/use-organization";
 import { getErrorMessage } from "@/lib/errors";
 import type { OrganizationMember } from "@/lib/organizations";
-import { AddMemberDialog } from "./add-member-dialog";
+import { BulkInviteDialog } from "./bulk-invite-dialog";
+import { InviteMemberDialog } from "./invite-member-dialog";
 import { MemberRow } from "./member-row";
 
 interface MembersPanelProps {
   organizationId: string;
-  domain: string;
   isAdmin: boolean;
+  isOwner: boolean;
   currentUserId: string | undefined;
 }
 
@@ -58,7 +60,7 @@ const BULK_ACTION_COPY: Record<
   "remove-access": {
     title: "Remove all company-knowledge access?",
     description:
-      "Every member's company-knowledge access grant will be revoked at once. Org admins are unaffected -- they always have access. This can't be undone in bulk; you'd need to re-grant members individually.",
+      "Every member's company-knowledge access grant will be revoked at once. The Owner and Admins are unaffected -- they always have access. This can't be undone in bulk; you'd need to re-grant members individually.",
     confirmLabel: "Remove all access",
   },
   "remove-members": {
@@ -71,8 +73,8 @@ const BULK_ACTION_COPY: Record<
 
 export function MembersPanel({
   organizationId,
-  domain,
   isAdmin,
+  isOwner,
   currentUserId,
 }: MembersPanelProps) {
   const [page, setPage] = useState(1);
@@ -83,7 +85,8 @@ export function MembersPanel({
   const grantAllAccess = useGrantAllKnowledgeAccess(organizationId);
   const removeAllAccess = useRemoveAllKnowledgeAccess(organizationId);
   const removeAllMembers = useRemoveAllMembers(organizationId);
-  const [addMemberOpen, setAddMemberOpen] = useState(false);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [bulkInviteOpen, setBulkInviteOpen] = useState(false);
   const removeTarget = useConfirmTarget<OrganizationMember>();
   const [bulkAction, setBulkAction] = useState<BulkAction | null>(null);
 
@@ -185,18 +188,24 @@ export function MembersPanel({
                   <ShieldOff className="size-4" />
                   Remove all access
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  variant="destructive"
-                  onClick={() => setBulkAction("remove-members")}
-                >
-                  <UserX className="size-4" />
-                  Remove all members
-                </DropdownMenuItem>
+                {isOwner && (
+                  <DropdownMenuItem
+                    variant="destructive"
+                    onClick={() => setBulkAction("remove-members")}
+                  >
+                    <UserX className="size-4" />
+                    Remove all members
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
-            <Button size="sm" onClick={() => setAddMemberOpen(true)}>
+            <Button size="sm" variant="outline" onClick={() => setBulkInviteOpen(true)}>
+              <Upload className="size-4" />
+              Bulk upload
+            </Button>
+            <Button size="sm" onClick={() => setInviteOpen(true)}>
               <Plus className="size-4" />
-              Add member
+              Invite
             </Button>
           </div>
         )}
@@ -235,10 +244,12 @@ export function MembersPanel({
             organizationId={organizationId}
             isCurrentUser={member.user_id === currentUserId}
             isAdmin={isAdmin}
+            isOwner={isOwner}
             onRequestRemove={removeTarget.request}
           />
         ))}
       </div>
+
 
       {totalPages > 1 && (
         <div className="flex items-center justify-between text-sm text-muted-foreground">
@@ -269,12 +280,19 @@ export function MembersPanel({
       )}
 
       {isAdmin && (
-        <AddMemberDialog
-          organizationId={organizationId}
-          domain={domain}
-          open={addMemberOpen}
-          onOpenChange={setAddMemberOpen}
-        />
+        <>
+          <InviteMemberDialog
+            organizationId={organizationId}
+            callerRole={isOwner ? "owner" : "admin"}
+            open={inviteOpen}
+            onOpenChange={setInviteOpen}
+          />
+          <BulkInviteDialog
+            organizationId={organizationId}
+            open={bulkInviteOpen}
+            onOpenChange={setBulkInviteOpen}
+          />
+        </>
       )}
 
       <ConfirmDialog

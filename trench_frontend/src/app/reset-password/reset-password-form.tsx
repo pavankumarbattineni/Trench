@@ -1,9 +1,10 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
+import { isAxiosError } from "axios";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 
@@ -11,7 +12,7 @@ import { AuthCard } from "@/components/auth-card";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { PasswordInput } from "@/components/ui/password-input";
-import { completePasswordReset, verifyResetCode } from "@/lib/auth-service";
+import { completePasswordReset } from "@/lib/auth-service";
 import { getErrorMessage } from "@/lib/errors";
 
 const schema = z
@@ -26,63 +27,39 @@ const schema = z
 
 type FormValues = z.infer<typeof schema>;
 
-type CodeState =
-  | { status: "checking" }
-  | { status: "valid"; email: string }
-  | { status: "invalid"; message: string }
-  | { status: "done" };
-
 export function ResetPasswordForm() {
   const searchParams = useSearchParams();
-  const oobCode = searchParams.get("oobCode");
-  // The "missing code" case is knowable synchronously from the URL, so it's
-  // computed as the initial state rather than set from an effect. Only the
-  // "verify with Firebase" case is genuinely asynchronous.
-  const [codeState, setCodeState] = useState<CodeState>(() =>
-    oobCode
-      ? { status: "checking" }
-      : { status: "invalid", message: "This reset link is missing or malformed." }
-  );
+  const token = searchParams.get("token");
   const [formError, setFormError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
   const {
     register,
     handleSubmit,
     formState: { errors, isSubmitting },
   } = useForm<FormValues>({ resolver: zodResolver(schema) });
 
-  useEffect(() => {
-    if (!oobCode) return;
-    verifyResetCode(oobCode)
-      .then((email) => setCodeState({ status: "valid", email }))
-      .catch((error) =>
-        setCodeState({ status: "invalid", message: getErrorMessage(error) })
-      );
-  }, [oobCode]);
-
   const onSubmit = async (values: FormValues) => {
-    if (!oobCode) return;
+    if (!token) return;
     setFormError(null);
     try {
-      await completePasswordReset(oobCode, values.password);
-      setCodeState({ status: "done" });
+      await completePasswordReset(token, values.password, values.confirmPassword);
+      setDone(true);
     } catch (error) {
+      if (isAxiosError(error) && error.response?.status === 404) {
+        setFormError(
+          "This reset link is no longer valid -- request a new one below."
+        );
+        return;
+      }
       setFormError(getErrorMessage(error));
     }
   };
 
-  if (codeState.status === "checking") {
-    return (
-      <AuthCard title="Reset your password">
-        <p className="text-sm text-muted-foreground">Checking your reset link…</p>
-      </AuthCard>
-    );
-  }
-
-  if (codeState.status === "invalid") {
+  if (!token) {
     return (
       <AuthCard
         title="Link invalid"
-        subtitle={codeState.message}
+        subtitle="This reset link is missing or malformed."
         footer={
           <Link
             href="/forgot-password"
@@ -99,7 +76,7 @@ export function ResetPasswordForm() {
     );
   }
 
-  if (codeState.status === "done") {
+  if (done) {
     return (
       <AuthCard
         title="Password updated"
@@ -116,13 +93,14 @@ export function ResetPasswordForm() {
   }
 
   return (
-    <AuthCard title="Set a new password" subtitle={`Resetting the password for ${codeState.email}`}>
+    <AuthCard title="Set a new password">
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
         <div className="space-y-2">
           <Label htmlFor="password">New password</Label>
           <PasswordInput
             id="password"
             autoComplete="new-password"
+            aria-invalid={Boolean(errors.password)}
             {...register("password")}
           />
           {errors.password && (
@@ -134,13 +112,23 @@ export function ResetPasswordForm() {
           <PasswordInput
             id="confirmPassword"
             autoComplete="new-password"
+            aria-invalid={Boolean(errors.confirmPassword)}
             {...register("confirmPassword")}
           />
           {errors.confirmPassword && (
             <p className="text-sm text-destructive">{errors.confirmPassword.message}</p>
           )}
         </div>
-        {formError && <p className="text-sm text-destructive">{formError}</p>}
+        {formError && (
+          <p className="text-sm text-destructive">
+            {formError}{" "}
+            {formError.startsWith("This reset link") && (
+              <Link href="/forgot-password" className="underline underline-offset-4">
+                Request a new link
+              </Link>
+            )}
+          </p>
+        )}
         <Button type="submit" className="w-full" disabled={isSubmitting}>
           {isSubmitting ? "Updating…" : "Update password"}
         </Button>

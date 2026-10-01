@@ -1,10 +1,9 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { useState } from "react";
-import { useForm } from "react-hook-form";
+import { useForm, useWatch } from "react-hook-form";
 import { z } from "zod";
 
 import { AuthCard } from "@/components/auth-card";
@@ -14,13 +13,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PasswordInput } from "@/components/ui/password-input";
-import { Switch } from "@/components/ui/switch";
-import { useSignupSuccess } from "@/hooks/use-signup-success";
-import { getAdminStatus } from "@/lib/api";
-import { signUp } from "@/lib/auth-service";
+import { signUpOwner } from "@/lib/auth-service";
 import { getErrorMessage } from "@/lib/errors";
 
-// Mirrors the backend's SignupRequest.username constraint
+// Mirrors the backend's OwnerSignupRequest.username constraint
 // (app/schemas/auth.py) -- kept in sync deliberately, not shared code,
 // since the backend re-validates independently regardless of this check.
 const schema = z
@@ -30,7 +26,16 @@ const schema = z
       .min(3, "At least 3 characters")
       .max(32, "At most 32 characters")
       .regex(/^[a-zA-Z0-9_-]+$/, "Letters, numbers, - and _ only"),
-    email: z.string().email("Enter a valid email address"),
+    organizationName: z
+      .string()
+      .min(1, "Required")
+      .max(128, "At most 128 characters"),
+    email: z
+      .string()
+      .email("Enter a valid email address")
+      .refine((email) => !isPersonalEmailDomain(email), {
+        message: "Please use a business email address.",
+      }),
     password: z.string().min(8, "At least 8 characters"),
     confirmPassword: z.string(),
   })
@@ -41,40 +46,77 @@ const schema = z
 
 type FormValues = z.infer<typeof schema>;
 
+// Client-side UX hint only, not exhaustive -- the backend independently
+// re-validates against its own (larger) blocklist at signup time
+// regardless of what this check allows through.
+const PERSONAL_EMAIL_DOMAINS = new Set([
+  "gmail.com",
+  "googlemail.com",
+  "yahoo.com",
+  "outlook.com",
+  "hotmail.com",
+  "live.com",
+  "icloud.com",
+  "me.com",
+  "aol.com",
+  "protonmail.com",
+]);
+
+function isPersonalEmailDomain(email: string): boolean {
+  const domain = email.split("@")[1]?.toLowerCase();
+  return Boolean(domain && PERSONAL_EMAIL_DOMAINS.has(domain));
+}
+
 export default function SignupPage() {
-  const handleSignupSuccess = useSignupSuccess();
   const [formError, setFormError] = useState<string | null>(null);
-  // Only ever offered while no Trench administrator exists yet -- purely
-  // a UX convenience; the backend independently re-checks the same
-  // "no admin yet" condition when signup actually happens, so hiding this
-  // is never the security boundary.
-  const [registerAsAdmin, setRegisterAsAdmin] = useState(false);
-  const adminStatusQuery = useQuery({
-    queryKey: ["auth", "admin-status"],
-    queryFn: getAdminStatus,
-  });
-  const offerAdminToggle = adminStatusQuery.data === false;
+  const [created, setCreated] = useState(false);
 
   const {
     register,
     handleSubmit,
+    control,
     formState: { errors, isSubmitting },
   } = useForm<FormValues>({ resolver: zodResolver(schema) });
+  const organizationName = useWatch({ control, name: "organizationName" }) ?? "";
 
   const onSubmit = async (values: FormValues) => {
     setFormError(null);
     try {
-      await signUp(values.username, values.email, values.password, registerAsAdmin);
-      handleSignupSuccess();
+      await signUpOwner(
+        values.username,
+        values.email,
+        values.password,
+        values.organizationName
+      );
+      setCreated(true);
     } catch (error) {
       setFormError(getErrorMessage(error));
     }
   };
 
+  if (created) {
+    return (
+      <AuthCard
+        title="Organization created"
+        subtitle="Sign in to continue."
+        footer={
+          <Link
+            href="/signin"
+            className="font-medium text-foreground underline underline-offset-4"
+          >
+            Go to sign in
+          </Link>
+        }
+      >
+        <div />
+      </AuthCard>
+    );
+  }
+
   return (
     <AuthCard
-      title="Create your account"
-      subtitle="Start building your knowledge base."
+      title="Create your organization"
+      subtitle="You'll be the owner — invite your team once you're in."
       footer={
         <>
           Already have an account?{" "}
@@ -89,8 +131,8 @@ export default function SignupPage() {
     >
       <GoogleSignInButton
         mode="signup"
-        registerAsAdmin={registerAsAdmin}
-        onSuccess={handleSignupSuccess}
+        organizationName={organizationName}
+        onSuccess={() => setCreated(true)}
         onError={setFormError}
       />
 
@@ -98,15 +140,40 @@ export default function SignupPage() {
 
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
         <div className="space-y-2">
+          <Label htmlFor="organizationName">Organization name</Label>
+          <Input
+            id="organizationName"
+            autoComplete="organization"
+            aria-invalid={Boolean(errors.organizationName)}
+            {...register("organizationName")}
+          />
+          {errors.organizationName && (
+            <p className="text-sm text-destructive">
+              {errors.organizationName.message}
+            </p>
+          )}
+        </div>
+        <div className="space-y-2">
           <Label htmlFor="username">Username</Label>
-          <Input id="username" autoComplete="username" {...register("username")} />
+          <Input
+            id="username"
+            autoComplete="username"
+            aria-invalid={Boolean(errors.username)}
+            {...register("username")}
+          />
           {errors.username && (
             <p className="text-sm text-destructive">{errors.username.message}</p>
           )}
         </div>
         <div className="space-y-2">
-          <Label htmlFor="email">Email</Label>
-          <Input id="email" type="email" autoComplete="email" {...register("email")} />
+          <Label htmlFor="email">Work email</Label>
+          <Input
+            id="email"
+            type="email"
+            autoComplete="email"
+            aria-invalid={Boolean(errors.email)}
+            {...register("email")}
+          />
           {errors.email && (
             <p className="text-sm text-destructive">{errors.email.message}</p>
           )}
@@ -116,6 +183,7 @@ export default function SignupPage() {
           <PasswordInput
             id="password"
             autoComplete="new-password"
+            aria-invalid={Boolean(errors.password)}
             {...register("password")}
           />
           {errors.password && (
@@ -127,6 +195,7 @@ export default function SignupPage() {
           <PasswordInput
             id="confirmPassword"
             autoComplete="new-password"
+            aria-invalid={Boolean(errors.confirmPassword)}
             {...register("confirmPassword")}
           />
           {errors.confirmPassword && (
@@ -134,26 +203,9 @@ export default function SignupPage() {
           )}
         </div>
 
-        {offerAdminToggle && (
-          <div className="flex items-start justify-between gap-3 rounded-xl border border-border bg-muted/40 p-3">
-            <div className="space-y-0.5">
-              <Label htmlFor="register-as-admin">Register as administrator</Label>
-              <p className="text-xs text-muted-foreground">
-                No Trench administrator exists yet. Only an administrator can
-                create organizations.
-              </p>
-            </div>
-            <Switch
-              id="register-as-admin"
-              checked={registerAsAdmin}
-              onCheckedChange={setRegisterAsAdmin}
-            />
-          </div>
-        )}
-
         {formError && <p className="text-sm text-destructive">{formError}</p>}
         <Button type="submit" className="w-full" disabled={isSubmitting}>
-          {isSubmitting ? "Creating account…" : "Create account"}
+          {isSubmitting ? "Creating organization…" : "Create organization"}
         </Button>
       </form>
     </AuthCard>

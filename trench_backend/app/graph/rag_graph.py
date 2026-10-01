@@ -155,7 +155,21 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
         f"{getattr(m, 'type', 'user')}: {getattr(m, 'content', '')}"
         for m in prior_messages[:-1]
     )
-    resolved = await LLMClientService.resolve_for_user(db, user)
+    try:
+        resolved = await LLMClientService.resolve_for_knowledge(
+            db,
+            user,
+            knowledge_type=state["knowledge_type"],
+            organization_id=uuid.UUID(state["organization_id"])
+            if state.get("organization_id")
+            else None,
+        )
+    except LLMClientService.MissingCredentialError:
+        # Not fatal here -- condensing is an optimization, not the actual
+        # generation step. Skip it and use the raw query; `generate` will
+        # hit the same missing-credential condition and surface it to the
+        # user properly.
+        return {"condensed_query": state["query"]}
     rewrite_prompt = (
         "Given this conversation history and a follow-up question, rewrite "
         "the follow-up as a standalone question. Reply with ONLY the "
@@ -248,7 +262,23 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     history = [_to_provider_message(m) for m in state["messages"][:-1]]
     conversation = [*history, {"role": "user", "content": state["query"]}]
 
-    resolved = await LLMClientService.resolve_for_user(db, user)
+    try:
+        resolved = await LLMClientService.resolve_for_knowledge(
+            db,
+            user,
+            knowledge_type=state["knowledge_type"],
+            organization_id=uuid.UUID(state["organization_id"])
+            if state.get("organization_id")
+            else None,
+        )
+    except LLMClientService.MissingCredentialError as exc:
+        reason = str(exc)
+        stream_manager.append_chunk(stream_id, {"type": "error", "content": reason})
+        return {
+            "response": reason,
+            "citations": [],
+            "messages": [{"role": "assistant", "content": reason}],
+        }
     full_text = ""
     async for delta in LLMClientService.stream_generate(
         resolved,

@@ -76,6 +76,14 @@ class CredentialService:
         return _mask_key(plaintext)
 
     @staticmethod
+    def mask_key(plaintext_api_key: str) -> str:
+        """Masks an already-decrypted key (e.g. an OrganizationCredential's,
+        resolved by its own service) -- same masking `masked_preview` uses
+        for a personal UserCredential, exposed for the unified /credentials
+        endpoints that list both scopes."""
+        return _mask_key(plaintext_api_key)
+
+    @staticmethod
     def required_credential_type(provider_name: str) -> str | None:
         """The BYOK provider_type a given LLM provider needs, or None if it
         needs no credential at all (the platform-owned Groq default)."""

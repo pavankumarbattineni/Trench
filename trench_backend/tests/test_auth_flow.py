@@ -1,11 +1,12 @@
 import time
+import uuid
 from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
-from app.database.models import User
+from app.database.models import Organization, User
 from app.database.session import async_session_factory
 
 TEST_FIREBASE_UID = "test-firebase-uid-1"
@@ -26,22 +27,25 @@ def _auth_headers(access_token: str) -> dict:
     return {"Authorization": f"Bearer {access_token}"}
 
 
-async def _signup(
+async def _signup_owner(
     client: AsyncClient,
     *,
     uid: str = TEST_FIREBASE_UID,
     email: str = TEST_EMAIL,
     username: str | None = None,
-    register_as_admin: bool = False,
+    organization_name: str | None = None,
 ):
-    body = {"id_token": "fake", "register_as_admin": register_as_admin}
+    body = {
+        "id_token": "fake",
+        "organization_name": organization_name or f"test-org-{uuid.uuid4().hex[:8]}",
+    }
     if username is not None:
         body["username"] = username
     with patch(
         "app.utils.firebase.verify_firebase_id_token",
         return_value=_fake_claims(uid=uid, email=email),
     ):
-        return await client.post("/api/v1/auth/signup", json=body)
+        return await client.post("/api/v1/auth/signup/owner", json=body)
 
 
 async def _login(
@@ -54,16 +58,15 @@ async def _login(
         return await client.post("/api/v1/auth/login", json={"id_token": "fake"})
 
 
-async def _signup_and_login(client: AsyncClient, **kwargs) -> str:
-    """Signs up then signs in, returning the access token. Splits kwargs
-    between the two calls by name (`username`/`register_as_admin` only
-    apply to signup)."""
+async def _signup_owner_and_get_token(client: AsyncClient, **kwargs) -> str:
+    """Signs up an Owner (which no longer issues a session itself) then
+    logs in separately, returning the access token."""
     signup_kwargs = {
-        k: v for k, v in kwargs.items() if k in ("username", "register_as_admin")
+        k: v for k, v in kwargs.items() if k in ("username", "organization_name")
     }
     login_kwargs = {k: v for k, v in kwargs.items() if k in ("uid", "email")}
-    signup_response = await _signup(client, **signup_kwargs, **login_kwargs)
-    assert signup_response.status_code == 200, signup_response.text
+    response = await _signup_owner(client, **signup_kwargs, **login_kwargs)
+    assert response.status_code == 200, response.text
     login_response = await _login(client, **login_kwargs)
     assert login_response.status_code == 200, login_response.text
     return login_response.json()["access_token"]
@@ -73,125 +76,131 @@ async def _signup_and_login(client: AsyncClient, **kwargs) -> str:
 async def cleanup_test_users():
     yield
     async with async_session_factory() as session:
+        await session.execute(
+            update(User)
+            .where(User.email.like("test%@example.com"))
+            .values(organization_id=None)
+        )
+        await session.commit()
+        org_result = await session.execute(
+            select(Organization).where(Organization.domain == "example.com")
+        )
+        for organization in org_result.scalars().all():
+            await session.delete(organization)
+        await session.commit()
         await session.execute(delete(User).where(User.email.like("test%@example.com")))
         await session.commit()
 
 
-# --- Signup ---------------------------------------------------------------
+# --- Owner signup -------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_signup_creates_a_user_without_issuing_tokens(client: AsyncClient):
-    response = await _signup(client)
+async def test_owner_signup_does_not_issue_a_session_but_creates_an_organization(
+    client: AsyncClient,
+):
+    """Owner-signup no longer logs the new Owner straight into the app --
+    the frontend sends them to /signin instead, same as every other
+    account-creation path except invite-accept (which stays untouched)."""
+    response = await _signup_owner(client, organization_name="Test Acme Corp")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["email"] == TEST_EMAIL
-    assert body["role"] == "user"
     assert "access_token" not in body
     assert "refresh_token" not in body
+    assert body["organization"]["name"] == "Test Acme Corp"
+    assert body["organization"]["domain"] == "example.com"
+
+    login = await _login(client)
+    assert login.status_code == 200
+    me = await client.get(
+        "/api/v1/users/me", headers=_auth_headers(login.json()["access_token"])
+    )
+    assert me.json()["email"] == TEST_EMAIL
+    assert me.json()["organization"]["role"] == "owner"
 
 
 @pytest.mark.asyncio
-async def test_signup_rejects_an_already_registered_email(client: AsyncClient):
-    first = await _signup(client)
+async def test_owner_signup_rejects_an_already_registered_email(client: AsyncClient):
+    first = await _signup_owner(client)
     assert first.status_code == 200
 
-    second = await _signup(client)
+    second = await _signup_owner(client)
     assert second.status_code == 409
 
 
 @pytest.mark.asyncio
-async def test_signup_uses_the_requested_username(client: AsyncClient):
-    response = await _signup(client, username="test-chosen-name")
-    assert response.status_code == 200
-    assert response.json()["username"] == "test-chosen-name"
-
-
-@pytest.mark.asyncio
-async def test_signup_rejects_duplicate_requested_username(client: AsyncClient):
-    first = await _signup(
-        client, uid="test-first-owner", email="test.first@example.com",
-        username="test-taken-name",
+async def test_owner_signup_rejects_a_public_email_domain(client: AsyncClient):
+    response = await _signup_owner(
+        client,
+        uid="test-public-domain-owner",
+        email="test.someone@gmail.com",
     )
-    assert first.status_code == 200
-
-    second = await _signup(
-        client, uid="test-second-owner", email="test.other@example.com",
-        username="test-taken-name",
-    )
-    assert second.status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_signup_rejects_malformed_username(client: AsyncClient):
-    response = await _signup(client, username="a")
     assert response.status_code == 422
 
 
 @pytest.mark.asyncio
-async def test_signup_default_role_is_user(client: AsyncClient):
-    response = await _signup(client)
-    assert response.json()["role"] == "user"
+async def test_owner_signup_uses_the_requested_username(client: AsyncClient):
+    access_token = await _signup_owner_and_get_token(
+        client, username="test-chosen-name"
+    )
+    me = await client.get("/api/v1/users/me", headers=_auth_headers(access_token))
+    assert me.json()["username"] == "test-chosen-name"
 
 
 @pytest.mark.asyncio
-async def test_signup_cannot_self_assign_admin_role_directly(client: AsyncClient):
-    """There is no raw `role` field on the signup request -- only the
-    gated `register_as_admin` boolean -- so a client attempting to smuggle
-    role="admin" directly has no effect; it's simply an unknown field."""
+async def test_owner_signup_rejects_duplicate_requested_username(
+    client: AsyncClient,
+):
+    first = await _signup_owner(
+        client,
+        uid="test-first-owner",
+        email="test.first@example.com",
+        username="test-taken-name",
+    )
+    assert first.status_code == 200
+
+    second = await _signup_owner(
+        client,
+        uid="test-second-owner",
+        email="test.other@example.com",
+        username="test-taken-name",
+    )
+    assert second.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_owner_signup_rejects_malformed_username(client: AsyncClient):
+    response = await _signup_owner(client, username="a")
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_owner_signup_default_role_is_owner_not_a_client_supplied_value(
+    client: AsyncClient,
+):
+    """There is no raw `role` field on OwnerSignupRequest at all -- a
+    client attempting to smuggle one has no effect; the Owner role comes
+    only from being the one who calls this endpoint."""
     with patch(
         "app.utils.firebase.verify_firebase_id_token", return_value=_fake_claims()
     ):
         response = await client.post(
-            "/api/v1/auth/signup", json={"id_token": "fake", "role": "admin"}
+            "/api/v1/auth/signup/owner",
+            json={
+                "id_token": "fake",
+                "organization_name": "Test Org",
+                "role": "superadmin",
+            },
         )
     assert response.status_code == 200
-    assert response.json()["role"] == "user"
-
-
-@pytest.mark.asyncio
-async def test_register_as_admin_becomes_admin_only_when_none_exists_yet(
-    client: AsyncClient,
-):
-    admin_status = await client.get("/api/v1/auth/admin-status")
-    if admin_status.json()["admin_exists"]:
-        pytest.skip(
-            "an administrator already exists elsewhere in this shared dev "
-            "database -- the 'no admin exists yet' branch can't be "
-            "deterministically exercised here; the converse branch is "
-            "covered by test_register_as_admin_is_ignored_once_one_exists"
-        )
-
-    response = await _signup(client, register_as_admin=True)
-    assert response.status_code == 200
-    assert response.json()["role"] == "admin"
-
-
-@pytest.mark.asyncio
-async def test_register_as_admin_is_ignored_once_one_exists(client: AsyncClient):
-    # Manufacture the "an admin already exists" precondition ourselves,
-    # deterministically, regardless of the database's real-world state.
-    first = await _signup(
-        client, uid="test-existing-admin", email="test.existing-admin@example.com",
-        register_as_admin=True,
+    login = await _login(client)
+    me = await client.get(
+        "/api/v1/users/me",
+        headers=_auth_headers(login.json()["access_token"]),
     )
-    assert first.status_code == 200
-    async with async_session_factory() as session:
-        result = await session.execute(
-            select(User).where(User.email == "test.existing-admin@example.com")
-        )
-        user = result.scalar_one()
-        if user.role != "admin":
-            user.role = "admin"
-            await session.commit()
-
-    second = await _signup(
-        client, uid="test-second-admin-hopeful",
-        email="test.second-admin-hopeful@example.com", register_as_admin=True,
-    )
-    assert second.status_code == 200
-    assert second.json()["role"] == "user"
+    assert me.json()["organization"]["role"] == "owner"
+    assert me.json()["role"] == "user"
 
 
 # --- Signin (login) ---------------------------------------------------------
@@ -204,8 +213,10 @@ async def test_login_rejects_an_unregistered_user(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_signup_then_login_returns_a_bearer_token_pair(client: AsyncClient):
-    assert (await _signup(client)).status_code == 200
+async def test_login_after_owner_signup_returns_a_bearer_token_pair(
+    client: AsyncClient,
+):
+    assert (await _signup_owner(client)).status_code == 200
 
     response = await _login(client)
 
@@ -221,7 +232,7 @@ async def test_signup_then_login_returns_a_bearer_token_pair(client: AsyncClient
 
 @pytest.mark.asyncio
 async def test_login_is_idempotent_across_repeated_signins(client: AsyncClient):
-    assert (await _signup(client)).status_code == 200
+    assert (await _signup_owner(client)).status_code == 200
 
     first = await _login(client)
     second = await _login(client)
@@ -242,8 +253,8 @@ async def test_users_me_requires_authentication(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_users_me_returns_profile_after_signin(client: AsyncClient):
-    access_token = await _signup_and_login(client)
+async def test_users_me_returns_profile_after_owner_signup(client: AsyncClient):
+    access_token = await _signup_owner_and_get_token(client)
 
     response = await client.get(
         "/api/v1/users/me", headers=_auth_headers(access_token)
@@ -251,11 +262,12 @@ async def test_users_me_returns_profile_after_signin(client: AsyncClient):
     assert response.status_code == 200
     assert response.json()["email"] == TEST_EMAIL
     assert response.json()["role"] == "user"
+    assert response.json()["organization"]["role"] == "owner"
 
 
 @pytest.mark.asyncio
 async def test_refresh_rotates_tokens(client: AsyncClient):
-    await _signup(client)
+    assert (await _signup_owner(client)).status_code == 200
     login_response = await _login(client)
     old_access = login_response.json()["access_token"]
 
@@ -274,18 +286,80 @@ async def test_refresh_without_a_token_is_unauthorized(client: AsyncClient):
     assert response.status_code == 401
 
 
+# --- Logout -------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_logout_requires_authentication(client: AsyncClient):
+    response = await client.post("/api/v1/auth/logout")
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_logout_returns_no_content_for_an_authenticated_user(
+    client: AsyncClient,
+):
+    access_token = await _signup_owner_and_get_token(client)
+
+    response = await client.post(
+        "/api/v1/auth/logout", headers=_auth_headers(access_token)
+    )
+
+    assert response.status_code == 204
+
+
 # --- Account deletion --------------------------------------------------------
+
+
+async def _create_plain_user_and_login(
+    client: AsyncClient, *, uid: str, email: str, username: str
+) -> str:
+    """Creates a User row directly (no organization -- account deletion's
+    happy path doesn't depend on org membership, only Owner-ship blocks
+    it, see test_delete_account_rejects_owner_of_an_organization) and
+    signs in, returning the access token."""
+    async with async_session_factory() as session:
+        session.add(User(email=email, username=username))
+        await session.commit()
+    login_response = await _login(client, uid=uid, email=email)
+    assert login_response.status_code == 200, login_response.text
+    return login_response.json()["access_token"]
+
+
+@pytest.mark.asyncio
+async def test_delete_account_rejects_owner_of_an_organization(client: AsyncClient):
+    access_token = await _signup_owner_and_get_token(client)
+
+    with patch(
+        "app.utils.firebase.verify_firebase_id_token", return_value=_fake_claims()
+    ):
+        response = await client.request(
+            "DELETE",
+            "/api/v1/auth/account",
+            json={"id_token": "fake"},
+            headers=_auth_headers(access_token),
+        )
+
+    assert response.status_code == 409
+
+    me = await client.get("/api/v1/users/me", headers=_auth_headers(access_token))
+    assert me.status_code == 200
 
 
 @pytest.mark.asyncio
 async def test_delete_account_removes_user_and_calls_firebase_delete(
     client: AsyncClient,
 ):
-    access_token = await _signup_and_login(client)
+    uid = "test-plain-deletable"
+    email = "test.plain-deletable@example.com"
+    access_token = await _create_plain_user_and_login(
+        client, uid=uid, email=email, username="test-plain-deletable"
+    )
 
     with (
         patch(
-            "app.utils.firebase.verify_firebase_id_token", return_value=_fake_claims()
+            "app.utils.firebase.verify_firebase_id_token",
+            return_value=_fake_claims(uid=uid, email=email),
         ),
         patch("app.utils.firebase.delete_firebase_user") as mock_delete,
     ):
@@ -297,7 +371,7 @@ async def test_delete_account_removes_user_and_calls_firebase_delete(
         )
 
     assert response.status_code == 204
-    mock_delete.assert_called_once_with(TEST_FIREBASE_UID)
+    mock_delete.assert_called_once_with(uid)
 
     me = await client.get("/api/v1/users/me", headers=_auth_headers(access_token))
     assert me.status_code == 401
@@ -305,7 +379,7 @@ async def test_delete_account_removes_user_and_calls_firebase_delete(
 
 @pytest.mark.asyncio
 async def test_delete_account_rejects_stale_firebase_token(client: AsyncClient):
-    access_token = await _signup_and_login(client)
+    access_token = await _signup_owner_and_get_token(client)
 
     stale_claims = _fake_claims(iat=int(time.time()) - 3600)
     with patch(
@@ -323,7 +397,7 @@ async def test_delete_account_rejects_stale_firebase_token(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_delete_account_rejects_token_for_different_account(client: AsyncClient):
-    access_token = await _signup_and_login(client)
+    access_token = await _signup_owner_and_get_token(client)
 
     # A genuinely different account now means a different email -- Trench
     # correlates identity by email, not by storing Firebase's own UID.

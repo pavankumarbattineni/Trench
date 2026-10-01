@@ -1,5 +1,4 @@
 import uuid
-from datetime import datetime
 from typing import Annotated
 
 from pydantic import BaseModel, Field
@@ -16,31 +15,31 @@ class FirebaseSessionRequest(BaseModel):
     id_token: str
 
 
-class SignupRequest(BaseModel):
-    """POST /auth/signup only.
-
-    `register_as_admin` is a request, not a grant -- the backend only ever
-    honors it when no Trench administrator exists yet (see
-    UserService.create_user). There is no raw `role` field a client could
-    set directly; "admin" is reachable only through this one bootstrap
-    path.
-    """
+class OwnerSignupRequest(BaseModel):
+    """POST /auth/signup/owner only -- the sole way an organization (and
+    its first user, as Owner) now comes into existence. There is no
+    `register_as_admin` field here: every onboarding path is either this
+    one (Owner, first user of a new company domain) or
+    InvitationService.accept (Member/Admin, invited by an existing
+    Owner/Admin)."""
 
     id_token: str
     username: Username | None = None
-    register_as_admin: bool = False
+    organization_name: str = Field(min_length=1, max_length=128)
 
 
-class SignupResponse(BaseModel):
+class OwnerSignupOrganization(BaseModel):
     id: uuid.UUID
-    email: str
-    username: str
-    role: str
-    created_at: datetime
+    name: str
+    domain: str
 
 
-class AdminStatusResponse(BaseModel):
-    admin_exists: bool
+class OwnerSignupResponse(BaseModel):
+    """No session is issued here -- the Owner signs in separately via
+    POST /auth/login afterward, same as every other account-creation path
+    except invite-accept."""
+
+    organization: OwnerSignupOrganization
 
 
 class AccountDeletionRequest(BaseModel):
