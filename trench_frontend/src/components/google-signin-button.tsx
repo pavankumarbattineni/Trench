@@ -39,27 +39,26 @@ type GoogleSignInButtonProps =
       onError: (message: string) => void;
     }
   | {
-      /** Creates the account AND its organization -- the only way an
-       * organization now comes into existence besides accepting an
-       * invitation. No session is established; the caller sends the
-       * user to /signin afterward. Requires an organization name chosen
-       * before the button can be used, since Google's popup flow
-       * collects no form fields of its own. */
+      /** Creates the account AND its tenant -- the only way a tenant now
+       * comes into existence besides accepting an invitation. No session
+       * is established; the caller sends the user to /signin afterward.
+       * Requires a tenant name chosen before the button can be used,
+       * since Google's popup flow collects no form fields of its own. */
       mode: "signup";
-      organizationName: string;
+      tenantName: string;
       onSuccess: (profile: OwnerSignupProfile) => void;
       onError: (message: string) => void;
     };
 
 export function GoogleSignInButton(props: GoogleSignInButtonProps) {
   const [loading, setLoading] = useState(false);
-  const disabled = loading || (props.mode === "signup" && !props.organizationName.trim());
+  const disabled = loading || (props.mode === "signup" && !props.tenantName.trim());
 
   const handleClick = async () => {
     setLoading(true);
     try {
       if (props.mode === "signup") {
-        props.onSuccess(await signUpOwnerWithGoogle(props.organizationName));
+        props.onSuccess(await signUpOwnerWithGoogle(props.tenantName));
       } else {
         props.onSuccess(await signInWithGoogle());
       }
@@ -82,9 +81,9 @@ export function GoogleSignInButton(props: GoogleSignInButtonProps) {
         <GoogleIcon />
         {loading ? "Connecting…" : "Continue with Google"}
       </Button>
-      {props.mode === "signup" && !props.organizationName.trim() && (
+      {props.mode === "signup" && !props.tenantName.trim() && (
         <p className="text-xs text-muted-foreground">
-          Enter your organization name below to continue with Google.
+          Enter your tenant name below to continue with Google.
         </p>
       )}
     </div>

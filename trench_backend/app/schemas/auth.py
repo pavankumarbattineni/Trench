@@ -16,8 +16,8 @@ class FirebaseSessionRequest(BaseModel):
 
 
 class OwnerSignupRequest(BaseModel):
-    """POST /auth/signup/owner only -- the sole way an organization (and
-    its first user, as Owner) now comes into existence. There is no
+    """POST /auth/signup/owner only -- the sole way a tenant (and its
+    first user, as Owner) now comes into existence. There is no
     `register_as_admin` field here: every onboarding path is either this
     one (Owner, first user of a new company domain) or
     InvitationService.accept (Member/Admin, invited by an existing
@@ -25,10 +25,10 @@ class OwnerSignupRequest(BaseModel):
 
     id_token: str
     username: Username | None = None
-    organization_name: str = Field(min_length=1, max_length=128)
+    tenant_name: str = Field(min_length=1, max_length=128)
 
 
-class OwnerSignupOrganization(BaseModel):
+class OwnerSignupTenant(BaseModel):
     id: uuid.UUID
     name: str
     domain: str
@@ -39,7 +39,7 @@ class OwnerSignupResponse(BaseModel):
     POST /auth/login afterward, same as every other account-creation path
     except invite-accept."""
 
-    organization: OwnerSignupOrganization
+    tenant: OwnerSignupTenant
 
 
 class AccountDeletionRequest(BaseModel):

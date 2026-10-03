@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.database.models import Document, UsageCounter, User
+from app.database.models import Document, User
 from app.database.session import async_session_factory
 
 
@@ -52,8 +52,7 @@ async def test_document_cascades_on_user_delete():
         assert document.knowledge_base == "own"
         assert document.chunk_count == 0
 
-        counter = UsageCounter(user_id=user.id, documents_uploaded_count=1)
-        session.add(counter)
+        user.documents_uploaded_count = 1
         await session.commit()
 
         # Deleting the user cascades through documents.

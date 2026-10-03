@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { FileText, Trash2 } from "lucide-react";
+import { Download, Eye, FileText, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ConfirmDialog, useConfirmTarget } from "@/components/confirm-dialog";
@@ -9,7 +9,13 @@ import { DocumentStatusBadge } from "@/components/documents/document-status-badg
 import { UploadDropzone } from "@/components/documents/upload-dropzone";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useDeleteDocument, useDocuments, useUploadDocument } from "@/hooks/use-documents";
+import {
+  useDeleteDocument,
+  useDocuments,
+  useDownloadDocument,
+  useUploadDocument,
+  useViewDocument,
+} from "@/hooks/use-documents";
 import { getErrorMessage } from "@/lib/errors";
 import type { DocumentSummary } from "@/lib/documents";
 
@@ -23,8 +29,22 @@ export default function DocumentsPage() {
   const { data: documents, isLoading, isError, error } = useDocuments();
   const upload = useUploadDocument();
   const remove = useDeleteDocument();
+  const view = useViewDocument();
+  const download = useDownloadDocument();
   const deleteTarget = useConfirmTarget<DocumentSummary>();
   const [uploadError, setUploadError] = useState<string | null>(null);
+
+  const handleView = (doc: DocumentSummary) => {
+    view.mutate(doc.id, {
+      onError: (err) => toast.error(getErrorMessage(err)),
+    });
+  };
+
+  const handleDownload = (doc: DocumentSummary) => {
+    download.mutate(doc.id, {
+      onError: (err) => toast.error(getErrorMessage(err)),
+    });
+  };
 
   const handleUpload = (file: File) => {
     setUploadError(null);
@@ -100,6 +120,27 @@ export default function DocumentsPage() {
               )}
             </div>
             <DocumentStatusBadge status={doc.status} />
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="View document"
+              disabled={doc.status !== "completed" || (view.isPending && view.variables === doc.id)}
+              onClick={() => handleView(doc)}
+            >
+              <Eye className="size-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Download document"
+              disabled={
+                doc.status !== "completed" ||
+                (download.isPending && download.variables === doc.id)
+              }
+              onClick={() => handleDownload(doc)}
+            >
+              <Download className="size-4" />
+            </Button>
             <Button
               variant="ghost"
               size="icon-sm"

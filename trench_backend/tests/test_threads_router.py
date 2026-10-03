@@ -5,7 +5,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select, update
 
-from app.database.models import Organization, User
+from app.database.models import Tenant, User
 from app.database.session import async_session_factory
 
 PREFIX = "test-threads-router"
@@ -26,7 +26,7 @@ async def _login(client: AsyncClient) -> None:
     with patch("app.utils.firebase.verify_firebase_id_token", return_value=_claims()):
         await client.post(
             "/api/v1/auth/signup/owner",
-            json={"id_token": "fake", "organization_name": f"{PREFIX}-org"},
+            json={"id_token": "fake", "tenant_name": f"{PREFIX}-org"},
         )
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
@@ -39,14 +39,14 @@ async def cleanup():
         await session.execute(
             update(User)
             .where(User.email.like(f"%{PREFIX}%"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
-        org_result = await session.execute(
-            select(Organization).where(Organization.domain.like(f"%{PREFIX}%"))
+        tenant_result = await session.execute(
+            select(Tenant).where(Tenant.domain.like(f"%{PREFIX}%"))
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
         result = await session.execute(
             select(User).where(User.email.like(f"%{PREFIX}%"))
@@ -131,16 +131,16 @@ async def test_update_thread_title_requires_ownership(client: AsyncClient):
         return_value={
             "uid": f"{PREFIX}-other-uid",
             # A distinct domain, not just a distinct local part -- a
-            # domain anchors exactly one organization, so a second Owner
+            # domain anchors exactly one tenant, so a second Owner
             # identity needs its own domain to avoid colliding with the
-            # first signup's organization.
+            # first signup's tenant.
             "email": f"owner@{PREFIX}-other.example.com",
             "iat": int(time.time()),
         },
     ):
         await client.post(
             "/api/v1/auth/signup/owner",
-            json={"id_token": "fake", "organization_name": f"{PREFIX}-other-org"},
+            json={"id_token": "fake", "tenant_name": f"{PREFIX}-other-org"},
         )
         other_login = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     other_client_headers = {

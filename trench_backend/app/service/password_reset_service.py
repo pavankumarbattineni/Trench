@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database.models import PasswordResetToken, User
 from app.utils import firebase as firebase_utils
 from app.utils.email import send_email
@@ -48,7 +49,8 @@ class PasswordResetService:
         db.add(token)
         await db.commit()
 
-        reset_url = f"https://app.trench.example/reset-password?token={raw_token}"
+        frontend_base_url = get_settings().TRENCH_CONFIG.FRONTEND_BASE_URL
+        reset_url = f"{frontend_base_url}/reset-password?token={raw_token}"
         await send_email(
             to=email,
             subject="Reset your Trench password",

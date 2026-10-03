@@ -14,6 +14,13 @@ export interface RetrievedChunk {
   chunk_index: number;
   content: string;
   score: number;
+  // The "[n]" the model actually cited this chunk as in the response text
+  // -- its 1-based position in the full candidate list the backend built
+  // the prompt from, not this array's own index (chunks the model didn't
+  // use are dropped before this ever reaches the frontend, so this array's
+  // positions don't line up with the numbers in the text; see
+  // app/graph/rag_graph.py's build_citations).
+  citation_number: number;
 }
 
 export type MessageRole = "user" | "assistant";

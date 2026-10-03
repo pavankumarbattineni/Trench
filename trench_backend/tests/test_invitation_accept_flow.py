@@ -6,7 +6,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import delete, select, update
 
-from app.database.models import Invitation, Organization, OrganizationMember, User
+from app.database.models import Invitation, Tenant, User
 from app.database.session import async_session_factory
 from app.service.invitation_service import InvitationService
 
@@ -28,51 +28,52 @@ async def cleanup():
         await session.execute(
             update(User)
             .where(User.email.like(f"{PREFIX}%"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
-        org_result = await session.execute(
-            select(Organization).where(Organization.domain.like(f"{PREFIX}%"))
+        tenant_result = await session.execute(
+            select(Tenant).where(Tenant.domain.like(f"{PREFIX}%"))
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
         await session.execute(delete(User).where(User.email.like(f"{PREFIX}%")))
         await session.commit()
 
 
-async def _create_org_owner_and_pending_invite(
+async def _create_tenant_with_owner(session, *, suffix: str) -> tuple[Tenant, User]:
+    tenant = Tenant(
+        name=f"{PREFIX}-tenant-{suffix}",
+        domain=f"{PREFIX}-{suffix}.example.com",
+    )
+    session.add(tenant)
+    await session.flush()
+    owner = User(
+        email=f"{PREFIX}-owner-{suffix}@{PREFIX}.example.com",
+        username=f"{PREFIX}-owner-{suffix}",
+        tenant_id=tenant.id,
+        role="owner",
+    )
+    session.add(owner)
+    await session.commit()
+    return tenant, owner
+
+
+async def _create_tenant_owner_and_pending_invite(
     *, invitee_email: str, role: str = "member", suffix: str
 ) -> str:
-    """Returns a raw invitation token. Bypasses HTTP for org/invite setup
-    (owner-signup and the invite-creation endpoint are covered by their
-    own tasks' tests) by writing directly to the DB and capturing the
-    raw token InvitationService.create would have emailed."""
+    """Returns a raw invitation token. Bypasses HTTP for tenant/invite
+    setup (owner-signup and the invite-creation endpoint are covered by
+    their own tests) by writing directly to the DB and capturing the raw
+    token InvitationService.create would have emailed."""
     async with async_session_factory() as session:
-        owner = User(
-            email=f"{PREFIX}-owner-{suffix}@{PREFIX}.example.com",
-            username=f"{PREFIX}-owner-{suffix}",
-        )
-        session.add(owner)
-        await session.flush()
-        org = Organization(
-            name=f"{PREFIX}-org-{suffix}",
-            domain=f"{PREFIX}-{suffix}.example.com",
-            owner_user_id=owner.id,
-        )
-        session.add(org)
-        await session.flush()
-        owner_membership = OrganizationMember(
-            organization_id=org.id, user_id=owner.id, role="owner"
-        )
-        session.add(owner_membership)
-        await session.commit()
+        tenant, owner = await _create_tenant_with_owner(session, suffix=suffix)
 
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             _invitation, raw_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=tenant,
+                inviter=owner,
                 email=invitee_email,
                 role=role,
             )
@@ -81,7 +82,7 @@ async def _create_org_owner_and_pending_invite(
 
 @pytest.mark.asyncio
 async def test_accept_invitation_returns_a_token_pair(client: AsyncClient):
-    raw_token = await _create_org_owner_and_pending_invite(
+    raw_token = await _create_tenant_owner_and_pending_invite(
         invitee_email=f"{PREFIX}-newhire@{PREFIX}-returns-pair.example.com",
         suffix="returns-pair",
     )
@@ -106,8 +107,52 @@ async def test_accept_invitation_returns_a_token_pair(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_accept_invitation_rejects_an_invitee_already_in_a_tenant(
+    client: AsyncClient,
+):
+    """A user belongs to at most one tenant -- accepting an invitation
+    must never silently move an existing member (here, another tenant's
+    Owner) out of theirs."""
+    async with async_session_factory() as session:
+        _tenant, existing_owner = await _create_tenant_with_owner(
+            session, suffix="already"
+        )
+    invitee_email = existing_owner.email
+    placeholder_email = f"{PREFIX}-placeholder@{PREFIX}-already-inviter.example.com"
+    raw_token = await _create_tenant_owner_and_pending_invite(
+        invitee_email=placeholder_email, suffix="already-inviter"
+    )
+    # create() only accepts emails on the inviting tenant's own domain, so
+    # repoint the invitation at the existing Owner's address directly.
+    async with async_session_factory() as session:
+        await session.execute(
+            update(Invitation)
+            .where(Invitation.email == placeholder_email)
+            .values(email=invitee_email)
+        )
+        await session.commit()
+
+    with patch(
+        "app.utils.firebase.verify_firebase_id_token",
+        return_value=_fake_claims(invitee_email),
+    ):
+        response = await client.post(
+            "/api/v1/auth/invitations/accept",
+            json={"token": raw_token, "id_token": "fake"},
+        )
+
+    assert response.status_code == 409
+    async with async_session_factory() as session:
+        owner = (
+            await session.execute(select(User).where(User.email == invitee_email))
+        ).scalar_one()
+        assert owner.role == "owner"
+        assert owner.tenant_id is not None
+
+
+@pytest.mark.asyncio
 async def test_accept_invitation_rejects_mismatched_email(client: AsyncClient):
-    raw_token = await _create_org_owner_and_pending_invite(
+    raw_token = await _create_tenant_owner_and_pending_invite(
         invitee_email=f"{PREFIX}-newhire2@{PREFIX}-mismatch.example.com",
         suffix="mismatch",
     )
@@ -141,35 +186,18 @@ async def test_accept_invitation_rejects_an_unknown_token(client: AsyncClient):
 async def test_accept_invitation_reuses_html_body_url_shape(client: AsyncClient):
     """Sanity check that the html_body accept_url format the helper parses
     in other test files actually matches what InvitationService emits --
-    protects test_organizations_router.py's `_invite_and_accept` helper
+    protects test_tenants_router.py's `_invite_and_accept` helper
     from silently breaking if the URL shape ever changes."""
     async with async_session_factory() as session:
-        owner = User(
-            email=f"{PREFIX}-urlcheck-owner@{PREFIX}.example.com",
-            username=f"{PREFIX}-urlcheck-owner",
-        )
-        session.add(owner)
-        await session.flush()
-        org = Organization(
-            name=f"{PREFIX}-org-urlcheck",
-            domain=f"{PREFIX}-urlcheck.example.com",
-            owner_user_id=owner.id,
-        )
-        session.add(org)
-        await session.flush()
-        owner_membership = OrganizationMember(
-            organization_id=org.id, user_id=owner.id, role="owner"
-        )
-        session.add(owner_membership)
-        await session.commit()
+        tenant, owner = await _create_tenant_with_owner(session, suffix="urlcheck")
 
         with patch(
             "app.service.invitation_service.send_email", new=AsyncMock()
         ) as mock_send:
             await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=tenant,
+                inviter=owner,
                 email=f"{PREFIX}-urlcheck-invitee@{PREFIX}-urlcheck.example.com",
                 role="member",
             )

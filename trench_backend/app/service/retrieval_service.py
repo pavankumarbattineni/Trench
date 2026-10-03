@@ -28,7 +28,7 @@ from app.service.vector_store_service import (
 
 _COMPANY_ACCESS_DENIED = HTTPException(
     status.HTTP_403_FORBIDDEN,
-    "You don't have access to this organization's company knowledge",
+    "You don't have access to this tenant's company knowledge",
 )
 
 
@@ -46,12 +46,12 @@ class RetrievedChunk:
 class KnowledgeScope:
     knowledge_type: str
     user_id: uuid.UUID | None
-    organization_id: uuid.UUID | None
+    tenant_id: uuid.UUID | None
 
     @property
     def namespace(self) -> str:
         if self.knowledge_type == "company":
-            return company_namespace(self.organization_id)
+            return company_namespace(self.tenant_id)
         return personal_namespace(self.user_id)
 
 
@@ -64,25 +64,23 @@ class RetrievalService:
         the resolved, trusted scope to retrieve against.
 
         Never trusts the caller's knowledge_type choice at face value for
-        "company" -- membership + an active grant (or admin role) is
-        required, checked fresh on every call.
+        "company" -- tenant membership + a grant (or an admin/owner role)
+        is required, checked fresh on every call.
         """
         if knowledge_type == "personal":
             return KnowledgeScope(
                 knowledge_type="personal",
                 user_id=requesting_user_id,
-                organization_id=None,
+                tenant_id=None,
             )
 
-        organization_id = (
-            await KnowledgeAccessService.authorized_company_organization_id(
-                db, user_id=requesting_user_id
-            )
+        tenant_id = await KnowledgeAccessService.authorized_company_tenant_id(
+            db, user_id=requesting_user_id
         )
-        if organization_id is None:
+        if tenant_id is None:
             raise _COMPANY_ACCESS_DENIED
         return KnowledgeScope(
-            knowledge_type="company", user_id=None, organization_id=organization_id
+            knowledge_type="company", user_id=None, tenant_id=tenant_id
         )
 
     @staticmethod

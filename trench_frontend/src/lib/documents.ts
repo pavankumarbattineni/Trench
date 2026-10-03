@@ -45,6 +45,22 @@ export async function deleteDocument(documentId: string): Promise<void> {
   await apiClient.delete(`/api/v1/documents/${documentId}`);
 }
 
+export interface DownloadUrlResponse {
+  url: string;
+  expires_in: number;
+}
+
+export async function getDownloadUrl(
+  documentId: string,
+  disposition: "inline" | "attachment"
+): Promise<DownloadUrlResponse> {
+  const { data } = await apiClient.get<DownloadUrlResponse>(
+    `/api/v1/documents/${documentId}/download`,
+    { params: { disposition } }
+  );
+  return data;
+}
+
 export const MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024;
 export const ACCEPTED_DOCUMENT_TYPES = [
   "application/pdf",

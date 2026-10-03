@@ -17,10 +17,14 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Document, UsageCounter, User
+from app.database.models import Document, User
 from app.database.session import async_session_factory
 from app.service.credential_service import CredentialService
-from app.service.document_storage_service import get_storage_provider
+from app.service.document_storage_service import (
+    Disposition,
+    DocumentStorageError,
+    get_storage_provider,
+)
 from app.service.embedding_service import EmbeddingService
 from app.service.knowledge_access_service import KnowledgeAccessService
 from app.service.vector_store_service import (
@@ -46,6 +50,11 @@ _STILL_PROCESSING = HTTPException(
 
 _ACTIVE_STATUSES = ("pending", "processing")
 
+# How long a presigned download URL stays valid. Short on purpose: the
+# frontend fetches a fresh one per click, and a leaked URL grants access
+# to the bytes with no further authorization check.
+DOWNLOAD_URL_EXPIRES_IN = 300
+
 
 class DocumentService:
     FREE_DOCUMENT_LIMIT = 5
@@ -59,22 +68,21 @@ class DocumentService:
         filename: str,
         content: bytes,
         knowledge_type: str = "personal",
-        organization_id: uuid.UUID | None = None,
+        tenant_id: uuid.UUID | None = None,
     ) -> Document:
         """Validates, dedupes, enforces the free-tier limit (personal only)
         and the one-active-upload-at-a-time rule, stores, and records a new
         document.
 
         Args:
-            user: The authenticated uploader (for company documents, an
-                org admin or a member granted document-management access
-                -- authorization for that must already have been checked
-                by the caller).
+            user: The authenticated uploader (for company documents, a
+                tenant Admin/Owner -- authorization for that must already
+                have been checked by the caller).
             filename: Original filename (used only for extension-based
                 disambiguation and display -- content is what's trusted).
             content: The raw file bytes.
             knowledge_type: "personal" | "company".
-            organization_id: Required (and pre-authorized) for
+            tenant_id: Required (and pre-authorized) for
                 knowledge_type="company"; ignored for "personal".
 
         Returns:
@@ -86,7 +94,8 @@ class DocumentService:
             HTTPException: 422 on an invalid file; 403 if the free-tier
                 limit is reached and the user has no Pinecone BYOK
                 credential; 409 if the user already has a document
-                pending/processing.
+                pending/processing; 502 if the storage backend rejects
+                the write.
         """
         mime_type = validate_upload(filename, content)
         content_hash = hashlib.sha256(content).hexdigest()
@@ -94,7 +103,7 @@ class DocumentService:
         existing_document = await cls._find_duplicate(
             db,
             user_id=user.id,
-            organization_id=organization_id,
+            tenant_id=tenant_id,
             knowledge_type=knowledge_type,
             content_hash=content_hash,
         )
@@ -106,14 +115,25 @@ class DocumentService:
             await cls._enforce_free_tier_limit(db, user_id=user.id)
 
         document_id = uuid.uuid4()
-        owner_scope = str(organization_id) if organization_id else str(user.id)
+        owner_scope = str(tenant_id) if tenant_id else str(user.id)
         storage_path = f"{knowledge_type}/{owner_scope}/{document_id}/{filename}"
-        await get_storage_provider().save(storage_path, content)
+        # Bytes are stored *before* the row is created (and nothing has been
+        # added to the session yet), so a storage failure can never leave a
+        # `pending` Document with no bytes behind it for ingestion to choke
+        # on. The reverse failure -- object written, commit fails -- leaves
+        # at most one unreferenced object in the bucket, which is harmless.
+        try:
+            await get_storage_provider().save(storage_path, content)
+        except DocumentStorageError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                "Failed to store the uploaded document. Please try again.",
+            ) from exc
 
         document = Document(
             id=document_id,
             user_id=user.id,
-            organization_id=organization_id,
+            tenant_id=tenant_id,
             document_name=filename,
             document_type=document_type_for(mime_type),
             mime_type=mime_type,
@@ -148,13 +168,13 @@ class DocumentService:
         db: AsyncSession,
         *,
         user_id: uuid.UUID,
-        organization_id: uuid.UUID | None,
+        tenant_id: uuid.UUID | None,
         knowledge_type: str,
         content_hash: str,
     ) -> Document | None:
         if knowledge_type == "company":
             query = select(Document).where(
-                Document.organization_id == organization_id,
+                Document.tenant_id == tenant_id,
                 Document.content_hash == content_hash,
             )
         else:
@@ -180,11 +200,13 @@ class DocumentService:
     async def _enforce_free_tier_limit(
         cls, db: AsyncSession, *, user_id: uuid.UUID
     ) -> None:
+        # Read straight from the column rather than off a possibly stale
+        # in-memory User -- the count is incremented by the background
+        # ingestion task in its own session.
         result = await db.execute(
-            select(UsageCounter).where(UsageCounter.user_id == user_id)
+            select(User.documents_uploaded_count).where(User.id == user_id)
         )
-        counter = result.scalar_one_or_none()
-        current_count = counter.documents_uploaded_count if counter is not None else 0
+        current_count = result.scalar_one_or_none() or 0
 
         if current_count < cls.FREE_DOCUMENT_LIMIT:
             return
@@ -212,15 +234,53 @@ class DocumentService:
 
     @staticmethod
     async def list_company_documents(
-        db: AsyncSession, *, organization_id: uuid.UUID
+        db: AsyncSession, *, tenant_id: uuid.UUID
     ) -> list[Document]:
         result = await db.execute(
             select(Document).where(
-                Document.organization_id == organization_id,
+                Document.tenant_id == tenant_id,
                 Document.knowledge_type == "company",
             )
         )
         return list(result.scalars().all())
+
+    @staticmethod
+    async def has_any_personal_documents(
+        db: AsyncSession, *, user_id: uuid.UUID
+    ) -> bool:
+        """Whether `user_id` has at least one fully-ingested personal
+        document -- used by the RAG graph to tell "this knowledge base has
+        never had anything in it" apart from "nothing relevant matched
+        this query" (see app/graph/rag_graph.py's validate_knowledge_access).
+        A LIMIT 1 existence check, not a count -- cheaper, and the caller
+        only needs a boolean."""
+        result = await db.execute(
+            select(Document.id)
+            .where(
+                Document.user_id == user_id,
+                Document.knowledge_type == "personal",
+                Document.status == "completed",
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
+    async def has_any_company_documents(
+        db: AsyncSession, *, tenant_id: uuid.UUID
+    ) -> bool:
+        """Same as has_any_personal_documents, scoped to a tenant's
+        company knowledge instead."""
+        result = await db.execute(
+            select(Document.id)
+            .where(
+                Document.tenant_id == tenant_id,
+                Document.knowledge_type == "company",
+                Document.status == "completed",
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     @classmethod
     async def get_document(
@@ -245,12 +305,10 @@ class DocumentService:
                 raise _ACCESS_DENIED
             return document
 
-        authorized_org_id = (
-            await KnowledgeAccessService.authorized_company_organization_id(
-                db, user_id=user.id
-            )
+        authorized_id = await KnowledgeAccessService.authorized_company_tenant_id(
+            db, user_id=user.id
         )
-        if authorized_org_id is None or authorized_org_id != document.organization_id:
+        if authorized_id is None or authorized_id != document.tenant_id:
             raise _ACCESS_DENIED
         return document
 
@@ -272,44 +330,43 @@ class DocumentService:
 
     @classmethod
     async def get_company_document(
-        cls, db: AsyncSession, *, organization_id: uuid.UUID, document_id: uuid.UUID
+        cls, db: AsyncSession, *, tenant_id: uuid.UUID, document_id: uuid.UUID
     ) -> Document:
-        """Fetches a company document scoped to `organization_id`.
+        """Fetches a company document scoped to `tenant_id`.
 
-        Callers must already have been authorized (by the router, e.g. via
-        `require_org_document_manager`) to manage this organization's
-        documents -- this only verifies the document actually belongs to
-        it, it doesn't re-derive per-user knowledge-access authorization
-        (that's a separate, narrower grant -- see KnowledgeAccessService --
-        not required to manage documents).
+        Callers must already have been authorized (by the router, via
+        `require_tenant_admin_or_owner`) to manage this tenant's documents
+        -- this only verifies the document actually belongs to it, it
+        doesn't re-derive per-user knowledge-access authorization (that's
+        a separate, narrower grant -- see KnowledgeAccessService -- not
+        required to manage documents).
 
         Raises:
             HTTPException: 404 if the document doesn't exist, isn't a
-                company document, or belongs to a different organization.
+                company document, or belongs to a different tenant.
         """
         result = await db.execute(select(Document).where(Document.id == document_id))
         document = result.scalar_one_or_none()
         if (
             document is None
             or document.knowledge_type != "company"
-            or document.organization_id != organization_id
+            or document.tenant_id != tenant_id
         ):
             raise _ACCESS_DENIED
         return document
 
     @classmethod
     async def delete_company_document(
-        cls, db: AsyncSession, *, organization_id: uuid.UUID, document_id: uuid.UUID
+        cls, db: AsyncSession, *, tenant_id: uuid.UUID, document_id: uuid.UUID
     ) -> None:
-        """Deletes a company document, scoped to `organization_id`.
+        """Deletes a company document, scoped to `tenant_id`.
 
         Raises:
             HTTPException: 404 if the document doesn't exist or belongs to
-                a different organization; 409 if it's still
-                pending/processing.
+                a different tenant; 409 if it's still pending/processing.
         """
         document = await cls.get_company_document(
-            db, organization_id=organization_id, document_id=document_id
+            db, tenant_id=tenant_id, document_id=document_id
         )
         await cls._delete_document_row(db, document)
 
@@ -327,7 +384,7 @@ class DocumentService:
 
         if document.chunk_count > 0:
             namespace = (
-                company_namespace(document.organization_id)
+                company_namespace(document.tenant_id)
                 if document.knowledge_type == "company"
                 else personal_namespace(document.user_id)
             )
@@ -339,6 +396,79 @@ class DocumentService:
             vector_store = get_vector_store(dimensions=EmbeddingService.DIMENSIONS)
             await vector_store.delete(namespace=namespace, ids=chunk_ids)
 
-        await get_storage_provider().delete(document.storage_path)
+        # A failed storage delete deliberately does NOT block the DB delete:
+        # one orphaned object left in the bucket is a far smaller problem
+        # than a document the user can never get rid of (and every retry
+        # would hit the same failure). The object key is logged so it can
+        # be cleaned up by hand; the user still sees a successful delete.
+        try:
+            await get_storage_provider().delete(document.storage_path)
+        except DocumentStorageError:
+            logger.error(
+                "Orphaned storage object after document delete | "
+                "document_id=%s storage_path=%s",
+                document.id,
+                document.storage_path,
+            )
         await db.delete(document)
         await db.commit()
+
+    @classmethod
+    async def generate_download_url(
+        cls,
+        db: AsyncSession,
+        *,
+        user: User,
+        document_id: uuid.UUID,
+        disposition: Disposition,
+    ) -> str:
+        """Returns a short-lived presigned URL to the document's bytes,
+        after the same visibility check as get_document.
+
+        Raises:
+            HTTPException: 404 if the document doesn't exist or the
+                requester isn't authorized to see it; 502 if the storage
+                backend can't sign the URL.
+        """
+        document = await cls.get_document(db, user=user, document_id=document_id)
+        return await cls._presigned_url_for(document, disposition)
+
+    @classmethod
+    async def generate_company_download_url(
+        cls,
+        db: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        document_id: uuid.UUID,
+        disposition: Disposition,
+    ) -> str:
+        """Returns a short-lived presigned URL to a company document's
+        bytes. Like get_company_document, this only verifies the document
+        belongs to `tenant_id` -- the caller's right to read that tenant's
+        company knowledge must already have been checked by the router.
+
+        Raises:
+            HTTPException: 404 if the document doesn't exist or belongs to
+                a different tenant; 502 if the storage backend can't sign
+                the URL.
+        """
+        document = await cls.get_company_document(
+            db, tenant_id=tenant_id, document_id=document_id
+        )
+        return await cls._presigned_url_for(document, disposition)
+
+    @staticmethod
+    async def _presigned_url_for(document: Document, disposition: Disposition) -> str:
+        try:
+            return await get_storage_provider().generate_presigned_url(
+                document.storage_path,
+                filename=document.document_name,
+                mime_type=document.mime_type,
+                disposition=disposition,
+                expires_in=DOWNLOAD_URL_EXPIRES_IN,
+            )
+        except DocumentStorageError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                "Failed to generate a download link. Please try again.",
+            ) from exc

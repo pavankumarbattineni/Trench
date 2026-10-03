@@ -1,4 +1,4 @@
-"""Sends transactional email over SMTP -- organization invitations and
+"""Sends transactional email over SMTP -- tenant invitations and
 password-reset links. No third-party email API: TRENCH_CONFIG.SMTP holds
 a plain SMTP account's credentials, following the same
 TRENCH_CONFIG.<SECTION> pattern as FIREBASE/GROQ/PINECONE.

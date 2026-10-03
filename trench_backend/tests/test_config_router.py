@@ -5,7 +5,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select, update
 
-from app.database.models import Organization, User
+from app.database.models import Tenant, User
 from app.database.session import async_session_factory
 
 PREFIX = "test-config-router"
@@ -23,11 +23,11 @@ def _claims() -> dict:
 async def _login(client: AsyncClient) -> None:
     """Signs up as an Owner (idempotently -- a 409 for an already-registered
     email is fine here, since signup/invite-accept is now the only way a
-    user and its organization come into being) then signs in."""
+    user and its tenant come into being) then signs in."""
     with patch("app.utils.firebase.verify_firebase_id_token", return_value=_claims()):
         await client.post(
             "/api/v1/auth/signup/owner",
-            json={"id_token": "fake", "organization_name": f"{PREFIX}-org"},
+            json={"id_token": "fake", "tenant_name": f"{PREFIX}-org"},
         )
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
@@ -37,19 +37,19 @@ async def _login(client: AsyncClient) -> None:
 async def cleanup():
     yield
     async with async_session_factory() as session:
-        # users.organization_id <-> organizations.owner_user_id is a
-        # circular FK -- clear the user side before deleting the org.
+        # users.tenant_id has no ondelete -- clear it before deleting the
+        # tenant.
         await session.execute(
             update(User)
             .where(User.email.like(f"%{PREFIX}%"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
-        org_result = await session.execute(
-            select(Organization).where(Organization.domain.like(f"%{PREFIX}%"))
+        tenant_result = await session.execute(
+            select(Tenant).where(Tenant.domain.like(f"%{PREFIX}%"))
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
         result = await session.execute(
             select(User).where(User.email.like(f"%{PREFIX}%"))

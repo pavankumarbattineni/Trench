@@ -4,10 +4,10 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select, update
 
-from app.database.models import Organization, User
+from app.database.models import Tenant, User
 from app.database.session import async_session_factory
-from app.service.organization_service import OrganizationService
 from app.service.retrieval_service import KnowledgeScope, RetrievalService
+from app.service.tenant_service import TenantService
 from app.service.vector_store_service import ScoredChunk
 
 PREFIX = "test-retrieval-service"
@@ -17,22 +17,21 @@ PREFIX = "test-retrieval-service"
 async def cleanup():
     yield
     async with async_session_factory() as session:
-        # users.organization_id FK-references organizations, and
-        # organizations.owner_user_id FK-references users -- a circular
-        # reference, so a user's organization_id must be cleared before
-        # the organization itself can be deleted.
+        # users.tenant_id FK-references tenants with no ondelete, so a
+        # user's tenant_id must be cleared before the tenant itself can be
+        # deleted.
         await session.execute(
             update(User)
             .where(User.email.like(f"{PREFIX}%"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
 
-        org_result = await session.execute(
-            select(Organization).where(Organization.name.like(f"{PREFIX}%"))
+        tenant_result = await session.execute(
+            select(Tenant).where(Tenant.name.like(f"{PREFIX}%"))
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
 
         result = await session.execute(
@@ -69,7 +68,7 @@ async def test_resolve_scope_personal_always_allowed():
 @pytest.mark.asyncio
 async def test_resolve_scope_company_denied_without_membership():
     async with async_session_factory() as session:
-        user = await _make_user(session, "no-org")
+        user = await _make_user(session, "no-tenant")
         with pytest.raises(HTTPException) as exc_info:
             await RetrievalService.resolve_scope(
                 session, requesting_user_id=user.id, knowledge_type="company"
@@ -80,16 +79,71 @@ async def test_resolve_scope_company_denied_without_membership():
 @pytest.mark.asyncio
 async def test_resolve_scope_company_allowed_for_admin():
     async with async_session_factory() as session:
-        admin = await _make_user(session, "org-admin")
-        organization, _member = await OrganizationService.create(
-            session, creator=admin, name=f"{PREFIX}-org"
+        admin = await _make_user(session, "tenant-admin")
+        tenant = await TenantService.create(
+            session, creator=admin, name=f"{PREFIX}-tenant"
         )
         scope = await RetrievalService.resolve_scope(
             session, requesting_user_id=admin.id, knowledge_type="company"
         )
         assert scope.knowledge_type == "company"
-        assert scope.organization_id == organization.id
-        assert scope.namespace == f"company:{organization.id}"
+        assert scope.tenant_id == tenant.id
+        assert scope.namespace == f"company:{tenant.id}"
+
+
+async def _make_member(session, suffix: str, *, tenant_id, granted: bool) -> User:
+    member = User(
+        email=f"{PREFIX}-{suffix}@example.com",
+        username=f"{PREFIX.replace('-', '_')}_{suffix}",
+        tenant_id=tenant_id,
+        role="member",
+        has_company_knowledge_access=granted,
+    )
+    session.add(member)
+    await session.commit()
+    return member
+
+
+@pytest.mark.asyncio
+async def test_resolve_scope_company_requires_a_grant_for_a_plain_member():
+    async with async_session_factory() as session:
+        owner = await _make_user(session, "grant-owner")
+        tenant = await TenantService.create(
+            session, creator=owner, name=f"{PREFIX}-grant-tenant"
+        )
+        ungranted = await _make_member(
+            session, "ungranted", tenant_id=tenant.id, granted=False
+        )
+        granted = await _make_member(
+            session, "granted", tenant_id=tenant.id, granted=True
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await RetrievalService.resolve_scope(
+                session, requesting_user_id=ungranted.id, knowledge_type="company"
+            )
+        assert exc_info.value.status_code == 403
+
+        scope = await RetrievalService.resolve_scope(
+            session, requesting_user_id=granted.id, knowledge_type="company"
+        )
+        assert scope.tenant_id == tenant.id
+        assert scope.namespace == f"company:{tenant.id}"
+
+
+@pytest.mark.asyncio
+async def test_resolve_scope_company_denied_for_a_stale_grant_without_a_tenant():
+    """A grant flag without a tenant (shouldn't happen -- removal resets
+    both -- but must still fail closed) never authorizes anything."""
+    async with async_session_factory() as session:
+        orphan = await _make_member(
+            session, "orphan-grant", tenant_id=None, granted=True
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await RetrievalService.resolve_scope(
+                session, requesting_user_id=orphan.id, knowledge_type="company"
+            )
+        assert exc_info.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -125,7 +179,7 @@ async def test_retrieve_maps_pinecone_matches_to_retrieved_chunks():
         results = await RetrievalService.retrieve(
             query="what is the vacation policy",
             scope=KnowledgeScope(
-                knowledge_type="personal", user_id=None, organization_id=None
+                knowledge_type="personal", user_id=None, tenant_id=None
             ),
         )
 

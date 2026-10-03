@@ -88,7 +88,7 @@ export function AcceptInvitationForm() {
     } catch (error) {
       if (isAxiosError(error) && error.response?.status === 404) {
         setInvalidTokenMessage(
-          "This invitation link is no longer valid — ask your organization admin to resend it."
+          "This invitation link is no longer valid — ask your tenant admin to resend it."
         );
         return;
       }
@@ -124,7 +124,7 @@ export function AcceptInvitationForm() {
   return (
     <AuthCard
       title="Accept your invitation"
-      subtitle="Create your account to join the organization."
+      subtitle="Create your account to join the tenant."
     >
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
         <div className="space-y-2">

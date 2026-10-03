@@ -6,11 +6,11 @@ import {
   signInWithEmailAndPassword,
   signInWithPopup,
   signOut as firebaseSignOut,
-  updatePassword,
   type User as FirebaseUser,
 } from "firebase/auth";
 
 import {
+  changePasswordRequest,
   confirmPasswordResetToken,
   deleteAccountSession,
   getCurrentUser,
@@ -31,34 +31,34 @@ async function establishSession(user: FirebaseUser): Promise<UserProfile> {
 }
 
 /**
- * Registers a new Trench user as the Owner of a brand-new organization --
- * the only way an organization now comes into existence. No session is
- * established here: the backend returns no tokens, so callers must send
- * the user to /signin afterward rather than straight into the app.
+ * Registers a new Trench user as the Owner of a brand-new tenant -- the
+ * only way a tenant now comes into existence. No session is established
+ * here: the backend returns no tokens, so callers must send the user to
+ * /signin afterward rather than straight into the app.
  */
 export async function signUpOwner(
   username: string,
   email: string,
   password: string,
-  organizationName: string
+  tenantName: string
 ): Promise<OwnerSignupProfile> {
   const credential = await createUserWithEmailAndPassword(firebaseAuth, email, password);
   const idToken = await credential.user.getIdToken();
-  return signupOwner(idToken, organizationName, username);
+  return signupOwner(idToken, tenantName, username);
 }
 
 /**
  * "Continue with Google" used as a signup action (from the signup page):
- * creates the account AND its organization, same as the email/password
- * path above -- no session is established here either. Google collects
- * no username, so one is auto-generated from the email.
+ * creates the account AND its tenant, same as the email/password path
+ * above -- no session is established here either. Google collects no
+ * username, so one is auto-generated from the email.
  */
 export async function signUpOwnerWithGoogle(
-  organizationName: string
+  tenantName: string
 ): Promise<OwnerSignupProfile> {
   const credential = await signInWithPopup(firebaseAuth, googleProvider);
   const idToken = await credential.user.getIdToken();
-  return signupOwner(idToken, organizationName);
+  return signupOwner(idToken, tenantName);
 }
 
 export async function signIn(email: string, password: string): Promise<UserProfile> {
@@ -115,13 +115,22 @@ async function reauthenticate(user: FirebaseUser, currentPassword: string): Prom
   await reauthenticateWithCredential(user, credential);
 }
 
+/**
+ * Authenticated Settings > Change Password -- backend-driven: the
+ * backend verifies currentPassword against Firebase itself (via the
+ * Identity Toolkit REST API) and only then updates it through the
+ * Admin SDK. Deliberately separate from requestPasswordReset/
+ * completePasswordReset above (the Forgot Password flow) and from the
+ * client-side `reauthenticate` used by account deletion below --
+ * changing a password should not require a live Firebase client
+ * session, only a valid Trench session.
+ */
 export async function changePassword(
   currentPassword: string,
-  newPassword: string
+  newPassword: string,
+  confirmNewPassword: string
 ): Promise<void> {
-  const user = requireCurrentUser();
-  await reauthenticate(user, currentPassword);
-  await updatePassword(user, newPassword);
+  await changePasswordRequest(currentPassword, newPassword, confirmNewPassword);
 }
 
 async function finishAccountDeletion(user: FirebaseUser): Promise<void> {

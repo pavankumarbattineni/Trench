@@ -2,7 +2,7 @@ import { apiClient } from "@/lib/api";
 import type { TokenResponse } from "@/lib/api";
 
 /**
- * Accepts an organization invitation. The invited email comes from
+ * Accepts a tenant invitation. The invited email comes from
  * Firebase authentication (the `idToken`), not from any form field the
  * person could mistype -- the backend rejects a mismatch between the
  * authenticated email and the invitation's target email.

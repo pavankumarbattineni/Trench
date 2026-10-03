@@ -22,3 +22,11 @@ class DocumentResponse(BaseModel):
 
 class DocumentListResponse(BaseModel):
     documents: list[DocumentResponse]
+
+
+class DownloadUrlResponse(BaseModel):
+    """A short-lived presigned URL straight to the storage backend -- the
+    client fetches the bytes from there, never through this API."""
+
+    url: str
+    expires_in: int

@@ -16,7 +16,7 @@ export async function getHealth(): Promise<HealthResponse> {
   return data;
 }
 
-export interface UserOrganization {
+export interface UserTenant {
   id: string;
   name: string;
   role: "owner" | "admin" | "member";
@@ -30,17 +30,12 @@ export interface UserProfile {
   created_at: string;
   model_id: string | null;
   model_name: string | null;
-  // Every user belongs to exactly one organization under the
-  // invitation-only model -- still nullable in the type only for a brief
-  // transitional window (see Task 13's NOT NULL migration, not yet
-  // applied), never a state new code should expect to handle.
-  organization: UserOrganization | null;
+  // Every user belongs to exactly one tenant under the invitation-only
+  // model -- still nullable in the type only for a brief transitional
+  // window (see Task 13's NOT NULL migration, not yet applied), never a
+  // state new code should expect to handle.
+  tenant: UserTenant | null;
   has_company_access: boolean;
-  /** The Trench *application* role ("admin" | "user") -- vestigial since
-   * the invitation-only redesign (there is no more app-wide admin
-   * bootstrap flow); always "user" for any account created going
-   * forward. Separate from `organization.role`, an org's own role. */
-  role: "admin" | "user";
 }
 
 // Trench uses Bearer-token auth, not cookies for the API itself: the
@@ -111,32 +106,31 @@ export async function loginWithFirebase(idToken: string): Promise<TokenResponse>
   return data;
 }
 
-export interface OwnerSignupOrganization {
+export interface OwnerSignupTenant {
   id: string;
   name: string;
   domain: string;
 }
 
 export interface OwnerSignupProfile {
-  organization: OwnerSignupOrganization;
+  tenant: OwnerSignupTenant;
 }
 
 /**
- * Registers a new Trench user as the Owner of a brand-new organization --
- * the only way an account (and its organization) now comes into being,
- * other than accepting an invitation (see invitations.ts). No session is
- * established here: the Owner signs in separately via loginWithFirebase
- * afterward, same as every other account-creation path except
- * invite-accept.
+ * Registers a new Trench user as the Owner of a brand-new tenant -- the
+ * only way an account (and its tenant) now comes into being, other than
+ * accepting an invitation (see invitations.ts). No session is established
+ * here: the Owner signs in separately via loginWithFirebase afterward,
+ * same as every other account-creation path except invite-accept.
  */
 export async function signupOwner(
   idToken: string,
-  organizationName: string,
+  tenantName: string,
   username?: string
 ): Promise<OwnerSignupProfile> {
   const { data } = await apiClient.post<OwnerSignupProfile>(
     "/api/v1/auth/signup/owner",
-    { id_token: idToken, username, organization_name: organizationName }
+    { id_token: idToken, username, tenant_name: tenantName }
   );
   return data;
 }
@@ -208,6 +202,21 @@ export async function confirmPasswordResetToken(
   });
 }
 
+// Authenticated Settings > Change Password -- distinct from the Forgot
+// Password flow above (requestPasswordResetEmail/confirmPasswordResetToken),
+// which is for a signed-out user with no current password to prove.
+export async function changePasswordRequest(
+  currentPassword: string,
+  newPassword: string,
+  confirmNewPassword: string
+): Promise<void> {
+  await apiClient.post("/api/v1/auth/change-password", {
+    current_password: currentPassword,
+    new_password: newPassword,
+    confirm_new_password: confirmNewPassword,
+  });
+}
+
 // Attaches the stored access token to every outgoing request. Reads the
 // cookie fresh each time (no in-memory caching) so it always reflects the
 // latest token after a refresh.
@@ -228,6 +237,21 @@ function isAuthExchange(url: string | undefined): boolean {
     url === "/api/v1/auth/login" ||
     url === "/api/v1/auth/refresh" ||
     url === "/api/v1/auth/signup/owner"
+  );
+}
+
+// Mirrors proxy.ts's PROTECTED_PREFIXES -- duplicated rather than imported
+// for the same reason proxy.ts documents its own duplication (that file
+// runs in the edge runtime; this one needs axios/js-cookie, which don't
+// belong there). A dead session on a public page (e.g. /home, which
+// already renders correctly for a logged-out visitor) must not force-
+// navigate anywhere -- only a route that actually requires auth should.
+const PROTECTED_PREFIXES = ["/settings", "/chat", "/documents", "/tenant"];
+
+function isOnProtectedRoute(): boolean {
+  if (typeof window === "undefined") return false;
+  return PROTECTED_PREFIXES.some((prefix) =>
+    window.location.pathname.startsWith(prefix)
   );
 }
 
@@ -261,7 +285,15 @@ apiClient.interceptors.response.use(
       // /signin (e.g. a logged-out visitor whose AuthProvider probe still
       // somehow reached here), re-assigning the same URL would just
       // reload the page and re-trigger this exact same 401 -> here again.
-      if (typeof window !== "undefined" && window.location.pathname !== "/signin") {
+      // Only a protected route warrants the hard navigation at all -- a
+      // dead session discovered on a public page just means staying
+      // logged-out there, which AuthProvider's setUser(null) already
+      // handles without any navigation.
+      if (
+        typeof window !== "undefined" &&
+        window.location.pathname !== "/signin" &&
+        isOnProtectedRoute()
+      ) {
         window.location.href = "/signin";
       }
     }

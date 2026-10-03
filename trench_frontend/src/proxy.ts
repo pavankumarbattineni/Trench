@@ -8,7 +8,7 @@ import { NextRequest, NextResponse } from "next/server";
 // Cookie names must match ACCESS_TOKEN_COOKIE/REFRESH_TOKEN_COOKIE in
 // src/lib/api.ts -- these are duplicated (not imported) because that module
 // pulls in axios/js-cookie, which don't belong in the edge runtime here.
-const PROTECTED_PREFIXES = ["/settings", "/chat", "/documents", "/organization"];
+const PROTECTED_PREFIXES = ["/settings", "/chat", "/documents", "/tenant"];
 const AUTH_PAGE_PREFIXES = ["/signin", "/signup", "/forgot-password"];
 
 export function proxy(request: NextRequest) {
@@ -34,7 +34,7 @@ export const config = {
     "/settings/:path*",
     "/chat/:path*",
     "/documents/:path*",
-    "/organization/:path*",
+    "/tenant/:path*",
     "/signin",
     "/signup",
     "/forgot-password",

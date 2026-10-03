@@ -11,11 +11,12 @@ decision was already made at the design stage; a "yes, delete the data"
 decision at design time is not the same as "yes, run this destructive
 script against this specific database right now."
 
-Organizations are deleted before Users: Organization.owner_user_id has no
-ondelete behavior, so a user who still owns an organization can't be
-deleted until that organization is gone first. Every other FK from users
-(OrganizationMember, Document, Thread, UserCredential, Invitation,
-PasswordResetToken, etc.) cascades automatically on user delete.
+Deletion order: Invitations first (Invitation.invited_by_user_id has no
+ondelete behavior, so it would block deleting the inviter), then Users
+(Document, Thread, Credential, PasswordResetToken, etc. cascade
+automatically; Credential.set_by_user_id is SET NULL), then Tenants (only
+deletable once no User.tenant_id references them, since that FK has no
+ondelete behavior either).
 
 Usage:
     uv run python scripts/wipe_all_users.py --yes-i-am-sure
@@ -27,16 +28,17 @@ import sys
 from firebase_admin import auth as firebase_auth
 from sqlalchemy import delete
 
-from app.database.models import Organization, User
+from app.database.models import Invitation, Tenant, User
 from app.database.session import async_session_factory
 from app.utils.firebase import get_firebase_app
 
 
 async def wipe_postgres_users() -> int:
     async with async_session_factory() as session:
-        await session.execute(delete(Organization))
+        await session.execute(delete(Invitation))
         result = await session.execute(delete(User).returning(User.id))
         deleted_ids = result.scalars().all()
+        await session.execute(delete(Tenant))
         await session.commit()
         return len(deleted_ids)
 

@@ -7,7 +7,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import delete, select, update
 
-from app.database.models import Organization, PasswordResetToken, User
+from app.database.models import PasswordResetToken, Tenant, User
 from app.database.session import async_session_factory
 
 PREFIX = "test-password-reset"
@@ -25,14 +25,14 @@ async def cleanup():
         await session.execute(
             update(User)
             .where(User.email.like(f"%{PREFIX}%"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
-        org_result = await session.execute(
-            select(Organization).where(Organization.domain.like(f"%{PREFIX}%"))
+        tenant_result = await session.execute(
+            select(Tenant).where(Tenant.domain.like(f"%{PREFIX}%"))
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
         await session.execute(delete(User).where(User.email.like(f"%{PREFIX}%")))
         await session.commit()
@@ -47,7 +47,7 @@ async def _signup(client: AsyncClient, email: str, username: str) -> None:
             json={
                 "id_token": "fake",
                 "username": username,
-                "organization_name": f"org-{uuid.uuid4().hex[:8]}",
+                "tenant_name": f"org-{uuid.uuid4().hex[:8]}",
             },
         )
     assert response.status_code == 200, response.text
@@ -83,7 +83,7 @@ async def test_request_reset_emails_a_token_for_a_known_user(client: AsyncClient
     mock_send.assert_awaited_once()
 
 
-async def _request_reset_and_capture_token(client: AsyncClient, email: str) -> str:
+async def _request_reset_and_capture_url(client: AsyncClient, email: str) -> str:
     captured = {}
 
     async def _capture_send(*, to, subject, html_body, text_body):
@@ -96,8 +96,27 @@ async def _request_reset_and_capture_token(client: AsyncClient, email: str) -> s
             "/api/v1/auth/password-reset/request", json={"email": email}
         )
 
-    accept_url = captured["html_body"].split('href="')[1].split('"')[0]
+    return captured["html_body"].split('href="')[1].split('"')[0]
+
+
+async def _request_reset_and_capture_token(client: AsyncClient, email: str) -> str:
+    accept_url = await _request_reset_and_capture_url(client, email)
     return parse_qs(urlparse(accept_url).query)["token"][0]
+
+
+@pytest.mark.asyncio
+async def test_request_reset_builds_the_link_from_frontend_base_url(
+    client: AsyncClient,
+):
+    """The emailed link must point at the configured frontend, not a
+    hardcoded placeholder domain -- see app.config.TrenchConfig
+    .FRONTEND_BASE_URL."""
+    email = f"{PREFIX}-reset-link@{PREFIX}-reset-link.example.com"
+    await _signup(client, email, f"{PREFIX}-reset-link")
+
+    reset_url = await _request_reset_and_capture_url(client, email)
+
+    assert reset_url.startswith("http://localhost:3000/reset-password?token=")
 
 
 @pytest.mark.asyncio

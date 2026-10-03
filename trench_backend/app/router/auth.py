@@ -19,18 +19,20 @@ from app.router.deps import get_current_user
 from app.schemas.auth import (
     AccountDeletionRequest,
     FirebaseSessionRequest,
-    OwnerSignupOrganization,
     OwnerSignupRequest,
     OwnerSignupResponse,
+    OwnerSignupTenant,
     RefreshRequest,
     TokenResponse,
 )
+from app.schemas.change_password import ChangePasswordRequest
 from app.schemas.invitation import AcceptInvitationRequest
 from app.schemas.password_reset import (
     ConfirmPasswordResetRequest,
     RequestPasswordResetRequest,
 )
 from app.service.auth_service import AuthService
+from app.service.change_password_service import ChangePasswordService
 from app.service.invitation_service import InvitationService
 from app.service.password_reset_service import PasswordResetService
 from app.utils.security import create_access_token, create_refresh_token
@@ -43,37 +45,35 @@ async def signup_owner(
     body: OwnerSignupRequest,
     db: AsyncSession = Depends(get_db),
 ) -> OwnerSignupResponse:
-    """Registers a new Trench user as the Owner of a brand-new
-    organization. No session is issued here -- the Owner signs in
-    separately via POST /auth/login afterward, same as every other
-    account-creation path except invite-accept.
+    """Registers a new Trench user as the Owner of a brand-new tenant. No
+    session is issued here -- the Owner signs in separately via
+    POST /auth/login afterward, same as every other account-creation path
+    except invite-accept.
 
     Args:
         body: The Firebase ID token from signup, an optional username,
-            and the new organization's display name (its domain is
-            derived from the verified email, never user-entered).
+            and the new tenant's display name (its domain is derived from
+            the verified email, never user-entered).
         db: An active async SQLAlchemy session.
 
     Returns:
-        The new organization's id/name/domain.
+        The new tenant's id/name/domain.
 
     Raises:
         HTTPException: 401 if the Firebase ID token is invalid; 409 if an
-            account already exists for this email, the organization name
-            is taken, or an organization already exists for this email's
-            domain; 422 if the email is a public/personal provider
-            domain (Gmail, Yahoo, etc.) rather than a work domain.
+            account already exists for this email, the tenant name is
+            taken, or a tenant already exists for this email's domain;
+            422 if the email is a public/personal provider domain (Gmail,
+            Yahoo, etc.) rather than a work domain.
     """
-    _user, organization = await AuthService.signup_owner(
+    _user, tenant = await AuthService.signup_owner(
         db,
         id_token=body.id_token,
         username=body.username,
-        organization_name=body.organization_name,
+        tenant_name=body.tenant_name,
     )
     return OwnerSignupResponse(
-        organization=OwnerSignupOrganization(
-            id=organization.id, name=organization.name, domain=organization.domain
-        ),
+        tenant=OwnerSignupTenant(id=tenant.id, name=tenant.name, domain=tenant.domain),
     )
 
 
@@ -184,9 +184,9 @@ async def accept_invitation(
     body: AcceptInvitationRequest,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
-    """Accepts an organization invitation: verifies the Firebase ID token,
-    validates the invite token, creates (or reuses) the Trench user,
-    membership, and default knowledge-access grant, then issues a
+    """Accepts a tenant invitation: verifies the Firebase ID token,
+    validates the invite token, creates (or reuses) the Trench user with
+    their tenant, role, and default knowledge-access grant, then issues a
     session -- accept and first sign-in are one action here, unlike the
     separate signup/login split everywhere else (there's no meaningful
     "accepted but not yet signed in" state for an invite).
@@ -203,7 +203,8 @@ async def accept_invitation(
     Raises:
         HTTPException: 401 if the Firebase ID token is invalid; 404 if
             the invitation token doesn't exist or is no longer pending;
-            403 if the authenticated email doesn't match the invited one.
+            403 if the authenticated email doesn't match the invited one;
+            409 if the invitee's account already belongs to a tenant.
     """
     claims = AuthService.verify_firebase_token(body.id_token)
     try:
@@ -217,11 +218,42 @@ async def accept_invitation(
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except InvitationService.EmailMismatchError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except InvitationService.AlreadyInTenantError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
     return TokenResponse(
         access_token=create_access_token(user.id),
         refresh_token=create_refresh_token(user.id),
     )
+
+
+@router.post("/change-password", status_code=200)
+async def change_password(
+    body: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Changes the authenticated user's password from Settings.
+
+    Separate from the Forgot Password flow below (POST /auth/password-
+    reset/request + /confirm), which is for a signed-out user with no
+    current password to prove -- this endpoint instead requires the
+    caller to already know their current password.
+
+    Raises:
+        HTTPException: 401 if not authenticated; 400 if current_password
+            doesn't match the account's password on file; 422 if
+            new_password and confirm_new_password don't match or
+            new_password is too short.
+    """
+    try:
+        await ChangePasswordService.change(
+            user=current_user,
+            current_password=body.current_password,
+            new_password=body.new_password,
+        )
+    except ChangePasswordService.IncorrectCurrentPasswordError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return {"detail": "Password updated."}
 
 
 @router.post("/password-reset/request", status_code=200)

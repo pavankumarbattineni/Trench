@@ -31,7 +31,9 @@ export function MessageBubble({ message, onOpenCitations }: MessageBubbleProps) 
           <>
             <MarkdownContent
               content={message.content}
-              citationCount={message.chunks.length}
+              citationNumbers={
+                new Set(message.chunks.map((chunk) => chunk.citation_number))
+              }
               onCitationClick={(index) => onOpenCitations(message, index)}
             />
             {message.status === "failed" && (

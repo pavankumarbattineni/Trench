@@ -5,10 +5,13 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select, update
 
-from app.database.models import Document, Organization, User
+from app.database.models import Document, Tenant, User
 from app.database.session import async_session_factory
 from app.service.document_service import DocumentService
-from app.service.document_storage_service import LocalFilesystemStorageProvider
+from app.service.document_storage_service import (
+    DocumentStorageError,
+    LocalFilesystemStorageProvider,
+)
 
 TEST_FIREBASE_UID = "test-documents-router-uid"
 TEST_EMAIL = "owner@test-documents-router.example.com"
@@ -26,14 +29,14 @@ async def _login(
     """Signs up as an Owner (idempotently -- a 409 for an already-registered
     email is fine here) then signs in. Each distinct identity gets its own
     email domain (not just a different local part) since a domain anchors
-    exactly one organization under the invitation-only model."""
+    exactly one tenant under the invitation-only model."""
     with patch(
         "app.utils.firebase.verify_firebase_id_token",
         return_value=_fake_claims(uid=uid, email=email),
     ):
         await client.post(
             "/api/v1/auth/signup/owner",
-            json={"id_token": "fake", "organization_name": f"org-{uid}"},
+            json={"id_token": "fake", "tenant_name": f"org-{uid}"},
         )
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
@@ -59,16 +62,16 @@ async def cleanup():
         await session.execute(
             update(User)
             .where(User.email.like("%test-documents-router%"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
-        org_result = await session.execute(
-            select(Organization).where(
-                Organization.domain.like("%test-documents-router%")
+        tenant_result = await session.execute(
+            select(Tenant).where(
+                Tenant.domain.like("%test-documents-router%")
             )
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
         result = await session.execute(
             select(User).where(User.email.like("%test-documents-router%"))
@@ -156,3 +159,160 @@ async def test_rejects_invalid_file(client: AsyncClient):
         files={"file": ("archive.zip", b"not a real zip either", "application/zip")},
     )
     assert response.status_code == 422
+
+
+class _SigningStorage(LocalFilesystemStorageProvider):
+    """Local storage that also "signs" download URLs, recording each call."""
+
+    def __init__(self, root) -> None:
+        super().__init__(root)
+        self.presign_calls: list[tuple[str, dict]] = []
+
+    async def generate_presigned_url(self, path: str, **kwargs) -> str:
+        self.presign_calls.append((path, kwargs))
+        return "https://signed.example/download"
+
+
+class _FailingStorage(LocalFilesystemStorageProvider):
+    async def save(self, path: str, content: bytes) -> None:
+        raise DocumentStorageError("boom")
+
+    async def delete(self, path: str) -> None:
+        raise DocumentStorageError("boom")
+
+    async def generate_presigned_url(self, path: str, **kwargs) -> str:
+        raise DocumentStorageError("boom")
+
+
+async def _upload(client: AsyncClient, storage, name: str = "notes.txt") -> str:
+    with patch(
+        "app.service.document_service.get_storage_provider", return_value=storage
+    ):
+        response = await client.post(
+            "/api/v1/documents",
+            files={"file": (name, b"downloadable content", "text/plain")},
+        )
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_download_returns_presigned_url(client: AsyncClient, tmp_path):
+    await _login(client)
+    storage = _SigningStorage(tmp_path)
+    document_id = await _upload(client, storage)
+
+    with patch(
+        "app.service.document_service.get_storage_provider", return_value=storage
+    ):
+        default_response = await client.get(
+            f"/api/v1/documents/{document_id}/download"
+        )
+        attachment_response = await client.get(
+            f"/api/v1/documents/{document_id}/download",
+            params={"disposition": "attachment"},
+        )
+
+    assert default_response.status_code == 200
+    assert default_response.json() == {
+        "url": "https://signed.example/download",
+        "expires_in": 300,
+    }
+    assert attachment_response.status_code == 200
+    assert [call["disposition"] for _, call in storage.presign_calls] == [
+        "inline",
+        "attachment",
+    ]
+    assert storage.presign_calls[0][1]["filename"] == "notes.txt"
+    assert storage.presign_calls[0][1]["mime_type"] == "text/plain"
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_unknown_disposition(client: AsyncClient, tmp_path):
+    await _login(client)
+    storage = _SigningStorage(tmp_path)
+    document_id = await _upload(client, storage)
+
+    response = await client.get(
+        f"/api/v1/documents/{document_id}/download",
+        params={"disposition": "evil"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_cannot_download_another_users_document(client: AsyncClient, tmp_path):
+    await _login(client)
+    storage = _SigningStorage(tmp_path)
+    document_id = await _upload(client, storage, name="private.txt")
+
+    await _login(client, uid=OTHER_FIREBASE_UID, email=OTHER_EMAIL)
+
+    with patch(
+        "app.service.document_service.get_storage_provider", return_value=storage
+    ):
+        response = await client.get(f"/api/v1/documents/{document_id}/download")
+    assert response.status_code == 404
+    assert storage.presign_calls == []
+
+
+@pytest.mark.asyncio
+async def test_download_storage_failure_is_502(client: AsyncClient, tmp_path):
+    await _login(client)
+    document_id = await _upload(client, LocalFilesystemStorageProvider(tmp_path))
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=_FailingStorage(tmp_path),
+    ):
+        response = await client.get(f"/api/v1/documents/{document_id}/download")
+    assert response.status_code == 502
+    assert response.json()["message"] == (
+        "Failed to generate a download link. Please try again."
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_storage_failure_is_502_without_creating_a_document(
+    client: AsyncClient, tmp_path
+):
+    await _login(client)
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=_FailingStorage(tmp_path),
+    ):
+        response = await client.post(
+            "/api/v1/documents",
+            files={"file": ("notes.txt", b"never stored", "text/plain")},
+        )
+    assert response.status_code == 502
+    assert response.json()["message"] == (
+        "Failed to store the uploaded document. Please try again."
+    )
+
+    list_response = await client.get("/api/v1/documents")
+    assert list_response.json()["documents"] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_succeeds_even_if_storage_delete_fails(
+    client: AsyncClient, tmp_path
+):
+    await _login(client)
+    document_id = await _upload(client, LocalFilesystemStorageProvider(tmp_path))
+
+    async with async_session_factory() as session:
+        db_document = await session.get(Document, document_id)
+        db_document.status = "completed"
+        await session.commit()
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=_FailingStorage(tmp_path),
+    ):
+        response = await client.delete(f"/api/v1/documents/{document_id}")
+    assert response.status_code == 204
+
+    get_response = await client.get(f"/api/v1/documents/{document_id}")
+    assert get_response.status_code == 404

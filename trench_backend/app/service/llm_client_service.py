@@ -2,15 +2,15 @@
 
 Groq is the platform-owned free default (its key lives in
 TRENCH_CONFIG.GROQ, never per-user). OpenAI/Anthropic/Gemini require the
-user's own validated BYOK credential (UserCredential) for a personal-
-knowledge query -- if a user's selected model belongs to one of those
-providers but they have no stored credential for it, resolution raises
+user's own validated personal BYOK credential for a personal-knowledge
+query -- if a user's selected model belongs to one of those providers but
+they have no stored credential for it, resolution raises
 LLMClientService.MissingCredentialError rather than silently falling back
 to the platform default; no provider's models may be used without a
 valid key for that provider. (Company-knowledge queries are different:
-falling back to the platform default when the organization hasn't set a
-shared credential for the resolved provider is expected, normal
-behavior, not a missing-credential error -- see resolve_for_knowledge.)
+falling back to the platform default when the tenant hasn't set a shared
+credential for the resolved provider is expected, normal behavior, not a
+missing-credential error -- see resolve_for_knowledge.)
 """
 
 import uuid
@@ -21,9 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database.models import Provider, ProviderModel, User
 from app.service.credential_service import CredentialService
-from app.service.organization_credential_service import OrganizationCredentialService
 from app.service.provider_catalog_service import ProviderCatalogService
-from app.utils.encryption import decrypt_secret
 
 
 class ResolvedModel:
@@ -66,17 +64,18 @@ class LLMClientService:
             )
 
         byok_type = CredentialService.required_credential_type(provider.name)
-        credentials = (
-            await CredentialService.list_credentials(db, user_id=user.id)
+        personal_key = (
+            await CredentialService.get_decrypted(
+                db, user_id=user.id, provider_type=byok_type
+            )
             if byok_type
-            else []
+            else None
         )
-        matching = next((c for c in credentials if c.provider_type == byok_type), None)
-        if matching is not None:
+        if personal_key is not None:
             return ResolvedModel(
                 provider_name=provider.name,
                 model_name=model.model_name,
-                api_key=decrypt_secret(matching.encrypted_credential, purpose="byok"),
+                api_key=personal_key,
             )
 
         raise LLMClientService.MissingCredentialError(provider.display_name)
@@ -87,20 +86,24 @@ class LLMClientService:
         user: User,
         *,
         knowledge_type: str,
-        organization_id: uuid.UUID | None,
+        tenant_id: uuid.UUID | None,
     ) -> ResolvedModel:
         """Resolves which model/credential a query should use, branching
         on knowledge_type:
 
-        - "personal": identical to resolve_for_user (the querying user's
-          own BYOK credential, or the platform default).
-        - "company": the organization's OrganizationCredential if the
-          Owner has set one for the resolved provider; otherwise the
-          platform default. Never falls back to the querying member's
-          own personal UserCredential, even if they have one -- a
-          member's personal key only ever powers their personal KB.
+        - "personal" (or no tenant): identical to resolve_for_user (the
+          querying user's own personal BYOK credential -- a hard
+          MissingCredentialError if absent for a BYOK model).
+        - "company": the tenant's shared (tenant-scoped) credential if the
+          Owner has set one for the resolved provider; otherwise silently
+          the platform default. Never falls back to the querying member's
+          own personal credential, even if they have one -- a member's
+          personal key only ever powers their personal KB.
+
+        Both scopes live in the same `credentials` table now; this
+        asymmetry is deliberately decided here, not by storage.
         """
-        if knowledge_type == "personal" or organization_id is None:
+        if knowledge_type == "personal" or tenant_id is None:
             return await LLMClientService.resolve_for_user(db, user)
 
         default_model = await ProviderCatalogService.get_default(db)
@@ -116,18 +119,18 @@ class LLMClientService:
             )
 
         byok_type = CredentialService.required_credential_type(provider.name)
-        org_key = (
-            await OrganizationCredentialService.get_decrypted(
-                db, organization_id=organization_id, provider_type=byok_type
+        tenant_key = (
+            await CredentialService.get_decrypted(
+                db, tenant_id=tenant_id, provider_type=byok_type
             )
             if byok_type
             else None
         )
-        if org_key is not None:
+        if tenant_key is not None:
             return ResolvedModel(
                 provider_name=provider.name,
                 model_name=model.model_name,
-                api_key=org_key,
+                api_key=tenant_key,
             )
 
         return ResolvedModel(

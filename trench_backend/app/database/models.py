@@ -3,6 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -10,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
     text,
 )
@@ -42,9 +44,21 @@ class BaseModel(Base):
 class User(BaseModel):
     """No firebase_uid: Firebase still owns identity/passwords, but a
     Trench user row is correlated to a Firebase account by email (see
-    UserService.create_user), not by storing Firebase's own UID."""
+    UserService.create_user), not by storing Firebase's own UID.
+
+    A user's tenant and their role in it live directly on this row
+    (`tenant_id` + `role`) -- there is no separate membership join table,
+    so "which tenant is this user in, and what's their role" is always a
+    single, join-free read (see docs/superpowers/specs/
+    2026-10-03-tenant-rbac-redesign-design.md). The same goes for their
+    company-knowledge grant and free-tier usage counter, which used to be
+    their own tables.
+    """
 
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("role IN ('owner', 'admin', 'member')", name="ck_users_role"),
+    )
 
     email: Mapped[str] = mapped_column(
         String(255), unique=True, nullable=False, index=True
@@ -52,12 +66,15 @@ class User(BaseModel):
     username: Mapped[str] = mapped_column(
         String(64), unique=True, nullable=False, index=True
     )
-    # The Trench *application* role -- "admin" | "user". Entirely separate
-    # from OrganizationMember.role (an org's own admin/member roles): a
-    # Trench admin can create organizations but isn't automatically an
-    # admin of any one of them, and vice versa (see UserService.create_user
-    # for how "admin" can ever be assigned -- never from a raw client value).
-    role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    # The user's role *within their tenant* -- "owner" | "admin" |
+    # "member". There is no separate Trench-wide application role anymore.
+    # Exactly one "owner" exists per tenant (its creator, set once at
+    # signup by TenantService.create) and it can never be changed, demoted,
+    # or removed by anyone -- enforced at the application layer only
+    # (TenantService.require_not_owner), deliberately not by any DB
+    # constraint. An invitation can never carry "owner" either (see
+    # InvitationService.create).
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")
     # The user's currently selected LLM, surfaced through GET /users/me.
     # Nullable: resolved lazily to the platform default the first time it
     # matters (see UserPreferenceService) rather than being required at
@@ -67,101 +84,50 @@ class User(BaseModel):
     model_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("provider_models.id"), nullable=True
     )
-    # Every user belongs to exactly one organization -- nullable only
-    # until the one-time data-wipe migration (see
-    # docs/superpowers/plans/2026-10-01-multi-tenant-rbac-plan.md Task 11)
-    # flips this to NOT NULL. There is no more "orgless" user going
-    # forward; this column, not a join through OrganizationMember, is the
-    # primary tenant lookup used by get_current_tenant-style dependencies.
-    organization_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True
+    # The single tenant this user belongs to -- the only tenant lookup
+    # every authorization check uses (always scoped together with `role`).
+    # Set by both onboarding paths (TenantService.create for an Owner,
+    # InvitationService.accept for an invited Admin/Member). Nullable only
+    # because removing a member from their tenant (TenantService.
+    # remove_member / remove_all_members) clears it rather than deleting
+    # the user's account -- and their personal knowledge -- outright.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True, index=True
+    )
+    # Whether this user has been explicitly granted read/query access to
+    # their tenant's company knowledge. Belonging to a tenant does not
+    # itself grant it -- an Admin/Owner must (InvitationService.accept does
+    # so by default for an invited "member"). Irrelevant for "admin"/
+    # "owner", whose access is always derived from their role instead --
+    # see KnowledgeAccessService.has_company_access, the single place that
+    # combines the two. Reset to false whenever the user leaves a tenant.
+    has_company_knowledge_access: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    # Total personal documents this user has ever had successfully
+    # ingested -- the free-tier limit counter (see DocumentService.
+    # _enforce_free_tier_limit). Never decremented on delete: the limit is
+    # on documents ever processed, not documents currently stored.
+    documents_uploaded_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
     )
 
 
-class Organization(BaseModel):
-    """An organization's identity is its email domain (see
+class Tenant(BaseModel):
+    """A tenant's identity is its email domain (see
     app/utils/email_domain.py) -- derived from its creator's email at
     creation time, never user-entered directly, and used to gate which
-    users can subsequently be added as members."""
+    users can subsequently be invited as members.
 
-    __tablename__ = "organizations"
+    There is deliberately no owner column: ownership is `User.role ==
+    "owner"` scoped to `User.tenant_id` (see TenantService.get_owner).
+    """
+
+    __tablename__ = "tenants"
+    __table_args__ = (UniqueConstraint("domain", name="uq_tenants_domain"),)
 
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
-    domain: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    # The creator, permanently -- unlike role="admin" (which any admin can
-    # grant/revoke on any other member), the owner can never be changed,
-    # downgraded, or removed by anyone, including other admins. See
-    # OrganizationService.require_not_owner.
-    owner_user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
-    )
-
-
-class OrganizationMember(BaseModel):
-    """A user's membership in an organization.
-
-    A user belongs to at most one organization (enforced by the unique
-    constraint on user_id alone), so "the user's organization" is always an
-    unambiguous single lookup -- no need to disambiguate which org a
-    `knowledge_type=company` request refers to.
-    """
-
-    __tablename__ = "organization_members"
-    __table_args__ = (UniqueConstraint("user_id", name="uq_organization_members_user"),)
-
-    organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("organizations.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    # "owner" | "admin" | "member". Exactly one "owner" row exists per
-    # organization (the creator, set once at org-creation time via the
-    # owner-signup flow -- see AuthService.signup_owner) and it is never
-    # changed or removed by anyone, enforced in OrganizationService.
-    role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")
-
-
-class KnowledgeAccess(BaseModel):
-    """Grants a user permission to query an organization's company knowledge.
-
-    Membership in an organization does not itself grant company-knowledge
-    access -- that must be explicitly granted by an org admin. The
-    knowledge_type column is forward-looking (currently always "company";
-    personal knowledge needs no grant since ownership is the check).
-    """
-
-    __tablename__ = "knowledge_access"
-    __table_args__ = (
-        UniqueConstraint(
-            "organization_id",
-            "user_id",
-            "knowledge_type",
-            name="uq_knowledge_access_org_user_type",
-        ),
-    )
-
-    organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("organizations.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    knowledge_type: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="company"
-    )
+    domain: Mapped[str] = mapped_column(String(255), nullable=False)
 
 
 class Document(BaseModel):
@@ -179,14 +145,15 @@ class Document(BaseModel):
         UniqueConstraint(
             "user_id", "content_hash", name="uq_documents_user_content_hash"
         ),
-        # Ignored for personal documents (organization_id is NULL there, and
+        # Ignored for personal documents (tenant_id is NULL there, and
         # Postgres treats NULLs as distinct) -- this only dedupes company
-        # documents re-uploaded by a different org admin than the original
-        # uploader, which the per-user constraint above wouldn't catch.
+        # documents re-uploaded by a different tenant admin than the
+        # original uploader, which the per-user constraint above wouldn't
+        # catch.
         UniqueConstraint(
-            "organization_id",
+            "tenant_id",
             "content_hash",
-            name="uq_documents_organization_content_hash",
+            name="uq_documents_tenant_content_hash",
         ),
     )
 
@@ -196,12 +163,12 @@ class Document(BaseModel):
         nullable=False,
         index=True,
     )
-    # Set only for knowledge_type="company" documents -- the organization
-    # this document's company knowledge belongs to (and the vector store
+    # Set only for knowledge_type="company" documents -- the tenant this
+    # document's company knowledge belongs to (and the vector store
     # namespace it's indexed under). NULL for personal documents.
-    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("organizations.id", ondelete="CASCADE"),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -220,27 +187,17 @@ class Document(BaseModel):
     knowledge_type: Mapped[str] = mapped_column(
         String(16), nullable=False, default="personal"
     )
-    # "default" (the org's shared company base) | "own" (a user's personal
-    # base). Currently fully determined by knowledge_type (company->default,
-    # personal->own) but kept as its own column so future sub-scopes (e.g.
-    # per-department company bases) don't require a Document schema change.
+    # "default" (the tenant's shared company base) | "own" (a user's
+    # personal base). Currently fully determined by knowledge_type
+    # (company->default, personal->own) but kept as its own column so
+    # future sub-scopes (e.g. per-department company bases) don't require a
+    # Document schema change.
     knowledge_base: Mapped[str] = mapped_column(
         String(16), nullable=False, default="own"
     )
     chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
-    )
-
-
-class UsageCounter(Base):
-    __tablename__ = "usage_counters"
-
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
-    documents_uploaded_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0
     )
 
 
@@ -296,23 +253,67 @@ class ProviderModel(BaseModel):
     is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
-class UserCredential(BaseModel):
-    __tablename__ = "user_credentials"
+class Credential(BaseModel):
+    """A validated, encrypted BYOK credential owned by exactly one of a
+    user (personal scope) or a tenant (tenant scope) -- never both, never
+    neither (ck_credentials_single_owner).
+
+    - Personal (`user_id` set): the user's own key, used only for their
+      personal-knowledge queries and never shared.
+    - Tenant (`tenant_id` set): the Owner's key, used on behalf of every
+      member for company-knowledge queries. Only ever set/updated by the
+      tenant's Owner -- enforced at the router layer, not by any DB
+      constraint. `set_by_user_id` records who set it (always NULL for
+      personal rows; nulled out, not cascaded, if that user is deleted).
+
+    How each scope is *resolved* at query time differs on purpose (a
+    company query never falls back to the querying member's personal key,
+    and silently falls back to the platform default instead) -- that's
+    LLMClientService.resolve_for_knowledge's job, not this table's.
+    """
+
+    __tablename__ = "credentials"
     __table_args__ = (
-        UniqueConstraint(
-            "user_id", "provider_type", name="uq_user_credentials_user_provider"
+        CheckConstraint(
+            "(user_id IS NULL) <> (tenant_id IS NULL)",
+            name="ck_credentials_single_owner",
+        ),
+        # One credential per provider per owner. Partial, so each index
+        # only ever covers its own scope's rows.
+        Index(
+            "uq_credentials_user_provider",
+            "user_id",
+            "provider_type",
+            unique=True,
+            postgresql_where=text("user_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_credentials_tenant_provider",
+            "tenant_id",
+            "provider_type",
+            unique=True,
+            postgresql_where=text("tenant_id IS NOT NULL"),
         ),
     )
 
-    user_id: Mapped[uuid.UUID] = mapped_column(
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+        index=True,
+    )
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=True,
         index=True,
     )
     # openai_llm | anthropic_llm | gemini_llm | pinecone
     provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
     encrypted_credential: Mapped[str] = mapped_column(Text, nullable=False)
+    set_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     validated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -351,7 +352,7 @@ class ChatHistory(BaseModel):
 
 
 class Invitation(BaseModel):
-    """An email invitation to join an organization with a specific role.
+    """An email invitation to join a tenant with a specific role.
 
     The raw token is emailed once and never stored -- only its sha256
     hash (token_hash) is persisted, the same "secrets are never stored in
@@ -366,9 +367,9 @@ class Invitation(BaseModel):
         UniqueConstraint("token_hash", name="uq_invitations_token_hash"),
     )
 
-    organization_id: Mapped[uuid.UUID] = mapped_column(
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("organizations.id", ondelete="CASCADE"),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -386,40 +387,6 @@ class Invitation(BaseModel):
     )
     accepted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
-    )
-
-
-class OrganizationCredential(BaseModel):
-    """The Owner's BYOK credential, used on behalf of the whole
-    organization for company-knowledge queries -- see
-    LLMClientService.resolve_for_knowledge. Distinct from UserCredential
-    (always per-user, used for personal-knowledge queries and never
-    shared). Only ever set/updated by the organization's Owner -- enforced
-    in OrganizationCredentialService, not by any DB constraint.
-    """
-
-    __tablename__ = "organization_credentials"
-    __table_args__ = (
-        UniqueConstraint(
-            "organization_id",
-            "provider_type",
-            name="uq_organization_credentials_org_provider",
-        ),
-    )
-
-    organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("organizations.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    encrypted_credential: Mapped[str] = mapped_column(Text, nullable=False)
-    set_by_user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
-    )
-    validated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
     )
 
 

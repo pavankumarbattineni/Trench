@@ -6,8 +6,9 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select, update
 
-from app.database.models import Organization, User
+from app.database.models import Document, Tenant, User
 from app.database.session import async_session_factory
+from app.service.retrieval_service import RetrievedChunk
 
 PREFIX = "test-chat-flow"
 _EMAIL = f"owner@{PREFIX}.example.com"
@@ -21,13 +22,39 @@ def _claims() -> dict:
     }
 
 
+async def _seed_completed_personal_document(email: str) -> None:
+    """Inserts a `completed` personal Document directly (no real
+    upload/ingestion) so the chat graph's knowledge_base_empty check sees
+    this user as having documents -- needed by any test that wants to
+    exercise retrieval/the sufficiency loop rather than the empty-knowledge
+    -base short-circuit (see validate_knowledge_access in rag_graph.py)."""
+    async with async_session_factory() as session:
+        result = await session.execute(select(User).where(User.email == email))
+        user = result.scalar_one()
+        session.add(
+            Document(
+                user_id=user.id,
+                document_name="seed.txt",
+                document_type="txt",
+                mime_type="text/plain",
+                storage_path=f"personal/{user.id}/seed/seed.txt",
+                file_size=1,
+                content_hash=f"seed-hash-{user.id}",
+                status="completed",
+                knowledge_type="personal",
+                knowledge_base="own",
+            )
+        )
+        await session.commit()
+
+
 async def _login(client: AsyncClient) -> None:
     """Signs up as an Owner (idempotently -- a 409 for an already-registered
     email is fine here) then signs in."""
     with patch("app.utils.firebase.verify_firebase_id_token", return_value=_claims()):
         await client.post(
             "/api/v1/auth/signup/owner",
-            json={"id_token": "fake", "organization_name": f"{PREFIX}-org"},
+            json={"id_token": "fake", "tenant_name": f"{PREFIX}-org"},
         )
         response = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
     client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
@@ -40,14 +67,14 @@ async def cleanup():
         await session.execute(
             update(User)
             .where(User.email.like(f"%{PREFIX}%"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
-        org_result = await session.execute(
-            select(Organization).where(Organization.domain.like(f"%{PREFIX}%"))
+        tenant_result = await session.execute(
+            select(Tenant).where(Tenant.domain.like(f"%{PREFIX}%"))
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
         result = await session.execute(
             select(User).where(User.email.like(f"%{PREFIX}%"))
@@ -65,8 +92,38 @@ async def _fake_stream_generate(resolved, *, system_prompt, messages):
 async def _fake_retrieve(*, query, scope, top_k=8):
     # Keeps these tests from making real Pinecone/BM25-encoder network
     # calls -- retrieval itself is covered separately (see
-    # test_retrieval_service.py and the manual live verification).
-    return []
+    # test_retrieval_service.py and the manual live verification). A
+    # high-scoring chunk keeps assess_retrieval_sufficiency satisfied on
+    # the first attempt, so these tests exercise a single hybrid_retrieve
+    # -> generate pass, not the retry loop -- that loop has its own
+    # dedicated coverage (test_rag_graph_sufficiency.py and
+    # test_continue_after_interruption... intentionally does NOT use this
+    # fixture's chunk content for assertions).
+    return [
+        RetrievedChunk(
+            chunk_id="fake-chunk-1",
+            document_id="fake-doc-1",
+            document_name="notes.txt",
+            chunk_index=0,
+            content="fake retrieved content",
+            score=0.95,
+        )
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _fake_reranking(monkeypatch):
+    """Avoids real Cohere Rerank API calls -- reranking's own behavior is
+    covered separately (test_reranker_service.py, test_rag_graph_
+    reranking.py). Passes chunks through unchanged (truncated to top_k)
+    so these tests' content-based assertions keep working."""
+
+    async def _passthrough_rerank(query, chunks, *, top_k=8):
+        return chunks[:top_k]
+
+    monkeypatch.setattr(
+        "app.graph.rag_graph.RerankerService.rerank", _passthrough_rerank
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -207,14 +264,14 @@ async def test_company_query_denied_without_access(client: AsyncClient):
 
     await _login(client)
     me = await client.get("/api/v1/users/me")
-    organization_id = me.json()["organization"]["id"]
+    tenant_id = me.json()["tenant"]["id"]
 
     member_email = f"member@{PREFIX}.example.com"
     with patch(
         "app.service.invitation_service.send_email", new=AsyncMock()
     ) as mock_send:
         await client.post(
-            f"/api/v1/organizations/{organization_id}/invitations",
+            f"/api/v1/tenants/{tenant_id}/invitations",
             data={"email": member_email, "role": "member"},
         )
     html_body = mock_send.call_args.kwargs["html_body"]
@@ -243,7 +300,7 @@ async def test_company_query_denied_without_access(client: AsyncClient):
     assert member_me.json()["has_company_access"] is True  # default-on grant
 
     await client.delete(
-        f"/api/v1/organizations/{organization_id}/knowledge-access",
+        f"/api/v1/tenants/{tenant_id}/knowledge-access",
         params={"user_id": member_me.json()["id"]},
     )
 
@@ -407,3 +464,94 @@ async def test_continue_after_interruption_carries_partial_answer_forward(
 
     generate_call_contents = [m["content"] for m in captured_calls[-1]]
     assert any("Partial answer" in c for c in generate_call_contents)
+
+
+@pytest.mark.asyncio
+async def test_insufficient_retrieval_retries_then_still_completes(
+    client: AsyncClient,
+):
+    """When retrieval never turns up a good-enough chunk, the graph
+    retries up to the hard cap (3 total attempts) rather than looping
+    forever, then still completes the turn with whatever it has."""
+    await _login(client)
+    # Without a document on file, validate_knowledge_access would route
+    # straight to generate (knowledge_base_empty), and RetrievalService
+    # .retrieve would never be called at all -- this test is specifically
+    # about the retrieve/reformulate retry loop, which only runs once the
+    # scope has at least one document.
+    await _seed_completed_personal_document(_EMAIL)
+    thread = (await client.post("/api/v1/threads")).json()
+
+    retrieve_calls = 0
+
+    async def _always_empty_retrieve(*, query, scope, top_k=8):
+        nonlocal retrieve_calls
+        retrieve_calls += 1
+        return []
+
+    async def _fast_stream_generate(resolved, *, system_prompt, messages):
+        for word in ["Hello", " ", "there", "!"]:
+            yield word
+
+    with (
+        patch(
+            "app.service.llm_client_service.LLMClientService.stream_generate",
+            _fast_stream_generate,
+        ),
+        patch("app.graph.rag_graph.RetrievalService.retrieve", _always_empty_retrieve),
+    ):
+        response = await client.post(
+            f"/api/v1/chat/threads/{thread['id']}/messages",
+            json={"query": "What's in my notes?", "knowledge_type": "personal"},
+        )
+        final = await _wait_for_status(
+            client, response.json()["stream_id"], "completed"
+        )
+
+    assert retrieve_calls == 3
+    assert final["content"] == "Hello there!"
+
+
+@pytest.mark.asyncio
+async def test_chat_turn_tags_its_langsmith_trace(client: AsyncClient):
+    """Every turn's LangGraph invocation carries tags/metadata (knowledge
+    type, user, thread) so a real LangSmith trace can be filtered/found --
+    see the architecture doc's observability section. Spies on the real
+    compiled graph's ainvoke rather than replacing it, so the turn still
+    actually runs end to end."""
+    import app.service.chat_service as chat_service_module
+
+    await _login(client)
+    thread = (await client.post("/api/v1/threads")).json()
+
+    real_graph = chat_service_module._get_compiled_graph()
+    captured_configs = []
+
+    class _SpyGraph:
+        async def ainvoke(self, state, config):
+            captured_configs.append(config)
+            return await real_graph.ainvoke(state, config=config)
+
+        def __getattr__(self, name):
+            return getattr(real_graph, name)
+
+    with (
+        patch(
+            "app.service.llm_client_service.LLMClientService.stream_generate",
+            _fake_stream_generate,
+        ),
+        patch("app.graph.rag_graph.RetrievalService.retrieve", _fake_retrieve),
+        patch.object(
+            chat_service_module, "_get_compiled_graph", return_value=_SpyGraph()
+        ),
+    ):
+        response = await client.post(
+            f"/api/v1/chat/threads/{thread['id']}/messages",
+            json={"query": "What's in my notes?", "knowledge_type": "personal"},
+        )
+        await _wait_for_status(client, response.json()["stream_id"], "completed")
+
+    assert len(captured_configs) == 1
+    config = captured_configs[0]
+    assert "agentic-rag" in config.get("tags", [])
+    assert config.get("metadata", {}).get("knowledge_type") == "personal"

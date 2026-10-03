@@ -1,7 +1,7 @@
 """Dense+sparse (hybrid) vector storage/retrieval -- Pinecone-backed, one
-operator-owned index shared by all free-tier users and organizations,
+operator-owned index shared by all free-tier users and tenants,
 partitioned into per-scope namespaces so company and personal knowledge
-(and different organizations' company knowledge) never mix in the same
+(and different tenants' company knowledge) never mix in the same
 retrieval scope.
 
 There is no Postgres document_chunks table: each chunk's text lives only
@@ -26,8 +26,8 @@ def personal_namespace(user_id: uuid.UUID) -> str:
     return f"personal:{user_id}"
 
 
-def company_namespace(organization_id: uuid.UUID) -> str:
-    return f"company:{organization_id}"
+def company_namespace(tenant_id: uuid.UUID) -> str:
+    return f"company:{tenant_id}"
 
 
 class VectorRecord:

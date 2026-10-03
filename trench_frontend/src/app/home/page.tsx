@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useState } from "react";
+
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 
@@ -8,12 +10,44 @@ import { TrenchMark } from "@/components/trench-mark";
 import { Button } from "@/components/ui/button";
 import { getHealth } from "@/lib/api";
 
+const HERO_MESSAGES = {
+  company: {
+    heading: "Your team's knowledge, all in one place.",
+    body: "A shared knowledge base for your organization's documents, policies, and know-how — accessible to everyone who needs it.",
+  },
+  personal: {
+    heading: "Keep everything you know in reach.",
+    body: "A personal knowledge base for your notes, research, and ideas — built to grow with you.",
+  },
+} as const;
+
+type HeroKind = keyof typeof HERO_MESSAGES;
+
+const HERO_INTERVAL_MS = 5000;
+
+// Alternates personal/company every HERO_INTERVAL_MS -- starts on personal.
+// A plain setInterval, not a library: the project has no animation
+// dependency, and a timer + CSS opacity transition is all this needs.
+function useAlternatingHero(): HeroKind {
+  const [active, setActive] = useState<HeroKind>("personal");
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setActive((prev) => (prev === "company" ? "personal" : "company"));
+    }, HERO_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  return active;
+}
+
 export default function Home() {
   const { data, isError } = useQuery({
     queryKey: ["health"],
     queryFn: getHealth,
   });
   const { user, loading: authLoading } = useAuth();
+  const activeHero = useAlternatingHero();
 
   return (
     <main
@@ -56,14 +90,23 @@ export default function Home() {
         <span className="flex h-20 w-20 items-center justify-center overflow-hidden rounded-2xl bg-primary text-primary-foreground">
           <TrenchMark className="h-11 w-11" />
         </span>
-        <div className="max-w-xl space-y-3">
-          <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">
-            Keep everything you know in reach.
-          </h1>
-          <p className="text-balance text-base text-muted-foreground sm:text-lg">
-            A personal knowledge base for your notes, research, and ideas — built to
-            grow with you.
-          </p>
+        <div className="grid max-w-xl">
+          {(Object.keys(HERO_MESSAGES) as HeroKind[]).map((kind) => (
+            <div
+              key={kind}
+              aria-hidden={activeHero !== kind}
+              className={`col-start-1 row-start-1 space-y-3 transition-opacity duration-700 motion-reduce:transition-none ${
+                activeHero === kind ? "opacity-100" : "opacity-0"
+              }`}
+            >
+              <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">
+                {HERO_MESSAGES[kind].heading}
+              </h1>
+              <p className="text-balance text-base text-muted-foreground sm:text-lg">
+                {HERO_MESSAGES[kind].body}
+              </p>
+            </div>
+          ))}
         </div>
       </section>
 

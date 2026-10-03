@@ -11,7 +11,7 @@ from app.router.config import router as config_router
 from app.router.credentials import router as credentials_router
 from app.router.documents import router as documents_router
 from app.router.health import router as health_router
-from app.router.organizations import router as organizations_router
+from app.router.tenants import router as tenants_router
 from app.router.threads import router as threads_router
 from app.router.users import router as users_router
 from app.utils.logging import configure_logging
@@ -52,7 +52,7 @@ app.include_router(auth_router, prefix=_API_V1_PREFIX)
 app.include_router(users_router, prefix=_API_V1_PREFIX)
 app.include_router(credentials_router, prefix=_API_V1_PREFIX)
 app.include_router(documents_router, prefix=_API_V1_PREFIX)
-app.include_router(organizations_router, prefix=_API_V1_PREFIX)
+app.include_router(tenants_router, prefix=_API_V1_PREFIX)
 app.include_router(config_router, prefix=_API_V1_PREFIX)
 app.include_router(threads_router, prefix=_API_V1_PREFIX)
 app.include_router(chat_router, prefix=_API_V1_PREFIX)

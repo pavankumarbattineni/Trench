@@ -26,7 +26,7 @@ const schema = z
       .min(3, "At least 3 characters")
       .max(32, "At most 32 characters")
       .regex(/^[a-zA-Z0-9_-]+$/, "Letters, numbers, - and _ only"),
-    organizationName: z
+    tenantName: z
       .string()
       .min(1, "Required")
       .max(128, "At most 128 characters"),
@@ -77,7 +77,7 @@ export default function SignupPage() {
     control,
     formState: { errors, isSubmitting },
   } = useForm<FormValues>({ resolver: zodResolver(schema) });
-  const organizationName = useWatch({ control, name: "organizationName" }) ?? "";
+  const tenantName = useWatch({ control, name: "tenantName" }) ?? "";
 
   const onSubmit = async (values: FormValues) => {
     setFormError(null);
@@ -86,7 +86,7 @@ export default function SignupPage() {
         values.username,
         values.email,
         values.password,
-        values.organizationName
+        values.tenantName
       );
       setCreated(true);
     } catch (error) {
@@ -97,7 +97,7 @@ export default function SignupPage() {
   if (created) {
     return (
       <AuthCard
-        title="Organization created"
+        title="Tenant created"
         subtitle="Sign in to continue."
         footer={
           <Link
@@ -115,7 +115,7 @@ export default function SignupPage() {
 
   return (
     <AuthCard
-      title="Create your organization"
+      title="Create your tenant"
       subtitle="You'll be the owner — invite your team once you're in."
       footer={
         <>
@@ -131,7 +131,7 @@ export default function SignupPage() {
     >
       <GoogleSignInButton
         mode="signup"
-        organizationName={organizationName}
+        tenantName={tenantName}
         onSuccess={() => setCreated(true)}
         onError={setFormError}
       />
@@ -140,16 +140,16 @@ export default function SignupPage() {
 
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
         <div className="space-y-2">
-          <Label htmlFor="organizationName">Organization name</Label>
+          <Label htmlFor="tenantName">Tenant name</Label>
           <Input
-            id="organizationName"
+            id="tenantName"
             autoComplete="organization"
-            aria-invalid={Boolean(errors.organizationName)}
-            {...register("organizationName")}
+            aria-invalid={Boolean(errors.tenantName)}
+            {...register("tenantName")}
           />
-          {errors.organizationName && (
+          {errors.tenantName && (
             <p className="text-sm text-destructive">
-              {errors.organizationName.message}
+              {errors.tenantName.message}
             </p>
           )}
         </div>
@@ -205,7 +205,7 @@ export default function SignupPage() {
 
         {formError && <p className="text-sm text-destructive">{formError}</p>}
         <Button type="submit" className="w-full" disabled={isSubmitting}>
-          {isSubmitting ? "Creating organization…" : "Create organization"}
+          {isSubmitting ? "Creating tenant…" : "Create tenant"}
         </Button>
       </form>
     </AuthCard>

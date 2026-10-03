@@ -1,200 +1,129 @@
 """Grants/revokes/checks a user's permission to query company knowledge.
 
-Belonging to an organization does not itself grant company-knowledge
-access -- an admin must explicitly grant it. This is the authorization
-check the retrieval layer relies on before a "company" query is ever
-allowed to reach the vector store (see RetrievalService).
+Belonging to a tenant does not itself grant company-knowledge access --
+an Admin/Owner must explicitly grant it, which just flips
+`User.has_company_knowledge_access`. Admins and the Owner are always
+authorized by role instead (they manage the knowledge), regardless of
+that flag. This is the authorization check the retrieval layer relies on
+before a "company" query is ever allowed to reach the vector store (see
+RetrievalService).
+
+Every grant/revoke is scoped to `tenant_id` as well as the user, so an
+Admin of one tenant can never flip the flag of a user in another.
 """
 
 import uuid
 
-from sqlalchemy import delete, select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import KnowledgeAccess, OrganizationMember
+from app.database.models import User
+from app.service.tenant_service import ADMIN_ROLES
 
 
 class KnowledgeAccessService:
     @staticmethod
-    async def grant(
-        db: AsyncSession,
-        *,
-        organization_id: uuid.UUID,
-        user_id: uuid.UUID,
-        knowledge_type: str = "company",
-    ) -> KnowledgeAccess:
-        result = await db.execute(
-            select(KnowledgeAccess).where(
-                KnowledgeAccess.organization_id == organization_id,
-                KnowledgeAccess.user_id == user_id,
-                KnowledgeAccess.knowledge_type == knowledge_type,
-            )
-        )
-        access = result.scalar_one_or_none()
-        if access is None:
-            access = KnowledgeAccess(
-                organization_id=organization_id,
-                user_id=user_id,
-                knowledge_type=knowledge_type,
-            )
-            db.add(access)
-        else:
-            access.is_active = True
-        await db.commit()
-        await db.refresh(access)
-        return access
-
-    @staticmethod
-    async def revoke(
-        db: AsyncSession,
-        *,
-        organization_id: uuid.UUID,
-        user_id: uuid.UUID,
-        knowledge_type: str = "company",
+    async def _set_access(
+        db: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID, allowed: bool
     ) -> None:
-        """Revokes a grant if one exists. Idempotent: revoking a user who
-        was never granted access (or already revoked) is a no-op success,
-        not an error -- this is the "desired state" side of a toggle, not
-        a strict "delete this specific existing thing" operation."""
-        result = await db.execute(
-            select(KnowledgeAccess).where(
-                KnowledgeAccess.organization_id == organization_id,
-                KnowledgeAccess.user_id == user_id,
-                KnowledgeAccess.knowledge_type == knowledge_type,
-            )
+        await db.execute(
+            update(User)
+            .where(User.id == user_id, User.tenant_id == tenant_id)
+            .values(has_company_knowledge_access=allowed)
+            .execution_options(synchronize_session="fetch")
         )
-        access = result.scalar_one_or_none()
-        if access is None:
-            return
-        await db.delete(access)
         await db.commit()
 
-    @staticmethod
-    async def revoke_all(
-        db: AsyncSession, *, organization_id: uuid.UUID, knowledge_type: str = "company"
-    ) -> int:
-        """Revokes every member's company-knowledge grant for an
-        organization in one shot. Never touches org admins' effective
-        access (that's derived from OrganizationMember.role, not from
-        these rows -- see `authorized_company_organization_id`), so this
-        never needs to special-case the owner.
+    @classmethod
+    async def grant(
+        cls, db: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+    ) -> None:
+        """Idempotent: granting an already-granted user is a no-op."""
+        await cls._set_access(db, tenant_id=tenant_id, user_id=user_id, allowed=True)
 
-        Returns:
-            How many grants were revoked.
-        """
+    @classmethod
+    async def revoke(
+        cls, db: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+    ) -> None:
+        """Idempotent: revoking a user who was never granted access (or
+        already revoked) is a no-op success, not an error -- this is the
+        "desired state" side of a toggle, not a strict "delete this
+        specific existing thing" operation."""
+        await cls._set_access(db, tenant_id=tenant_id, user_id=user_id, allowed=False)
+
+    @staticmethod
+    async def _set_access_for_all(
+        db: AsyncSession, *, tenant_id: uuid.UUID, allowed: bool
+    ) -> int:
         result = await db.execute(
-            delete(KnowledgeAccess)
+            update(User)
             .where(
-                KnowledgeAccess.organization_id == organization_id,
-                KnowledgeAccess.knowledge_type == knowledge_type,
+                User.tenant_id == tenant_id,
+                User.has_company_knowledge_access.is_(not allowed),
             )
-            .returning(KnowledgeAccess.id)
+            .values(has_company_knowledge_access=allowed)
+            .returning(User.id)
+            .execution_options(synchronize_session="fetch")
         )
-        revoked_ids = result.scalars().all()
+        changed_ids = result.scalars().all()
         await db.commit()
-        return len(revoked_ids)
+        return len(changed_ids)
 
-    @staticmethod
-    async def grant_all(
-        db: AsyncSession, *, organization_id: uuid.UUID, knowledge_type: str = "company"
-    ) -> int:
-        """Grants company-knowledge access to every current member of the
-        organization in one shot -- creating a new grant, or reactivating
-        an existing inactive one, for whichever members aren't already
-        actively granted. Org admins are unaffected either way (their
-        access is derived from role, not a grant row), but granting them
-        one too is harmless.
+    @classmethod
+    async def revoke_all(cls, db: AsyncSession, *, tenant_id: uuid.UUID) -> int:
+        """Revokes every member's company-knowledge grant for a tenant in
+        one shot. Never touches admins' effective access (that's derived
+        from `User.role`, not this flag -- see `has_company_access`), so
+        this never needs to special-case the owner.
 
         Returns:
-            How many members were newly granted access (already-active
-            grants aren't re-counted).
+            How many grants were revoked (members that actually had one).
         """
-        member_ids_result = await db.execute(
-            select(OrganizationMember.user_id).where(
-                OrganizationMember.organization_id == organization_id
-            )
-        )
-        member_ids = [row[0] for row in member_ids_result.all()]
-        if not member_ids:
-            return 0
+        return await cls._set_access_for_all(db, tenant_id=tenant_id, allowed=False)
 
-        existing_result = await db.execute(
-            select(KnowledgeAccess).where(
-                KnowledgeAccess.organization_id == organization_id,
-                KnowledgeAccess.knowledge_type == knowledge_type,
-                KnowledgeAccess.user_id.in_(member_ids),
-            )
-        )
-        existing_by_user = {
-            access.user_id: access for access in existing_result.scalars().all()
-        }
+    @classmethod
+    async def grant_all(cls, db: AsyncSession, *, tenant_id: uuid.UUID) -> int:
+        """Grants company-knowledge access to every current member of the
+        tenant in one shot. Admins are unaffected either way (their access
+        is derived from role, not the flag), but flagging them too is
+        harmless.
 
-        granted = 0
-        for user_id in member_ids:
-            existing = existing_by_user.get(user_id)
-            if existing is None:
-                db.add(
-                    KnowledgeAccess(
-                        organization_id=organization_id,
-                        user_id=user_id,
-                        knowledge_type=knowledge_type,
-                    )
-                )
-                granted += 1
-            elif not existing.is_active:
-                existing.is_active = True
-                granted += 1
-        await db.commit()
-        return granted
+        Returns:
+            How many members were newly granted access (already-granted
+            members aren't re-counted).
+        """
+        return await cls._set_access_for_all(db, tenant_id=tenant_id, allowed=True)
 
     @staticmethod
-    async def has_company_access(
-        db: AsyncSession, *, user_id: uuid.UUID, organization_id: uuid.UUID
-    ) -> bool:
-        result = await db.execute(
-            select(KnowledgeAccess.id).where(
-                KnowledgeAccess.organization_id == organization_id,
-                KnowledgeAccess.user_id == user_id,
-                KnowledgeAccess.knowledge_type == "company",
-                KnowledgeAccess.is_active.is_(True),
-            )
-        )
-        return result.scalar_one_or_none() is not None
+    def has_company_access(user: User) -> bool:
+        """Whether `user` may query their own tenant's company knowledge:
+        always for an Admin/Owner, otherwise only with an explicit grant.
+        Says nothing about *which* tenant -- see
+        `authorized_company_tenant_id` for that."""
+        if user.tenant_id is None:
+            return False
+        return user.role in ADMIN_ROLES or user.has_company_knowledge_access
 
-    @staticmethod
-    async def authorized_company_organization_id(
-        db: AsyncSession, *, user_id: uuid.UUID
+    @classmethod
+    async def authorized_company_tenant_id(
+        cls, db: AsyncSession, *, user_id: uuid.UUID
     ) -> uuid.UUID | None:
-        """Returns the organization_id the user may query company knowledge
-        for, or None if they have no such authorization.
+        """Returns the tenant_id the user may query company knowledge for,
+        or None if they have no such authorization.
 
         This is the single check every company-knowledge code path (chat
-        retrieval, document listing) must go through -- an org admin is
-        always authorized for their own org's knowledge (they manage it),
-        everyone else needs an explicit KnowledgeAccess grant.
+        retrieval, document listing) must go through -- always re-read
+        from the database, never from a caller's claim.
         """
-        membership_result = await db.execute(
-            select(OrganizationMember).where(OrganizationMember.user_id == user_id)
-        )
-        membership = membership_result.scalar_one_or_none()
-        if membership is None:
+        result = await db.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+        if user is None or not cls.has_company_access(user):
             return None
-        if membership.role in ("admin", "owner"):
-            return membership.organization_id
+        return user.tenant_id
 
-        has_access = await KnowledgeAccessService.has_company_access(
-            db, user_id=user_id, organization_id=membership.organization_id
-        )
-        return membership.organization_id if has_access else None
-
-    @staticmethod
+    @classmethod
     async def user_has_any_company_access(
-        db: AsyncSession, *, user_id: uuid.UUID
+        cls, db: AsyncSession, *, user_id: uuid.UUID
     ) -> bool:
         """Whether /users/me should advertise the "Company" knowledge option."""
-        organization_id = (
-            await KnowledgeAccessService.authorized_company_organization_id(
-                db, user_id=user_id
-            )
-        )
-        return organization_id is not None
+        return await cls.authorized_company_tenant_id(db, user_id=user_id) is not None

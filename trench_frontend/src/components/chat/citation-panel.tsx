@@ -25,9 +25,8 @@ function PanelBody({ chunks, activeIndex }: CitationSelection) {
 
   return (
     <div className="flex flex-col gap-3 overflow-y-auto p-4">
-      {chunks.map((chunk, i) => {
-        const index = i + 1;
-        const isActive = index === activeIndex;
+      {chunks.map((chunk) => {
+        const isActive = chunk.citation_number === activeIndex;
         return (
           <div
             key={chunk.chunk_id}
@@ -43,7 +42,7 @@ function PanelBody({ chunks, activeIndex }: CitationSelection) {
                 <span className="truncate">{chunk.document_name}</span>
               </div>
               <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[0.65rem] font-medium text-muted-foreground">
-                [{index}]
+                [{chunk.citation_number}]
               </span>
             </div>
             <p className="whitespace-pre-wrap text-foreground/90">{chunk.content}</p>

@@ -21,11 +21,11 @@ export default function AccountPage() {
             <dd className="font-medium">
               {new Date(user.created_at).toLocaleDateString()}
             </dd>
-            {user.organization && (
+            {user.tenant && (
               <>
-                <dt className="text-muted-foreground">Organization</dt>
+                <dt className="text-muted-foreground">Tenant</dt>
                 <dd className="font-medium">
-                  {user.organization.name} ({user.organization.role})
+                  {user.tenant.name} ({user.tenant.role})
                 </dd>
               </>
             )}

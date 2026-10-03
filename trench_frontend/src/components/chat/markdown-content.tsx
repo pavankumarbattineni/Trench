@@ -70,19 +70,20 @@ function buildComponents(onCitationClick?: (index: number) => void): Components 
 
 interface MarkdownContentProps {
   content: string;
-  /** Number of citations available on this message -- bounds which
-   * "[n]" text sequences get turned into clickable markers. */
-  citationCount?: number;
+  /** The message's actual citation_numbers -- which "[n]" text sequences
+   * get turned into clickable markers (see linkifyCitations). */
+  citationNumbers?: ReadonlySet<number>;
   onCitationClick?: (index: number) => void;
 }
 
 export function MarkdownContent({
   content,
-  citationCount = 0,
+  citationNumbers,
   onCitationClick,
 }: MarkdownContentProps) {
-  const processed =
-    citationCount > 0 ? linkifyCitations(content, citationCount) : content;
+  const processed = citationNumbers?.size
+    ? linkifyCitations(content, citationNumbers)
+    : content;
 
   return (
     <div className="text-sm leading-relaxed">

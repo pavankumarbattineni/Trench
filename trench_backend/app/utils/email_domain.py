@@ -1,16 +1,16 @@
-"""Extracts and validates the organization-eligible domain from an email
+"""Extracts and validates the tenant-eligible domain from an email
 address.
 
-An organization's identity is its email domain (e.g. "acme.com") -- see
-Organization.domain. Public/free email providers can't anchor an
-organization: anyone could claim "gmail.com" and there's no meaningful
+A tenant's identity is its email domain (e.g. "acme.com") -- see
+Tenant.domain. Public/free email providers can't anchor a tenant: anyone
+could claim "gmail.com" and there's no meaningful
 sense in which its users share an employer, so those domains are rejected
 outright rather than trusted like a real company domain.
 """
 
 # Not exhaustive (no list of every free-mail provider is), but covers the
 # large, well-known providers that would otherwise let anyone claim an
-# "organization domain" that isn't actually company-specific.
+# "tenant domain" that isn't actually company-specific.
 _PUBLIC_EMAIL_DOMAINS = {
     "gmail.com",
     "googlemail.com",

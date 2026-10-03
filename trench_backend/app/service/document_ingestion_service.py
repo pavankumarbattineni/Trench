@@ -6,17 +6,17 @@ own -- no background-task machinery is needed to test it.
 
 There is no Postgres chunk table: each chunk's text and dense+sparse
 vectors go straight to Pinecone, keyed by a fresh id and namespaced by the
-document's knowledge scope (personal:{user_id} / company:{organization_id}).
+document's knowledge scope (personal:{user_id} / company:{tenant_id}).
 """
 
 import logging
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Document, UsageCounter
+from app.database.models import Document, User
 from app.service.chunking_service import ChunkingService
 from app.service.document_storage_service import get_storage_provider
 from app.service.embedding_service import EmbeddingService
@@ -50,6 +50,11 @@ class DocumentIngestionService:
             document.status = "processing"
             await db.commit()
 
+            # A storage failure raises DocumentStorageError, whose message
+            # is written for the user ("Failed to read the document from
+            # storage.") -- it's handled by the same catch-all below as any
+            # parse/embed/index failure, landing as status="failed" with
+            # that message as error_message.
             raw_bytes = await get_storage_provider().read(document.storage_path)
             text = await ParsingService.parse(
                 raw_bytes, document.mime_type, filename=document.document_name
@@ -61,7 +66,7 @@ class DocumentIngestionService:
 
             if pieces:
                 namespace = (
-                    company_namespace(document.organization_id)
+                    company_namespace(document.tenant_id)
                     if document.knowledge_type == "company"
                     else personal_namespace(document.user_id)
                 )
@@ -130,13 +135,13 @@ class DocumentIngestionService:
 
     @staticmethod
     async def _increment_usage(db: AsyncSession, user_id: uuid.UUID) -> None:
-        result = await db.execute(
-            select(UsageCounter).where(UsageCounter.user_id == user_id)
+        # A single atomic `count = count + 1` UPDATE rather than a
+        # read-modify-write on a loaded User, so concurrent ingestions for
+        # the same user can't lose an increment.
+        await db.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(documents_uploaded_count=User.documents_uploaded_count + 1)
+            .execution_options(synchronize_session="fetch")
         )
-        counter = result.scalar_one_or_none()
-        if counter is None:
-            counter = UsageCounter(user_id=user_id, documents_uploaded_count=1)
-            db.add(counter)
-        else:
-            counter.documents_uploaded_count += 1
         await db.commit()

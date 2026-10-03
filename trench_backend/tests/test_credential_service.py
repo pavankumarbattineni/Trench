@@ -1,3 +1,4 @@
+import uuid
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,37 @@ def test_mask_key_shows_only_first_and_last_four_chars():
     assert masked.startswith("sk-a")
     assert masked.endswith("1234")
     assert "abcdefghij" not in masked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scope",
+    [{}, {"user_id": uuid.uuid4(), "tenant_id": uuid.uuid4()}],
+    ids=["neither", "both"],
+)
+async def test_every_method_requires_exactly_one_scope(scope: dict):
+    """Personal and tenant credentials share one table; a call that names
+    neither or both owners is a programming error, never a silent
+    cross-scope read/write."""
+    async with async_session_factory() as session:
+        with pytest.raises(ValueError):
+            await CredentialService.list_credentials(session, **scope)
+        with pytest.raises(ValueError):
+            await CredentialService.get_decrypted(
+                session, provider_type="openai_llm", **scope
+            )
+        with pytest.raises(ValueError):
+            await CredentialService.has_credential(
+                session, provider_type="openai_llm", **scope
+            )
+        with pytest.raises(ValueError):
+            await CredentialService.delete_credential(
+                session, provider_type="openai_llm", **scope
+            )
+        with pytest.raises(ValueError):
+            await CredentialService.save_credential(
+                session, provider_type="openai_llm", api_key="sk-x", **scope
+            )
 
 
 @pytest.fixture(autouse=True)

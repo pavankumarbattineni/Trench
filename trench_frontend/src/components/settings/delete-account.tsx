@@ -59,7 +59,7 @@ export function DeleteAccount() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm text-muted-foreground">
           Permanently delete your account and all associated data -- documents, chat
-          history, and organization membership. This cannot be undone.
+          history, and tenant membership. This cannot be undone.
         </p>
         <Button
           variant="destructive"

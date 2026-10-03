@@ -160,9 +160,10 @@ class ChatService:
                     "stream_id": stream_id,
                     "query": query,
                     "knowledge_type": knowledge_type,
-                    "organization_id": None,
+                    "tenant_id": None,
                     "access_denied": False,
                     "denial_reason": None,
+                    "knowledge_base_empty": False,
                     "condensed_query": "",
                     "retrieved_chunks": [],
                     "response": "",
@@ -176,7 +177,20 @@ class ChatService:
                         "user": user,
                         "stream_id": stream_id,
                         "assistant_message_id": str(assistant_message_id),
-                    }
+                    },
+                    # Surfaced on the LangSmith trace (when LangSmith
+                    # tracing is enabled -- see .env's LANGCHAIN_TRACING/
+                    # LANGSMITH_API_KEY) so a turn can be found/filtered
+                    # by knowledge type, user, or thread without digging
+                    # into node-level state. See the architecture doc's
+                    # observability section.
+                    "run_name": "agentic_rag_chat",
+                    "tags": ["agentic-rag", knowledge_type],
+                    "metadata": {
+                        "user_id": str(user.id),
+                        "knowledge_type": knowledge_type,
+                        "thread_id": str(thread_id),
+                    },
                 }
 
                 await _get_compiled_graph().ainvoke(initial_state, config=config)

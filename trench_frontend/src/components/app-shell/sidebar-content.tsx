@@ -173,10 +173,10 @@ export function AppSidebarContent({
           onNavigate={onNavigate}
         />
         <NavLink
-          href="/organization"
-          label="Organization"
+          href="/tenant"
+          label="Tenant"
           icon={<Building2 className="size-4 shrink-0" />}
-          active={pathname === "/organization"}
+          active={pathname === "/tenant"}
           collapsed={collapsed}
           onNavigate={onNavigate}
         />

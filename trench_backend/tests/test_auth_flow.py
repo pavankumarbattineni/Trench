@@ -6,7 +6,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import delete, select, update
 
-from app.database.models import Organization, User
+from app.database.models import Tenant, User
 from app.database.session import async_session_factory
 
 TEST_FIREBASE_UID = "test-firebase-uid-1"
@@ -33,11 +33,11 @@ async def _signup_owner(
     uid: str = TEST_FIREBASE_UID,
     email: str = TEST_EMAIL,
     username: str | None = None,
-    organization_name: str | None = None,
+    tenant_name: str | None = None,
 ):
     body = {
         "id_token": "fake",
-        "organization_name": organization_name or f"test-org-{uuid.uuid4().hex[:8]}",
+        "tenant_name": tenant_name or f"test-org-{uuid.uuid4().hex[:8]}",
     }
     if username is not None:
         body["username"] = username
@@ -62,7 +62,7 @@ async def _signup_owner_and_get_token(client: AsyncClient, **kwargs) -> str:
     """Signs up an Owner (which no longer issues a session itself) then
     logs in separately, returning the access token."""
     signup_kwargs = {
-        k: v for k, v in kwargs.items() if k in ("username", "organization_name")
+        k: v for k, v in kwargs.items() if k in ("username", "tenant_name")
     }
     login_kwargs = {k: v for k, v in kwargs.items() if k in ("uid", "email")}
     response = await _signup_owner(client, **signup_kwargs, **login_kwargs)
@@ -79,14 +79,14 @@ async def cleanup_test_users():
         await session.execute(
             update(User)
             .where(User.email.like("test%@example.com"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
-        org_result = await session.execute(
-            select(Organization).where(Organization.domain == "example.com")
+        tenant_result = await session.execute(
+            select(Tenant).where(Tenant.domain == "example.com")
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
         await session.execute(delete(User).where(User.email.like("test%@example.com")))
         await session.commit()
@@ -96,20 +96,20 @@ async def cleanup_test_users():
 
 
 @pytest.mark.asyncio
-async def test_owner_signup_does_not_issue_a_session_but_creates_an_organization(
+async def test_owner_signup_does_not_issue_a_session_but_creates_a_tenant(
     client: AsyncClient,
 ):
     """Owner-signup no longer logs the new Owner straight into the app --
     the frontend sends them to /signin instead, same as every other
     account-creation path except invite-accept (which stays untouched)."""
-    response = await _signup_owner(client, organization_name="Test Acme Corp")
+    response = await _signup_owner(client, tenant_name="Test Acme Corp")
 
     assert response.status_code == 200
     body = response.json()
     assert "access_token" not in body
     assert "refresh_token" not in body
-    assert body["organization"]["name"] == "Test Acme Corp"
-    assert body["organization"]["domain"] == "example.com"
+    assert body["tenant"]["name"] == "Test Acme Corp"
+    assert body["tenant"]["domain"] == "example.com"
 
     login = await _login(client)
     assert login.status_code == 200
@@ -117,7 +117,7 @@ async def test_owner_signup_does_not_issue_a_session_but_creates_an_organization
         "/api/v1/users/me", headers=_auth_headers(login.json()["access_token"])
     )
     assert me.json()["email"] == TEST_EMAIL
-    assert me.json()["organization"]["role"] == "owner"
+    assert me.json()["tenant"]["role"] == "owner"
 
 
 @pytest.mark.asyncio
@@ -189,7 +189,7 @@ async def test_owner_signup_default_role_is_owner_not_a_client_supplied_value(
             "/api/v1/auth/signup/owner",
             json={
                 "id_token": "fake",
-                "organization_name": "Test Org",
+                "tenant_name": "Test Org",
                 "role": "superadmin",
             },
         )
@@ -199,8 +199,10 @@ async def test_owner_signup_default_role_is_owner_not_a_client_supplied_value(
         "/api/v1/users/me",
         headers=_auth_headers(login.json()["access_token"]),
     )
-    assert me.json()["organization"]["role"] == "owner"
-    assert me.json()["role"] == "user"
+    assert me.json()["tenant"]["role"] == "owner"
+    # There's no separate top-level app role anymore -- the tenant role is
+    # the user's only role.
+    assert "role" not in me.json()
 
 
 # --- Signin (login) ---------------------------------------------------------
@@ -261,8 +263,7 @@ async def test_users_me_returns_profile_after_owner_signup(client: AsyncClient):
     )
     assert response.status_code == 200
     assert response.json()["email"] == TEST_EMAIL
-    assert response.json()["role"] == "user"
-    assert response.json()["organization"]["role"] == "owner"
+    assert response.json()["tenant"]["role"] == "owner"
 
 
 @pytest.mark.asyncio
@@ -314,9 +315,9 @@ async def test_logout_returns_no_content_for_an_authenticated_user(
 async def _create_plain_user_and_login(
     client: AsyncClient, *, uid: str, email: str, username: str
 ) -> str:
-    """Creates a User row directly (no organization -- account deletion's
-    happy path doesn't depend on org membership, only Owner-ship blocks
-    it, see test_delete_account_rejects_owner_of_an_organization) and
+    """Creates a User row directly (no tenant -- account deletion's
+    happy path doesn't depend on tenant membership, only Owner-ship blocks
+    it, see test_delete_account_rejects_owner_of_a_tenant) and
     signs in, returning the access token."""
     async with async_session_factory() as session:
         session.add(User(email=email, username=username))
@@ -327,7 +328,7 @@ async def _create_plain_user_and_login(
 
 
 @pytest.mark.asyncio
-async def test_delete_account_rejects_owner_of_an_organization(client: AsyncClient):
+async def test_delete_account_rejects_owner_of_a_tenant(client: AsyncClient):
     access_token = await _signup_owner_and_get_token(client)
 
     with patch(

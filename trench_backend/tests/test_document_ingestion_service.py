@@ -1,12 +1,15 @@
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.database.models import Document, UsageCounter, User
+from app.database.models import Document, User
 from app.database.session import async_session_factory
 from app.service.document_ingestion_service import DocumentIngestionService
-from app.service.document_storage_service import LocalFilesystemStorageProvider
+from app.service.document_storage_service import (
+    DocumentStorageError,
+    LocalFilesystemStorageProvider,
+)
 from app.service.embedding_service import EmbeddingService
 
 TEST_EMAIL_PREFIX = "test-ingestion"
@@ -114,17 +117,21 @@ async def test_process_marks_document_completed_and_increments_usage(tmp_path):
         assert document.chunk_count >= 1
 
         counter_result = await session.execute(
-            select(UsageCounter).where(UsageCounter.user_id == document.user_id)
+            select(User.documents_uploaded_count).where(User.id == document.user_id)
         )
-        counter = counter_result.scalar_one()
-        assert counter.documents_uploaded_count == 1
+        uploaded_count = counter_result.scalar_one()
+        assert uploaded_count == 1
 
 
 @pytest.mark.asyncio
 async def test_process_increments_existing_usage_counter(tmp_path):
     async with async_session_factory() as session:
         document = await _make_document(session, "b", content_hash=f"{'b':0<64}"[:64])
-        session.add(UsageCounter(user_id=document.user_id, documents_uploaded_count=3))
+        await session.execute(
+            update(User)
+            .where(User.id == document.user_id)
+            .values(documents_uploaded_count=3)
+        )
         await session.commit()
 
         full_path = tmp_path / document.storage_path
@@ -134,10 +141,10 @@ async def test_process_increments_existing_usage_counter(tmp_path):
         await DocumentIngestionService.process(session, document.id)
 
         counter_result = await session.execute(
-            select(UsageCounter).where(UsageCounter.user_id == document.user_id)
+            select(User.documents_uploaded_count).where(User.id == document.user_id)
         )
-        counter = counter_result.scalar_one()
-        assert counter.documents_uploaded_count == 4
+        uploaded_count = counter_result.scalar_one()
+        assert uploaded_count == 4
 
 
 @pytest.mark.asyncio
@@ -146,3 +153,29 @@ async def test_process_is_a_noop_for_missing_document():
         # Should return quietly rather than raise -- the document may have
         # been deleted before the task got to it.
         await DocumentIngestionService.process(session, uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_process_marks_document_failed_when_storage_read_fails(monkeypatch):
+    class _UnreadableStorage:
+        async def read(self, path: str) -> bytes:
+            raise DocumentStorageError("Failed to read the document from storage.")
+
+    monkeypatch.setattr(
+        "app.service.document_ingestion_service.get_storage_provider",
+        lambda: _UnreadableStorage(),
+    )
+
+    async with async_session_factory() as session:
+        document = await _make_document(session, "c", content_hash=f"{'c':0<64}"[:64])
+
+        await DocumentIngestionService.process(session, document.id)
+
+        await session.refresh(document)
+        assert document.status == "failed"
+        assert document.error_message == "Failed to read the document from storage."
+
+        counter_result = await session.execute(
+            select(User.documents_uploaded_count).where(User.id == document.user_id)
+        )
+        assert counter_result.scalar_one() == 0

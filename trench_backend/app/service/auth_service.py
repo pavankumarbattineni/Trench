@@ -13,8 +13,8 @@ from fastapi import HTTPException, status
 from firebase_admin import auth as firebase_auth
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Organization, User
-from app.service.organization_service import OrganizationService
+from app.database.models import Tenant, User
+from app.service.tenant_service import TenantService
 from app.service.user_service import UserService
 from app.utils import firebase as firebase_utils
 from app.utils.security import (
@@ -43,8 +43,8 @@ _ALREADY_REGISTERED = HTTPException(
 )
 _OWNER_CANNOT_DELETE_ACCOUNT = HTTPException(
     status.HTTP_409_CONFLICT,
-    "You're the owner of an organization -- transfer ownership or delete "
-    "the organization before deleting your account.",
+    "You're the owner of a tenant -- transfer ownership or delete the "
+    "tenant before deleting your account.",
 )
 
 # How fresh a Firebase ID token's issued-at time must be to count as "recent
@@ -87,13 +87,13 @@ class AuthService:
         *,
         id_token: str,
         username: str | None,
-        organization_name: str,
-    ) -> tuple[User, Organization]:
-        """Registers a new Trench user AND the organization they own, as
-        one action -- there is no more open signup; every account comes
-        into being either this way (Owner, first user of a new company
-        domain) or via InvitationService.accept (Member/Admin, invited by
-        an existing Owner/Admin).
+        tenant_name: str,
+    ) -> tuple[User, Tenant]:
+        """Registers a new Trench user AND the tenant they own, as one
+        action -- there is no more open signup; every account comes into
+        being either this way (Owner, first user of a new company domain)
+        or via InvitationService.accept (Member/Admin, invited by an
+        existing Owner/Admin).
 
         Args:
             db: An active async SQLAlchemy session.
@@ -102,36 +102,33 @@ class AuthService:
                 sign-in used as a signup action).
             username: A username collected at signup (absent for Google,
                 which auto-generates one from the email instead).
-            organization_name: The new organization's display name. Its
-                domain is derived from the verified email, never
-                user-entered.
+            tenant_name: The new tenant's display name. Its domain is
+                derived from the verified email, never user-entered.
 
         Returns:
-            (user, organization) -- no session is issued here; the new
-            Owner signs in separately via POST /auth/login afterward.
+            (user, tenant) -- the user now has role="owner" and
+            tenant_id set (by TenantService.create). No session is issued
+            here; the new Owner signs in separately via POST /auth/login
+            afterward.
 
         Raises:
             HTTPException: 409 if an account already exists for this
-                email, or the organization name/domain is already taken;
-                422 if the email is a public/personal provider domain.
+                email, or the tenant name/domain is already taken; 422 if
+                the email is a public/personal provider domain.
         """
         claims = cls.verify_firebase_token(id_token)
         if await UserService.get_by_email(db, claims["email"]) is not None:
             raise _ALREADY_REGISTERED
         # Validated before the user row is created, not after -- a
         # domain-ineligible signup attempt must never leave behind an
-        # orphaned User with no organization.
-        await OrganizationService.validate_domain_eligible_for_org(
-            db, claims["email"]
-        )
+        # orphaned User with no tenant.
+        await TenantService.validate_domain_eligible_for_tenant(db, claims["email"])
         user = await UserService.create_user(
             db, email=claims["email"], desired_username=username
         )
-        organization, _membership = await OrganizationService.create(
-            db, creator=user, name=organization_name
-        )
+        tenant = await TenantService.create(db, creator=user, name=tenant_name)
         await db.refresh(user)
-        return user, organization
+        return user, tenant
 
     @classmethod
     async def create_session(
@@ -240,8 +237,8 @@ class AuthService:
             HTTPException: 403 if the token belongs to a different account
                 (matched by email -- Trench has no stored Firebase UID),
                 401 if the token is stale, 409 if the account is the
-                permanent Owner of an organization (transfer ownership or
-                delete the organization first), 500 if Firebase deletion
+                permanent Owner of a tenant (transfer ownership or
+                delete the tenant first), 500 if Firebase deletion
                 fails after Postgres data was already removed.
         """
         claims = cls.verify_firebase_token(id_token)
@@ -256,9 +253,7 @@ class AuthService:
         if age_seconds > _RECENT_LOGIN_WINDOW_SECONDS:
             raise _RECENT_LOGIN_REQUIRED
 
-        if await OrganizationService.get_owned_organization(
-            db, current_user.id
-        ) is not None:
+        if await TenantService.get_owned_tenant(db, current_user) is not None:
             raise _OWNER_CANNOT_DELETE_ACCOUNT
 
         firebase_uid = claims["uid"]

@@ -41,6 +41,14 @@ class EncryptionConfig(BaseModel):
 
 class FirebaseConfig(BaseModel):
     credentials_path: str
+    # Firebase's public Web API key (Project settings > General), NOT a
+    # secret like the Admin SDK's service-account credentials -- it's
+    # required to call the Identity Toolkit REST API's
+    # accounts:signInWithPassword endpoint, which is the only way to
+    # verify a plaintext password server-side (the Admin SDK can only
+    # look up/overwrite users, never check a password against one).
+    # See app/utils/firebase.py's verify_user_password.
+    web_api_key: str
 
 
 class GroqConfig(BaseModel):
@@ -48,19 +56,47 @@ class GroqConfig(BaseModel):
 
 
 class StorageConfig(BaseModel):
+    # Legacy: no longer read by get_storage_provider() now that document
+    # bytes live in Backblaze B2 (see BackblazeConfig). Kept so existing
+    # .env files still validate until it's removed in a follow-up.
     local_root_path: str
+
+
+class BackblazeConfig(BaseModel):
+    """Backblaze B2 bucket holding uploaded documents' raw bytes, reached
+    through B2's S3-compatible API with boto3 (see
+    app/service/document_storage_service.py's B2StorageProvider) rather
+    than the native b2sdk. `application_key_id`/`application_key` are a B2
+    application key -- they map onto boto3's aws_access_key_id /
+    aws_secret_access_key."""
+
+    endpoint_url: str
+    region: str
+    bucket_name: str
+    application_key_id: str
+    application_key: str
 
 
 class PineconeConfig(BaseModel):
     api_key: str
     # Personal knowledge lives in namespace f"personal:{user_id}", company
-    # knowledge in f"company:{organization_id}" -- both inside this one
+    # knowledge in f"company:{tenant_id}" -- both inside this one
     # operator-owned index (BYOK users get their own index/project instead,
-    # resolved through UserCredential rather than this config).
+    # resolved through their personal Credential rather than this config).
     index_name: str = "trench-platform"
 
 
 class LlamaParseConfig(BaseModel):
+    api_key: str
+
+
+class CohereRerankerConfig(BaseModel):
+    """Cohere's hosted Rerank API -- reranks already-retrieved (hybrid
+    dense+sparse) chunks against the actual query (see
+    app/service/reranker_service.py and docs/superpowers/specs/2026-10-
+    01-agentic-rag-jev-architecture.md). Chosen over a local cross-encoder
+    to avoid the torch/sentence-transformers dependency weight."""
+
     api_key: str
 
 
@@ -77,18 +113,39 @@ class SMTPConfig(BaseModel):
     use_tls: bool = True
 
 
+class TypeSafeConfig(BaseModel):
+    """TypeSafe/JEV decision-model access -- optional and unset until a
+    real API key exists (see docs/superpowers/specs/2026-10-01-agentic-
+    rag-jev-architecture.md). Every JevService call falls back to a
+    documented heuristic while this is unset ("stub mode"), so its
+    absence from .env is never a startup error, unlike the other
+    required TRENCH_CONFIG sections."""
+
+    api_key: str | None = None
+
+
 class TrenchConfig(BaseModel):
     ENVIRONMENT: str = "DEV"
+    # The frontend's own origin -- used to build links that must point at
+    # it rather than the API (invitation-accept, password-reset). Defaults
+    # to the local Next.js dev server so a fresh checkout works out of the
+    # box; set to the real app domain in staging/prod via TRENCH_CONFIG.
+    # No trailing slash (see InvitationService.create/PasswordResetService
+    # .request, which join it directly with a leading-slash path).
+    FRONTEND_BASE_URL: str = "http://localhost:3000"
     DB: DBConfig
     JWT: JWTConfig
     ENCRYPTION: EncryptionConfig
     FIREBASE: FirebaseConfig
     GROQ: GroqConfig
     STORAGE: StorageConfig
+    BACKBLAZE: BackblazeConfig
     PINECONE: PineconeConfig
     LLAMAPARSE: LlamaParseConfig
+    COHERE_RERANKER: CohereRerankerConfig
     GEMINI: GeminiConfig
     SMTP: SMTPConfig
+    TYPESAFE: TypeSafeConfig = TypeSafeConfig()
 
 
 class Settings(BaseSettings):

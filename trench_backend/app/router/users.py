@@ -21,7 +21,7 @@ async def get_current_user_profile(
     """Returns the authenticated user's profile.
 
     Includes their selected LLM (resolving lazily to the platform default
-    the first time it's read) and their organization membership/
+    the first time it's read) and their tenant (with their role in it)/
     company-knowledge-access status, if any.
 
     Args:
@@ -30,7 +30,7 @@ async def get_current_user_profile(
 
     Returns:
         The user's core profile fields, selected model, and
-        organization/company-access status.
+        tenant/company-access status.
     """
     return await UserProfileService.build_response(db, current_user)
 

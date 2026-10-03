@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import delete, select, update
 
-from app.database.models import Invitation, Organization, OrganizationMember, User
+from app.database.models import Invitation, Tenant, User
 from app.database.session import async_session_factory
 
 PREFIX = "test-invitation-service"
@@ -19,46 +19,40 @@ async def cleanup():
             delete(Invitation).where(Invitation.email.like(f"{PREFIX}%"))
         )
         await session.commit()
-        # Break the circular FK (users.organization_id <-> organizations.owner_user_id)
-        # before deleting either side.
+        # users.tenant_id has no ondelete -- detach users before deleting
+        # their tenant.
         await session.execute(
             update(User)
             .where(User.email.like(f"{PREFIX}%"))
-            .values(organization_id=None)
+            .values(tenant_id=None)
         )
         await session.commit()
-        org_result = await session.execute(
-            select(Organization).where(Organization.domain.like(f"{PREFIX}%"))
+        tenant_result = await session.execute(
+            select(Tenant).where(Tenant.domain.like(f"{PREFIX}%"))
         )
-        for organization in org_result.scalars().all():
-            await session.delete(organization)
+        for tenant in tenant_result.scalars().all():
+            await session.delete(tenant)
         await session.commit()
         await session.execute(delete(User).where(User.email.like(f"{PREFIX}%")))
         await session.commit()
 
 
-async def _make_org_and_owner(
-    session, suffix: str
-) -> tuple[Organization, OrganizationMember]:
+async def _make_tenant_and_owner(session, suffix: str) -> tuple[Tenant, User]:
+    tenant = Tenant(
+        name=f"{PREFIX}-tenant-{suffix}",
+        domain=f"{PREFIX}-{suffix}.example.com",
+    )
+    session.add(tenant)
+    await session.flush()
     owner = User(
         email=f"{PREFIX}-owner-{suffix}@{PREFIX}.example.com",
         username=f"{PREFIX}-owner-{suffix}",
+        tenant_id=tenant.id,
+        role="owner",
     )
     session.add(owner)
     await session.flush()
-    org = Organization(
-        name=f"{PREFIX}-org-{suffix}",
-        domain=f"{PREFIX}-{suffix}.example.com",
-        owner_user_id=owner.id,
-    )
-    session.add(org)
-    await session.flush()
-    membership = OrganizationMember(
-        organization_id=org.id, user_id=owner.id, role="owner"
-    )
-    session.add(membership)
-    await session.flush()
-    return org, membership
+    return tenant, owner
 
 
 @pytest.mark.asyncio
@@ -66,7 +60,7 @@ async def test_create_sends_an_email_and_stores_only_the_token_hash():
     from app.service.invitation_service import InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "create")
+        org, owner = await _make_tenant_and_owner(session, "create")
         await session.commit()
 
         with patch(
@@ -74,8 +68,8 @@ async def test_create_sends_an_email_and_stores_only_the_token_hash():
         ) as mock_send:
             invitation, raw_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=org,
+                inviter=owner,
                 email=f"{PREFIX}-invitee-create@{org.domain}",
                 role="member",
             )
@@ -87,19 +81,46 @@ async def test_create_sends_an_email_and_stores_only_the_token_hash():
 
 
 @pytest.mark.asyncio
+async def test_create_builds_the_accept_link_from_frontend_base_url():
+    """The emailed link must point at the configured frontend, not a
+    hardcoded placeholder domain -- see app.config.TrenchConfig
+    .FRONTEND_BASE_URL."""
+    from app.service.invitation_service import InvitationService
+
+    async with async_session_factory() as session:
+        org, owner = await _make_tenant_and_owner(session, "accept-link")
+        await session.commit()
+
+        with patch(
+            "app.service.invitation_service.send_email", new=AsyncMock()
+        ) as mock_send:
+            _invitation, raw_token = await InvitationService.create(
+                session,
+                tenant=org,
+                inviter=owner,
+                email=f"{PREFIX}-invitee-accept-link@{org.domain}",
+                role="member",
+            )
+
+        html_body = mock_send.await_args.kwargs["html_body"]
+        accept_url = html_body.split('href="')[1].split('"')[0]
+        assert accept_url == f"http://localhost:3000/invite/accept?token={raw_token}"
+
+
+@pytest.mark.asyncio
 async def test_create_rejects_an_email_with_a_different_domain():
     from app.service.invitation_service import DomainMismatchError, InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "domain-mismatch")
+        org, owner = await _make_tenant_and_owner(session, "domain-mismatch")
         await session.commit()
 
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             with pytest.raises(DomainMismatchError):
                 await InvitationService.create(
                     session,
-                    organization=org,
-                    inviter_membership=owner_membership,
+                    tenant=org,
+                    inviter=owner,
                     email=f"{PREFIX}-outsider@not-{org.domain}",
                     role="member",
                 )
@@ -110,27 +131,24 @@ async def test_admin_cannot_create_an_admin_role_invitation():
     from app.service.invitation_service import InvitationService, TooManyRoleError
 
     async with async_session_factory() as session:
-        org, _owner_membership = await _make_org_and_owner(session, "admin-limit")
+        org, _owner = await _make_tenant_and_owner(session, "admin-limit")
         await session.commit()
 
         admin_user = User(
             email=f"{PREFIX}-admin-admin-limit@{PREFIX}.example.com",
             username=f"{PREFIX}-admin-admin-limit",
+            tenant_id=org.id,
+            role="admin",
         )
         session.add(admin_user)
-        await session.flush()
-        admin_membership = OrganizationMember(
-            organization_id=org.id, user_id=admin_user.id, role="admin"
-        )
-        session.add(admin_membership)
         await session.commit()
 
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             with pytest.raises(TooManyRoleError):
                 await InvitationService.create(
                     session,
-                    organization=org,
-                    inviter_membership=admin_membership,
+                    tenant=org,
+                    inviter=admin_user,
                     email=f"{PREFIX}-wannabe-admin@{PREFIX}.example.com",
                     role="admin",
                 )
@@ -141,13 +159,13 @@ async def test_accept_rejects_a_mismatched_email():
     from app.service.invitation_service import InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "mismatch")
+        org, owner = await _make_tenant_and_owner(session, "mismatch")
         await session.commit()
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             _invitation, raw_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=org,
+                inviter=owner,
                 email=f"{PREFIX}-invitee-mismatch@{org.domain}",
                 role="member",
             )
@@ -166,14 +184,14 @@ async def test_accept_creates_membership_and_grants_default_knowledge_access():
     from app.service.knowledge_access_service import KnowledgeAccessService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "accept-default")
+        org, owner = await _make_tenant_and_owner(session, "accept-default")
         await session.commit()
         email = f"{PREFIX}-invitee-accept-default@{org.domain}"
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             _invitation, raw_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=org,
+                inviter=owner,
                 email=email,
                 role="member",
             )
@@ -184,11 +202,42 @@ async def test_accept_creates_membership_and_grants_default_knowledge_access():
 
         assert created is True
         assert accepted_invitation.status == "accepted"
-        assert user.organization_id == org.id
-        has_access = await KnowledgeAccessService.has_company_access(
-            session, user_id=user.id, organization_id=org.id
+        assert user.tenant_id == org.id
+        assert user.role == "member"
+        assert user.has_company_knowledge_access is True
+        assert KnowledgeAccessService.has_company_access(user) is True
+        assert (
+            await KnowledgeAccessService.authorized_company_tenant_id(
+                session, user_id=user.id
+            )
+            == org.id
         )
-        assert has_access is True
+
+
+@pytest.mark.asyncio
+async def test_accept_as_admin_sets_role_without_a_grant():
+    """Admins' company access is role-derived -- accepting an admin
+    invitation sets role="admin" directly and needs no grant flag."""
+    from app.service.invitation_service import InvitationService
+    from app.service.knowledge_access_service import KnowledgeAccessService
+
+    async with async_session_factory() as session:
+        org, owner = await _make_tenant_and_owner(session, "accept-admin")
+        await session.commit()
+        email = f"{PREFIX}-invitee-accept-admin@{org.domain}"
+        with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+            _invitation, raw_token = await InvitationService.create(
+                session, tenant=org, inviter=owner, email=email, role="admin"
+            )
+
+        _accepted, user, _created = await InvitationService.accept(
+            session, raw_token=raw_token, authenticated_email=email
+        )
+
+        assert user.tenant_id == org.id
+        assert user.role == "admin"
+        assert user.has_company_knowledge_access is False
+        assert KnowledgeAccessService.has_company_access(user) is True
 
 
 @pytest.mark.asyncio
@@ -196,14 +245,14 @@ async def test_accept_rejects_an_already_accepted_token():
     from app.service.invitation_service import InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "reuse")
+        org, owner = await _make_tenant_and_owner(session, "reuse")
         await session.commit()
         email = f"{PREFIX}-invitee-reuse@{org.domain}"
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             _invitation, raw_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=org,
+                inviter=owner,
                 email=email,
                 role="member",
             )
@@ -222,14 +271,14 @@ async def test_accept_rejects_an_expired_token():
     from app.service.invitation_service import InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "expired")
+        org, owner = await _make_tenant_and_owner(session, "expired")
         await session.commit()
         email = f"{PREFIX}-invitee-expired@{org.domain}"
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             invitation, raw_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=org,
+                inviter=owner,
                 email=email,
                 role="member",
             )
@@ -247,14 +296,14 @@ async def test_resend_rotates_token_and_resends_email():
     from app.service.invitation_service import InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "resend")
+        org, owner = await _make_tenant_and_owner(session, "resend")
         await session.commit()
         email = f"{PREFIX}-invitee-resend@{org.domain}"
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             invitation, first_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=org,
+                inviter=owner,
                 email=email,
                 role="member",
             )
@@ -263,7 +312,7 @@ async def test_resend_rotates_token_and_resends_email():
             "app.service.invitation_service.send_email", new=AsyncMock()
         ) as mock_send:
             new_token = await InvitationService.resend(
-                session, invitation=invitation, organization=org
+                session, invitation=invitation, tenant=org
             )
 
         assert mock_send.await_count == 1
@@ -276,13 +325,13 @@ async def test_revoke_sets_status_to_revoked():
     from app.service.invitation_service import InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "revoke")
+        org, owner = await _make_tenant_and_owner(session, "revoke")
         await session.commit()
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             invitation, _raw_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=org,
+                inviter=owner,
                 email=f"{PREFIX}-invitee-revoke@{org.domain}",
                 role="member",
             )
@@ -297,11 +346,11 @@ async def test_create_raises_email_delivery_error_but_keeps_the_invitation_row()
     exception bubbling up as a 500) -- but the already-committed Invitation
     row stays in place, since a Resend is exactly how the Owner recovers
     from a transient delivery failure, and create() itself already
-    dedupes/rotates against an existing pending row by (org, email)."""
+    dedupes/rotates against an existing pending row by (tenant, email)."""
     from app.service.invitation_service import InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "delivery-fail")
+        org, owner = await _make_tenant_and_owner(session, "delivery-fail")
         await session.commit()
         email = f"{PREFIX}-invitee-delivery-fail@{org.domain}"
 
@@ -312,8 +361,8 @@ async def test_create_raises_email_delivery_error_but_keeps_the_invitation_row()
             with pytest.raises(InvitationService.EmailDeliveryError):
                 await InvitationService.create(
                     session,
-                    organization=org,
-                    inviter_membership=owner_membership,
+                    tenant=org,
+                    inviter=owner,
                     email=email,
                     role="member",
                 )
@@ -330,13 +379,13 @@ async def test_resend_raises_email_delivery_error_on_smtp_failure():
     from app.service.invitation_service import InvitationService
 
     async with async_session_factory() as session:
-        org, owner_membership = await _make_org_and_owner(session, "resend-fail")
+        org, owner = await _make_tenant_and_owner(session, "resend-fail")
         await session.commit()
         with patch("app.service.invitation_service.send_email", new=AsyncMock()):
             invitation, _raw_token = await InvitationService.create(
                 session,
-                organization=org,
-                inviter_membership=owner_membership,
+                tenant=org,
+                inviter=owner,
                 email=f"{PREFIX}-invitee-resend-fail@{org.domain}",
                 role="member",
             )
@@ -347,5 +396,5 @@ async def test_resend_raises_email_delivery_error_on_smtp_failure():
         ):
             with pytest.raises(InvitationService.EmailDeliveryError):
                 await InvitationService.resend(
-                    session, invitation=invitation, organization=org
+                    session, invitation=invitation, tenant=org
                 )

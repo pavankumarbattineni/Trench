@@ -11,18 +11,18 @@ VALID_PROVIDER_TYPES = {
     "pinecone",
 }
 
-CredentialScope = Literal["personal", "organization"]
+CredentialScope = Literal["personal", "tenant"]
 
 
 class SaveCredentialRequest(BaseModel):
-    """POST /credentials -- organization_id is optional: given, this saves
-    the organization's shared BYOK credential (caller must be its Owner);
-    omitted, this saves the caller's own personal credential. There is no
-    separate organization-credentials API."""
+    """POST /credentials -- tenant_id is optional: given, this saves the
+    tenant's shared BYOK credential (caller must be its Owner); omitted,
+    this saves the caller's own personal credential. There is no separate
+    tenant-credentials API."""
 
     provider_type: str
     api_key: str
-    organization_id: uuid.UUID | None = None
+    tenant_id: uuid.UUID | None = None
 
 
 class CredentialResponse(BaseModel):

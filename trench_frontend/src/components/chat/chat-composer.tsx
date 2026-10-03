@@ -79,8 +79,8 @@ export function ChatComposer({
   };
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-2 p-4">
-      <div className="flex items-end gap-2 rounded-2xl border border-border bg-card p-2">
+    <div className="mx-auto w-full max-w-3xl p-4">
+      <div className="flex flex-col gap-2 rounded-2xl border border-border bg-card p-3">
         <Textarea
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -89,72 +89,75 @@ export function ChatComposer({
           rows={1}
           disabled={isBusy}
           autoFocus
-          className="max-h-40 min-h-9 flex-1 resize-none border-none bg-transparent shadow-none focus-visible:ring-0"
+          className="max-h-40 min-h-9 resize-none border-none bg-transparent px-1 shadow-none focus-visible:ring-0"
         />
-        {isStreaming ? (
-          <Button
-            type="button"
-            size="icon"
-            variant="outline"
-            aria-label="Stop generating"
-            onClick={onStop}
-          >
-            <Square className="size-3.5 fill-current" />
-          </Button>
-        ) : (
-          <Button
-            type="button"
-            size="icon"
-            aria-label="Send message"
-            disabled={!query.trim() || isBusy}
-            onClick={handleSubmit}
-          >
-            <ArrowUp className="size-4" />
-          </Button>
-        )}
-      </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <Select
-          items={knowledgeTypeItems}
-          value={knowledgeType}
-          onValueChange={(value) => setKnowledgeType(value as KnowledgeType)}
-        >
-          <SelectTrigger size="sm">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="personal">Personal knowledge</SelectItem>
-            {user?.has_company_access && (
-              <SelectItem value="company">Company knowledge</SelectItem>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              items={knowledgeTypeItems}
+              value={knowledgeType}
+              onValueChange={(value) => setKnowledgeType(value as KnowledgeType)}
+            >
+              <SelectTrigger size="sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="personal">Personal knowledge</SelectItem>
+                {user?.has_company_access && (
+                  <SelectItem value="company">Company knowledge</SelectItem>
+                )}
+              </SelectContent>
+            </Select>
+
+            {config?.llm_models && config.llm_models.length > 0 && (
+              <Select
+                items={modelItems}
+                value={user?.model_id ?? undefined}
+                onValueChange={handleModelChange}
+              >
+                <SelectTrigger size="sm" className="min-w-[13rem]">
+                  <SelectValue placeholder="Model" />
+                </SelectTrigger>
+                <SelectContent className="max-h-60">
+                  {config.llm_models.map((model) => {
+                    const unusable = model.requires_api_key && !model.has_credential;
+                    return (
+                      <SelectItem key={model.id} value={model.id} disabled={unusable}>
+                        {model.display_name}
+                        {unusable && (
+                          <span className="text-muted-foreground"> (BYOK)</span>
+                        )}
+                      </SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
             )}
-          </SelectContent>
-        </Select>
+          </div>
 
-        {config?.llm_models && config.llm_models.length > 0 && (
-          <Select
-            items={modelItems}
-            value={user?.model_id ?? undefined}
-            onValueChange={handleModelChange}
-          >
-            <SelectTrigger size="sm" className="min-w-[13rem]">
-              <SelectValue placeholder="Model" />
-            </SelectTrigger>
-            <SelectContent className="max-h-60">
-              {config.llm_models.map((model) => {
-                const unusable = model.requires_api_key && !model.has_credential;
-                return (
-                  <SelectItem key={model.id} value={model.id} disabled={unusable}>
-                    {model.display_name}
-                    {unusable && (
-                      <span className="text-muted-foreground"> (BYOK)</span>
-                    )}
-                  </SelectItem>
-                );
-              })}
-            </SelectContent>
-          </Select>
-        )}
+          {isStreaming ? (
+            <Button
+              type="button"
+              size="icon"
+              variant="outline"
+              aria-label="Stop generating"
+              onClick={onStop}
+            >
+              <Square className="size-3.5 fill-current" />
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              size="icon"
+              aria-label="Send message"
+              disabled={!query.trim() || isBusy}
+              onClick={handleSubmit}
+            >
+              <ArrowUp className="size-4" />
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   );

@@ -3,6 +3,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
+import { toast } from "sonner";
 import { z } from "zod";
 
 import { Button } from "@/components/ui/button";
@@ -25,9 +26,7 @@ const schema = z
 type FormValues = z.infer<typeof schema>;
 
 export function ChangePasswordForm() {
-  const [message, setMessage] = useState<{ type: "error" | "success"; text: string } | null>(
-    null
-  );
+  const [error, setError] = useState<string | null>(null);
   const {
     register,
     handleSubmit,
@@ -36,13 +35,17 @@ export function ChangePasswordForm() {
   } = useForm<FormValues>({ resolver: zodResolver(schema) });
 
   const onSubmit = async (values: FormValues) => {
-    setMessage(null);
+    setError(null);
     try {
-      await changePassword(values.currentPassword, values.newPassword);
+      await changePassword(
+        values.currentPassword,
+        values.newPassword,
+        values.confirmPassword
+      );
       reset();
-      setMessage({ type: "success", text: "Password updated." });
-    } catch (error) {
-      setMessage({ type: "error", text: getErrorMessage(error) });
+      toast.success("Password updated successfully.");
+    } catch (err) {
+      setError(getErrorMessage(err));
     }
   };
 
@@ -81,17 +84,7 @@ export function ChangePasswordForm() {
           <p className="text-sm text-destructive">{errors.confirmPassword.message}</p>
         )}
       </div>
-      {message && (
-        <p
-          className={
-            message.type === "error"
-              ? "text-sm text-destructive"
-              : "text-sm font-medium text-foreground"
-          }
-        >
-          {message.text}
-        </p>
-      )}
+      {error && <p className="text-sm text-destructive">{error}</p>}
       <Button type="submit" disabled={isSubmitting}>
         {isSubmitting ? "Updating…" : "Update password"}
       </Button>
