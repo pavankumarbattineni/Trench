@@ -50,6 +50,32 @@ class LLMClientService:
             )
 
     @staticmethod
+    def _groq_resolved(model: ProviderModel) -> ResolvedModel:
+        return ResolvedModel(
+            provider_name="groq",
+            model_name=model.model_name,
+            api_key=get_settings().TRENCH_CONFIG.GROQ.api_key,
+        )
+
+    @staticmethod
+    async def _resolve_byok_key(
+        db: AsyncSession,
+        provider_name: str,
+        *,
+        user_id: uuid.UUID | None = None,
+        tenant_id: uuid.UUID | None = None,
+    ) -> str | None:
+        """The decrypted BYOK key for `provider_name` in exactly one of
+        the personal (user_id) or tenant scopes, or None if that provider
+        needs no credential (Groq) or the scope has none stored."""
+        byok_type = CredentialService.required_credential_type(provider_name)
+        if byok_type is None:
+            return None
+        return await CredentialService.get_decrypted(
+            db, user_id=user_id, tenant_id=tenant_id, provider_type=byok_type
+        )
+
+    @staticmethod
     async def resolve_for_user(db: AsyncSession, user: User) -> ResolvedModel:
         default_model = await ProviderCatalogService.get_default(db)
         model_id = user.model_id or default_model.id
@@ -57,19 +83,10 @@ class LLMClientService:
         provider = await db.get(Provider, model.provider_id)
 
         if provider.name == "groq":
-            return ResolvedModel(
-                provider_name="groq",
-                model_name=model.model_name,
-                api_key=get_settings().TRENCH_CONFIG.GROQ.api_key,
-            )
+            return LLMClientService._groq_resolved(model)
 
-        byok_type = CredentialService.required_credential_type(provider.name)
-        personal_key = (
-            await CredentialService.get_decrypted(
-                db, user_id=user.id, provider_type=byok_type
-            )
-            if byok_type
-            else None
+        personal_key = await LLMClientService._resolve_byok_key(
+            db, provider.name, user_id=user.id
         )
         if personal_key is not None:
             return ResolvedModel(
@@ -112,19 +129,10 @@ class LLMClientService:
         provider = await db.get(Provider, model.provider_id)
 
         if provider.name == "groq":
-            return ResolvedModel(
-                provider_name="groq",
-                model_name=model.model_name,
-                api_key=get_settings().TRENCH_CONFIG.GROQ.api_key,
-            )
+            return LLMClientService._groq_resolved(model)
 
-        byok_type = CredentialService.required_credential_type(provider.name)
-        tenant_key = (
-            await CredentialService.get_decrypted(
-                db, tenant_id=tenant_id, provider_type=byok_type
-            )
-            if byok_type
-            else None
+        tenant_key = await LLMClientService._resolve_byok_key(
+            db, provider.name, tenant_id=tenant_id
         )
         if tenant_key is not None:
             return ResolvedModel(
@@ -133,11 +141,7 @@ class LLMClientService:
                 api_key=tenant_key,
             )
 
-        return ResolvedModel(
-            provider_name="groq",
-            model_name=default_model.model_name,
-            api_key=get_settings().TRENCH_CONFIG.GROQ.api_key,
-        )
+        return LLMClientService._groq_resolved(default_model)
 
     @staticmethod
     async def stream_generate(

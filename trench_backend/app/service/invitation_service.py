@@ -77,6 +77,32 @@ class InvitationService:
         exactly how the Owner/Admin recovers from a transient failure."""
 
     @staticmethod
+    async def _send_invite_email(
+        *,
+        email: str,
+        tenant_name: str,
+        role: str,
+        raw_token: str,
+        subject: str,
+        failure_message: str,
+    ) -> None:
+        """Shared tail of create() and resend(): build the accept link and
+        email body, send it, and wrap a delivery failure as
+        EmailDeliveryError -- the only things that differ between the two
+        callers are the subject line and the message shown on failure."""
+        frontend_base_url = get_settings().TRENCH_CONFIG.FRONTEND_BASE_URL
+        accept_url = f"{frontend_base_url}/invite/accept?token={raw_token}"
+        html_body, text_body = _invite_email_body(
+            tenant_name=tenant_name, role=role, accept_url=accept_url
+        )
+        try:
+            await send_email(
+                to=email, subject=subject, html_body=html_body, text_body=text_body
+            )
+        except Exception as exc:
+            raise InvitationService.EmailDeliveryError(failure_message) from exc
+
+    @staticmethod
     async def create(
         db: AsyncSession,
         *,
@@ -136,23 +162,17 @@ class InvitationService:
         await db.commit()
         await db.refresh(invitation)
 
-        frontend_base_url = get_settings().TRENCH_CONFIG.FRONTEND_BASE_URL
-        accept_url = f"{frontend_base_url}/invite/accept?token={raw_token}"
-        html_body, text_body = _invite_email_body(
-            tenant_name=tenant.name, role=role, accept_url=accept_url
-        )
-        try:
-            await send_email(
-                to=email,
-                subject=f"You're invited to join {tenant.name} on Trench",
-                html_body=html_body,
-                text_body=text_body,
-            )
-        except Exception as exc:
-            raise InvitationService.EmailDeliveryError(
+        await InvitationService._send_invite_email(
+            email=email,
+            tenant_name=tenant.name,
+            role=role,
+            raw_token=raw_token,
+            subject=f"You're invited to join {tenant.name} on Trench",
+            failure_message=(
                 "The invitation was created, but the email couldn't be "
                 "sent. Use Resend to try again."
-            ) from exc
+            ),
+        )
         return invitation, raw_token
 
     @staticmethod
@@ -167,25 +187,17 @@ class InvitationService:
         invitation.expires_at = datetime.now(UTC) + INVITATION_EXPIRY
         await db.commit()
 
-        frontend_base_url = get_settings().TRENCH_CONFIG.FRONTEND_BASE_URL
-        accept_url = f"{frontend_base_url}/invite/accept?token={raw_token}"
-        html_body, text_body = _invite_email_body(
+        await InvitationService._send_invite_email(
+            email=invitation.email,
             tenant_name=tenant.name,
             role=invitation.role,
-            accept_url=accept_url,
-        )
-        try:
-            await send_email(
-                to=invitation.email,
-                subject=f"Reminder: you're invited to join {tenant.name} on Trench",
-                html_body=html_body,
-                text_body=text_body,
-            )
-        except Exception as exc:
-            raise InvitationService.EmailDeliveryError(
+            raw_token=raw_token,
+            subject=f"Reminder: you're invited to join {tenant.name} on Trench",
+            failure_message=(
                 "The invitation link was refreshed, but the reminder email "
                 "couldn't be sent. Try Resend again."
-            ) from exc
+            ),
+        )
         return raw_token
 
     @staticmethod

@@ -141,6 +141,29 @@ def _member_response(member: User) -> TenantMemberResponse:
     )
 
 
+def _reject_if_bulk_also_given_single_target(
+    user_id: uuid.UUID | None, *, bulk_name: str
+) -> None:
+    """Shared half of the single/bulk XOR-param contract (see this
+    module's docstring) -- called from within a bulk-mode branch, where
+    `user_id` being set alongside it is ambiguous."""
+    if user_id is not None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"Provide either user_id or {bulk_name}=true, not both",
+        )
+
+
+def _require_single_target(user_id: uuid.UUID | None, *, bulk_name: str) -> None:
+    """The other half: called once bulk mode has been ruled out, where a
+    missing `user_id` leaves nothing to act on."""
+    if user_id is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"user_id is required unless {bulk_name}=true",
+        )
+
+
 @router.get("/{tenant_id}/members", response_model=PaginatedMembersResponse)
 async def list_members(
     tenant_id: uuid.UUID,
@@ -265,21 +288,13 @@ async def remove_member(
                 status.HTTP_403_FORBIDDEN,
                 "Only the tenant owner can remove all members at once",
             )
-        if user_id is not None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                "Provide either user_id or remove_all=true, not both",
-            )
+        _reject_if_bulk_also_given_single_target(user_id, bulk_name="remove_all")
         removed_count = await TenantService.remove_all_members(
             db, tenant_id=tenant_id, acting_user_id=acting_user.id
         )
         return MemberBulkRemoveResponse(removed_count=removed_count)
 
-    if user_id is None:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "user_id is required unless remove_all=true",
-        )
+    _require_single_target(user_id, bulk_name="remove_all")
     await TenantService.remove_member(
         db, tenant_id=tenant_id, target_user_id=user_id, acting_user=acting_user
     )
@@ -330,19 +345,11 @@ async def update_knowledge_access(
             `user_id` is the tenant's owner.
     """
     if access_all:
-        if user_id is not None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                "Provide either user_id or access_all=true, not both",
-            )
+        _reject_if_bulk_also_given_single_target(user_id, bulk_name="access_all")
         granted_count = await KnowledgeAccessService.grant_all(db, tenant_id=tenant_id)
         return KnowledgeAccessBulkGrantResponse(granted_count=granted_count)
 
-    if user_id is None:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "user_id is required unless access_all=true",
-        )
+    _require_single_target(user_id, bulk_name="access_all")
     if allow_access is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -399,19 +406,11 @@ async def revoke_knowledge_access(
             is the tenant's owner.
     """
     if remove_access:
-        if user_id is not None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                "Provide either user_id or remove_access=true, not both",
-            )
+        _reject_if_bulk_also_given_single_target(user_id, bulk_name="remove_access")
         revoked_count = await KnowledgeAccessService.revoke_all(db, tenant_id=tenant_id)
         return KnowledgeAccessBulkRevokeResponse(revoked_count=revoked_count)
 
-    if user_id is None:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "user_id is required unless remove_access=true",
-        )
+    _require_single_target(user_id, bulk_name="remove_access")
     await TenantService.require_not_owner(
         db, tenant_id=tenant_id, target_user_id=user_id
     )

@@ -7,10 +7,18 @@ Single-process only -- fine for one API worker; a multi-worker deployment
 would need this backed by something shared (Redis pub/sub, Postgres
 LISTEN/NOTIFY) instead, but the persisted ChatHistory row is always the
 durable source of truth regardless.
+
+A finished stream's buffer is evicted a few minutes after `finish()` --
+long enough to cover a client reconnecting via Last-Event-ID right after
+generation ends, but not kept forever. Without this, every chat turn ever
+run stays in this dict for the life of the process (nothing else ever
+deletes an entry) -- unbounded memory growth with turn count.
 """
 
 import asyncio
 from dataclasses import dataclass, field
+
+DEFAULT_EVICTION_DELAY_SECONDS = 300.0
 
 
 @dataclass
@@ -22,8 +30,11 @@ class _StreamState:
 
 
 class StreamManager:
-    def __init__(self) -> None:
+    def __init__(
+        self, *, eviction_delay_seconds: float = DEFAULT_EVICTION_DELAY_SECONDS
+    ) -> None:
         self._streams: dict[str, _StreamState] = {}
+        self._eviction_delay_seconds = eviction_delay_seconds
 
     def _state(self, stream_id: str) -> _StreamState:
         return self._streams.setdefault(stream_id, _StreamState())
@@ -49,6 +60,14 @@ class StreamManager:
         state.done = True
         for queue in state.subscribers:
             queue.put_nowait(None)  # sentinel: no more chunks
+        asyncio.ensure_future(self._evict_after_delay(stream_id))
+
+    async def _evict_after_delay(self, stream_id: str) -> None:
+        await asyncio.sleep(self._eviction_delay_seconds)
+        # subscribe() never adds to `subscribers` once `done` is set (it
+        # sends the sentinel immediately instead), so a finished stream's
+        # subscriber list can only shrink, never grow -- safe to drop.
+        self._streams.pop(stream_id, None)
 
     def subscribe(self, stream_id: str, *, from_index: int = 0) -> asyncio.Queue:
         state = self._state(stream_id)
