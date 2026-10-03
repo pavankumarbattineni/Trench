@@ -218,8 +218,8 @@ class DocumentService:
         if not has_own_pinecone:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
-                "You've used all 5 free documents. Add your own Pinecone "
-                "credentials in Settings to upload more.",
+                "You've used all 5 free documents. Delete an existing one "
+                "to upload another.",
             )
 
     @staticmethod

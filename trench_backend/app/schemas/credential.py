@@ -8,7 +8,6 @@ VALID_PROVIDER_TYPES = {
     "openai_llm",
     "anthropic_llm",
     "gemini_llm",
-    "pinecone",
 }
 
 CredentialScope = Literal["personal", "tenant"]

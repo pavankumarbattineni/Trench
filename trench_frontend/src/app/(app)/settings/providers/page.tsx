@@ -21,7 +21,7 @@ export default function ProvidersPage() {
       <div className="rounded-2xl border border-border bg-card">
         <SettingsSection
           title="Providers"
-          description="Trench uses a free platform-default model for chat. Bring your own API key below to use OpenAI, Anthropic, or Gemini instead, or to connect your own Pinecone index."
+          description="Trench uses a free platform-default model for chat. Bring your own API key below to use OpenAI, Anthropic, or Gemini instead."
         >
           <ApiKeysSection />
         </SettingsSection>

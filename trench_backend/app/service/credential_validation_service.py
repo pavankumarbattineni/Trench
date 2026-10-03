@@ -18,9 +18,7 @@ _INVALID_KEY_MESSAGES = {
 
 
 class CredentialValidationService:
-    """One validator per LLM provider_type. The "pinecone" provider_type
-    (a BYOK vector-store project) isn't validated yet -- added when that
-    path is wired up."""
+    """One validator per LLM provider_type."""
 
     @classmethod
     async def validate(cls, provider_type: str, api_key: str) -> None:

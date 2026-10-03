@@ -1,18 +1,12 @@
 import { apiClient } from "@/lib/api";
 
-export const PROVIDER_TYPES = [
-  "openai_llm",
-  "anthropic_llm",
-  "gemini_llm",
-  "pinecone",
-] as const;
+export const PROVIDER_TYPES = ["openai_llm", "anthropic_llm", "gemini_llm"] as const;
 export type ProviderType = (typeof PROVIDER_TYPES)[number];
 
 export const PROVIDER_LABELS: Record<ProviderType, string> = {
   openai_llm: "OpenAI",
   anthropic_llm: "Anthropic",
   gemini_llm: "Google Gemini",
-  pinecone: "Pinecone",
 };
 
 export interface Credential {
