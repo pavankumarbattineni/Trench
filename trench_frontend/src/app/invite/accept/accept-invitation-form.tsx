@@ -15,7 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PasswordInput } from "@/components/ui/password-input";
 import { useAuthSuccess } from "@/hooks/use-auth-success";
-import { getCurrentUser, persistTokens } from "@/lib/api";
+import { completeSession } from "@/lib/api";
 import { getErrorMessage } from "@/lib/errors";
 import { firebaseAuth } from "@/lib/firebase";
 import { acceptInvitation } from "@/lib/invitations";
@@ -83,8 +83,7 @@ export function AcceptInvitationForm() {
       }
 
       const tokens = await acceptInvitation(token, idToken, values.username);
-      persistTokens(tokens);
-      handleAuthSuccess(await getCurrentUser());
+      handleAuthSuccess(await completeSession(tokens));
     } catch (error) {
       if (isAxiosError(error) && error.response?.status === 404) {
         setInvalidTokenMessage(

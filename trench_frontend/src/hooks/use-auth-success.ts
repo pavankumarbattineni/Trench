@@ -8,9 +8,10 @@ import type { UserProfile } from "@/lib/api";
 /**
  * "Authenticated just now" handler: records the profile in AuthProvider's
  * state and goes straight to the main chat page. Used on /signin (both
- * email/password and "Continue with Google") and on /signup, since Owner
- * signup now establishes a session immediately rather than deferring to a
- * separate sign-in step.
+ * email/password and "Continue with Google") and on /invite/accept --
+ * not on /signup, since Owner signup issues no session (the backend's
+ * POST /auth/signup/owner returns tenant info only; the Owner signs in
+ * separately afterward).
  */
 export function useAuthSuccess() {
   const router = useRouter();

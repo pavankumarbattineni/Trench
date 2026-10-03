@@ -78,13 +78,15 @@ export function clearAuthTokens(): void {
 }
 
 /**
- * Stores a token pair obtained from a flow that lives outside this file
- * (e.g. invitations.ts's acceptInvitation) -- `setAuthTokens` above isn't
- * exported, so this is the seam other modules use to persist a session
- * without duplicating the cookie-writing logic.
+ * Persists a token pair obtained from a flow that lives outside this file
+ * (e.g. invitations.ts's acceptInvitation) and fetches the resulting user
+ * profile -- the shared "I just got tokens, now go live" tail shared by
+ * every way of establishing a session, so callers don't each re-implement
+ * persist-then-fetch themselves.
  */
-export function persistTokens(tokens: TokenResponse): void {
+export async function completeSession(tokens: TokenResponse): Promise<UserProfile> {
   setAuthTokens(tokens);
+  return getCurrentUser();
 }
 
 export function isAuthenticated(): boolean {
