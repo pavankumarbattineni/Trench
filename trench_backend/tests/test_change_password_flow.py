@@ -58,11 +58,11 @@ async def test_change_password_succeeds_when_current_password_is_correct(
 
     with (
         patch(
-            "app.service.change_password_service.firebase_utils.verify_user_password",
+            "app.service.auth_service.firebase_utils.verify_user_password",
             new=AsyncMock(return_value=True),
         ) as mock_verify,
         patch(
-            "app.service.change_password_service.firebase_utils.set_user_password",
+            "app.service.auth_service.firebase_utils.set_user_password",
             new=Mock(),
         ) as mock_set_pw,
     ):
@@ -89,11 +89,11 @@ async def test_change_password_rejects_an_incorrect_current_password(
 
     with (
         patch(
-            "app.service.change_password_service.firebase_utils.verify_user_password",
+            "app.service.auth_service.firebase_utils.verify_user_password",
             new=AsyncMock(return_value=False),
         ),
         patch(
-            "app.service.change_password_service.firebase_utils.set_user_password",
+            "app.service.auth_service.firebase_utils.set_user_password",
             new=Mock(),
         ) as mock_set_pw,
     ):
@@ -118,7 +118,7 @@ async def test_change_password_rejects_a_mismatched_confirm_password(
     await _login(client, email, f"{PREFIX}-mismatch")
 
     with patch(
-        "app.service.change_password_service.firebase_utils.set_user_password",
+        "app.service.auth_service.firebase_utils.set_user_password",
         new=Mock(),
     ) as mock_set_pw:
         response = await client.post(

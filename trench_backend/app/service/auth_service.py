@@ -1,22 +1,34 @@
-"""Business logic for the Firebase-backed authentication flow.
+"""Business logic for the Firebase-backed authentication flow: identity
+verification, Trench session issuance, and both password-change paths.
 
 Firebase owns passwords and identity; this service verifies Firebase ID
 tokens, provisions the matching Postgres user, and issues/verifies Trench's
 own short-lived access token and longer-lived refresh token (both stateless
 JWTs -- see app.utils.security). There is no server-side session store:
 a refresh token stays valid until it expires or the frontend discards it.
+
+Also holds the two password-change flows, each verifying "is this really
+you" a different way before Firebase will accept a new password:
+ChangePasswordService (authenticated Settings page, proves identity via
+the current password) and PasswordResetService (signed-out Forgot
+Password flow, proves identity via a custom emailed token).
 """
 
-from datetime import UTC, datetime
+import hashlib
+import secrets
+from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, status
 from firebase_admin import auth as firebase_auth
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Tenant, User
+from app.config import get_settings
+from app.database.models import PasswordResetToken, Tenant, User
 from app.service.tenant_service import TenantService
 from app.service.user_service import UserService
 from app.utils import firebase as firebase_utils
+from app.utils.email import send_email
 from app.utils.security import (
     TokenError,
     create_access_token,
@@ -24,6 +36,13 @@ from app.utils.security import (
     decode_access_token,
     decode_refresh_token,
 )
+
+RESET_TOKEN_EXPIRY = timedelta(hours=1)
+
+
+def _hash_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode()).hexdigest()
+
 
 _UNAUTHENTICATED = HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
 _INVALID_FIREBASE_TOKEN = HTTPException(
@@ -278,3 +297,108 @@ class AuthService:
                 "Account data was deleted, but removing the Firebase identity "
                 "failed. Please contact support.",
             ) from exc
+
+
+class ChangePasswordService:
+    """Authenticated Settings > Change Password flow -- kept fully separate
+    from PasswordResetService (the signed-out Forgot Password flow). Here
+    the caller already has a valid session; the only thing left to prove
+    is that they know the *current* password before Firebase will accept
+    a new one.
+    """
+
+    class IncorrectCurrentPasswordError(Exception):
+        """Raised when current_password doesn't match the account's
+        password on file."""
+
+    @classmethod
+    async def change(
+        cls, *, user: User, current_password: str, new_password: str
+    ) -> None:
+        """Raises:
+        IncorrectCurrentPasswordError: current_password is wrong.
+        """
+        verified = await firebase_utils.verify_user_password(
+            user.email, current_password
+        )
+        if not verified:
+            raise cls.IncorrectCurrentPasswordError(
+                "Current password is incorrect"
+            )
+        firebase_utils.set_user_password(user.email, new_password)
+
+
+class PasswordResetService:
+    """Fully custom password-reset flow: the backend generates its own
+    token, emails it via SMTP, and updates the password through the
+    Firebase Admin SDK -- Firebase remains the password *store*, but owns
+    none of the reset email or verification flow (replacing
+    sendPasswordResetEmail/oobCode/verifyPasswordResetCode on the
+    frontend).
+    """
+
+    class InvalidTokenError(Exception):
+        """Raised when a reset token is missing, expired, or already used."""
+
+    @staticmethod
+    async def request(db: AsyncSession, *, email: str) -> None:
+        """Always succeeds from the caller's point of view, whether or not
+        the email matches an account -- the router returns the same
+        response either way to avoid confirming/denying account
+        existence (the anti-enumeration UX the old Firebase-native flow
+        already had)."""
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+        if user is None:
+            return
+
+        raw_token = secrets.token_urlsafe(32)
+        token = PasswordResetToken(
+            user_id=user.id,
+            token_hash=_hash_token(raw_token),
+            expires_at=datetime.now(UTC) + RESET_TOKEN_EXPIRY,
+        )
+        db.add(token)
+        await db.commit()
+
+        frontend_base_url = get_settings().TRENCH_CONFIG.FRONTEND_BASE_URL
+        reset_url = f"{frontend_base_url}/reset-password?token={raw_token}"
+        await send_email(
+            to=email,
+            subject="Reset your Trench password",
+            html_body=(
+                f'<p><a href="{reset_url}">Reset your password</a></p>'
+                "<p>This link expires in 1 hour. If you didn't request this, "
+                "you can ignore this email.</p>"
+            ),
+            text_body=(
+                f"Reset your password: {reset_url}\n\n"
+                "This link expires in 1 hour. If you didn't request this, "
+                "you can ignore this email."
+            ),
+        )
+
+    @classmethod
+    async def confirm(
+        cls, db: AsyncSession, *, raw_token: str, new_password: str
+    ) -> None:
+        """Raises:
+        InvalidTokenError: token not found, already used, or expired.
+        """
+        token_hash = _hash_token(raw_token)
+        result = await db.execute(
+            select(PasswordResetToken).where(
+                PasswordResetToken.token_hash == token_hash
+            )
+        )
+        token = result.scalar_one_or_none()
+        if token is None or token.used_at is not None:
+            raise cls.InvalidTokenError("Reset token not found or already used")
+        if token.expires_at < datetime.now(UTC):
+            raise cls.InvalidTokenError("Reset token has expired")
+
+        user = await db.get(User, token.user_id)
+        firebase_utils.set_user_password(user.email, new_password)
+
+        token.used_at = datetime.now(UTC)
+        await db.commit()

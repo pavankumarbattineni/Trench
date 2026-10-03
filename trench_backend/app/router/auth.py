@@ -31,10 +31,12 @@ from app.schemas.password_reset import (
     ConfirmPasswordResetRequest,
     RequestPasswordResetRequest,
 )
-from app.service.auth_service import AuthService
-from app.service.change_password_service import ChangePasswordService
+from app.service.auth_service import (
+    AuthService,
+    ChangePasswordService,
+    PasswordResetService,
+)
 from app.service.invitation_service import InvitationService
-from app.service.password_reset_service import PasswordResetService
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 

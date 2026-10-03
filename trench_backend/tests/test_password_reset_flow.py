@@ -58,7 +58,7 @@ async def test_request_reset_always_returns_200_even_for_unknown_email(
     client: AsyncClient,
 ):
     with patch(
-        "app.service.password_reset_service.send_email", new=AsyncMock()
+        "app.service.auth_service.send_email", new=AsyncMock()
     ) as mock_send:
         response = await client.post(
             "/api/v1/auth/password-reset/request",
@@ -74,7 +74,7 @@ async def test_request_reset_emails_a_token_for_a_known_user(client: AsyncClient
     await _signup(client, email, f"{PREFIX}-resetme")
 
     with patch(
-        "app.service.password_reset_service.send_email", new=AsyncMock()
+        "app.service.auth_service.send_email", new=AsyncMock()
     ) as mock_send:
         response = await client.post(
             "/api/v1/auth/password-reset/request", json={"email": email}
@@ -90,7 +90,7 @@ async def _request_reset_and_capture_url(client: AsyncClient, email: str) -> str
         captured["html_body"] = html_body
 
     with patch(
-        "app.service.password_reset_service.send_email", new=_capture_send
+        "app.service.auth_service.send_email", new=_capture_send
     ):
         await client.post(
             "/api/v1/auth/password-reset/request", json={"email": email}
