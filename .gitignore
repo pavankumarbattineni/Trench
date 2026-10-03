@@ -1,6 +1,5 @@
 # Reference-only files — never commit
 frontend.html
-trench-e4b2f-firebase-adminsdk-fbsvc-acc908edf9.json
 
 # Python
 __pycache__/
@@ -8,6 +7,7 @@ __pycache__/
 .venv/
 trench_backend/.env
 .pytest_cache/
+trench_backend/storage/
 
 # Node / Next.js
 node_modules/
@@ -19,3 +19,10 @@ trench_frontend/.env.local
 # Editors / OS
 .DS_Store
 .vscode/
+
+# Playwright MCP review artifacts (screenshots, snapshots, console logs)
+.playwright-mcp/
+/*.png
+
+# LangGraph dev server local cache (langgraph.json / `langgraph dev`)
+trench_backend/.langgraph_api/
