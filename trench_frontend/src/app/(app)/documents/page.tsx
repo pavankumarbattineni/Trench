@@ -17,13 +17,7 @@ import {
   useViewDocument,
 } from "@/hooks/use-documents";
 import { getErrorMessage } from "@/lib/errors";
-import type { DocumentSummary } from "@/lib/documents";
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+import { formatBytes, type DocumentSummary } from "@/lib/documents";
 
 export default function DocumentsPage() {
   const { data: documents, isLoading, isError, error } = useDocuments();

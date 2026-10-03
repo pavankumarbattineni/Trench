@@ -17,13 +17,7 @@ import {
   useViewCompanyDocument,
 } from "@/hooks/use-tenant-documents";
 import { getErrorMessage } from "@/lib/errors";
-import type { DocumentSummary } from "@/lib/documents";
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+import { formatBytes, type DocumentSummary } from "@/lib/documents";
 
 interface TenantDocumentsPanelProps {
   tenantId: string;

@@ -16,6 +16,7 @@ import uuid
 from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
 
 from app.database.models import Document, User
 from app.database.session import async_session_factory
@@ -222,65 +223,90 @@ class DocumentService:
             )
 
     @staticmethod
+    async def _list_documents(
+        db: AsyncSession,
+        *,
+        knowledge_type: str,
+        owner_column: InstrumentedAttribute[uuid.UUID],
+        owner_id: uuid.UUID,
+    ) -> list[Document]:
+        result = await db.execute(
+            select(Document).where(
+                owner_column == owner_id, Document.knowledge_type == knowledge_type
+            )
+        )
+        return list(result.scalars().all())
+
+    @classmethod
     async def list_personal_documents(
-        db: AsyncSession, *, user_id: uuid.UUID
+        cls, db: AsyncSession, *, user_id: uuid.UUID
     ) -> list[Document]:
-        result = await db.execute(
-            select(Document).where(
-                Document.user_id == user_id, Document.knowledge_type == "personal"
-            )
+        return await cls._list_documents(
+            db,
+            knowledge_type="personal",
+            owner_column=Document.user_id,
+            owner_id=user_id,
         )
-        return list(result.scalars().all())
 
-    @staticmethod
+    @classmethod
     async def list_company_documents(
-        db: AsyncSession, *, tenant_id: uuid.UUID
+        cls, db: AsyncSession, *, tenant_id: uuid.UUID
     ) -> list[Document]:
-        result = await db.execute(
-            select(Document).where(
-                Document.tenant_id == tenant_id,
-                Document.knowledge_type == "company",
-            )
+        return await cls._list_documents(
+            db,
+            knowledge_type="company",
+            owner_column=Document.tenant_id,
+            owner_id=tenant_id,
         )
-        return list(result.scalars().all())
 
     @staticmethod
+    async def _has_any_documents(
+        db: AsyncSession,
+        *,
+        knowledge_type: str,
+        owner_column: InstrumentedAttribute[uuid.UUID],
+        owner_id: uuid.UUID,
+    ) -> bool:
+        """A LIMIT 1 existence check, not a count -- cheaper, and every
+        caller only needs a boolean."""
+        result = await db.execute(
+            select(Document.id)
+            .where(
+                owner_column == owner_id,
+                Document.knowledge_type == knowledge_type,
+                Document.status == "completed",
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    @classmethod
     async def has_any_personal_documents(
-        db: AsyncSession, *, user_id: uuid.UUID
+        cls, db: AsyncSession, *, user_id: uuid.UUID
     ) -> bool:
         """Whether `user_id` has at least one fully-ingested personal
         document -- used by the RAG graph to tell "this knowledge base has
         never had anything in it" apart from "nothing relevant matched
-        this query" (see app/graph/rag_graph.py's validate_knowledge_access).
-        A LIMIT 1 existence check, not a count -- cheaper, and the caller
-        only needs a boolean."""
-        result = await db.execute(
-            select(Document.id)
-            .where(
-                Document.user_id == user_id,
-                Document.knowledge_type == "personal",
-                Document.status == "completed",
-            )
-            .limit(1)
+        this query" (see app/graph/rag_graph.py's validate_knowledge_access)."""
+        return await cls._has_any_documents(
+            db,
+            knowledge_type="personal",
+            owner_column=Document.user_id,
+            owner_id=user_id,
         )
-        return result.scalar_one_or_none() is not None
 
-    @staticmethod
+    @classmethod
     async def has_any_company_documents(
-        db: AsyncSession, *, tenant_id: uuid.UUID
+        cls, db: AsyncSession, *, tenant_id: uuid.UUID
     ) -> bool:
         """Same as has_any_personal_documents, scoped to a tenant's
         company knowledge instead."""
-        result = await db.execute(
-            select(Document.id)
-            .where(
-                Document.tenant_id == tenant_id,
-                Document.knowledge_type == "company",
-                Document.status == "completed",
-            )
-            .limit(1)
+        return await cls._has_any_documents(
+            db,
+            knowledge_type="company",
+            owner_column=Document.tenant_id,
+            owner_id=tenant_id,
         )
-        return result.scalar_one_or_none() is not None
 
     @classmethod
     async def get_document(
