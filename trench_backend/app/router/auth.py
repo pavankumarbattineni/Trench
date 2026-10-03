@@ -35,7 +35,6 @@ from app.service.auth_service import AuthService
 from app.service.change_password_service import ChangePasswordService
 from app.service.invitation_service import InvitationService
 from app.service.password_reset_service import PasswordResetService
-from app.utils.security import create_access_token, create_refresh_token
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -221,10 +220,8 @@ async def accept_invitation(
     except InvitationService.AlreadyInTenantError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
-    return TokenResponse(
-        access_token=create_access_token(user.id),
-        refresh_token=create_refresh_token(user.id),
-    )
+    access_token, refresh_token = AuthService.issue_tokens(user.id)
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
 
 @router.post("/change-password", status_code=200)

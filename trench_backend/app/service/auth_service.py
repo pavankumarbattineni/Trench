@@ -130,6 +130,16 @@ class AuthService:
         await db.refresh(user)
         return user, tenant
 
+    @staticmethod
+    def issue_tokens(user_id: str) -> tuple[str, str]:
+        """Mints a fresh (access_token, refresh_token) pair for a user.
+
+        The single place all three Trench token-issuing paths (login,
+        refresh, invitation-accept) go through, so a future change to how
+        tokens are minted only has one call site to update.
+        """
+        return create_access_token(user_id), create_refresh_token(user_id)
+
     @classmethod
     async def create_session(
         cls, db: AsyncSession, id_token: str
@@ -154,7 +164,7 @@ class AuthService:
         user = await UserService.get_by_email(db, claims["email"])
         if user is None:
             raise _NOT_REGISTERED
-        return user, create_access_token(user.id), create_refresh_token(user.id)
+        return user, *cls.issue_tokens(user.id)
 
     @staticmethod
     async def resolve_access_token(db: AsyncSession, token: str | None) -> User:
@@ -211,7 +221,7 @@ class AuthService:
         if user is None or not user.is_active:
             raise _UNAUTHENTICATED
 
-        return user, create_access_token(user.id), create_refresh_token(user.id)
+        return user, *AuthService.issue_tokens(user.id)
 
     @classmethod
     async def delete_account(
