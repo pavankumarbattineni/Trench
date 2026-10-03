@@ -1,5 +1,7 @@
 """Thin wrapper around the Firebase Admin SDK -- no Trench business logic here."""
 
+import base64
+import json
 import logging
 from functools import lru_cache
 
@@ -26,7 +28,9 @@ _GENUINE_WRONG_CREDENTIALS = "INVALID_LOGIN_CREDENTIALS"
 @lru_cache
 def get_firebase_app() -> firebase_admin.App:
     settings = get_settings()
-    cred = credentials.Certificate(settings.TRENCH_CONFIG.FIREBASE.credentials_path)
+    raw_json = base64.b64decode(settings.TRENCH_CONFIG.FIREBASE.credentials_json_base64)
+    cert_info = json.loads(raw_json)
+    cred = credentials.Certificate(cert_info)
     return firebase_admin.initialize_app(cred)
 
 

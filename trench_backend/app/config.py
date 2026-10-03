@@ -40,7 +40,17 @@ class EncryptionConfig(BaseModel):
 
 
 class FirebaseConfig(BaseModel):
-    credentials_path: str
+    # The service-account key's raw file contents (Project settings >
+    # Service accounts > Generate new private key), base64-encoded and
+    # pasted directly into this config rather than kept as a separate
+    # file on disk -- no environment this app runs in should depend on a
+    # local file outside the repo existing at a specific path. Base64,
+    # not plain JSON: the key's PEM-formatted private_key field is
+    # multi-line, and a raw newline (escaped or not) inside a single
+    # quoted .env value is exactly the kind of thing a naive .env/JSON
+    # parse can silently mangle; base64 has no characters either layer
+    # treats specially, so there's nothing to misparse.
+    credentials_json_base64: str
     # Firebase's public Web API key (Project settings > General), NOT a
     # secret like the Admin SDK's service-account credentials -- it's
     # required to call the Identity Toolkit REST API's

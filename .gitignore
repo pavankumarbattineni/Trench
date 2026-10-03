@@ -1,6 +1,5 @@
 # Reference-only files — never commit
 frontend.html
-trench-e4b2f-firebase-adminsdk-fbsvc-acc908edf9.json
 
 # Python
 __pycache__/

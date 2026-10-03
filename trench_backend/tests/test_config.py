@@ -8,4 +8,4 @@ def test_settings_parse_trench_config_from_env():
     assert config.DB.database == "trench"
     assert config.DB.url.startswith("postgresql+asyncpg://")
     assert config.JWT.algorithm == "HS256"
-    assert config.FIREBASE.credentials_path.endswith(".json")
+    assert config.FIREBASE.credentials_json_base64
