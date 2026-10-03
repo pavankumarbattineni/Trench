@@ -46,8 +46,9 @@ async def upload_document(
 
     Raises:
         HTTPException: 422 on an invalid file; 403 if the free-tier
-            document limit is reached and no Pinecone BYOK credential is
-            set; 409 if the user already has a document pending/processing.
+            document limit is reached (see DocumentService.upload_document
+            for the legacy Pinecone-credential exception); 409 if the user
+            already has a document pending/processing.
     """
     content = await file.read()
     return await DocumentService.upload_document(

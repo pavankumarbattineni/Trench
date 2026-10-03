@@ -308,7 +308,10 @@ class Credential(BaseModel):
         nullable=True,
         index=True,
     )
-    # openai_llm | anthropic_llm | gemini_llm | pinecone
+    # openai_llm | anthropic_llm | gemini_llm -- "pinecone" is legacy-only,
+    # no longer in VALID_PROVIDER_TYPES, but a pre-existing row with it may
+    # still exist and remains functional (see
+    # DocumentService._enforce_free_tier_limit).
     provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
     encrypted_credential: Mapped[str] = mapped_column(Text, nullable=False)
     set_by_user_id: Mapped[uuid.UUID | None] = mapped_column(

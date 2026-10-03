@@ -20,6 +20,14 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { getErrorMessage } from "@/lib/errors";
 import { PROVIDER_LABELS, PROVIDER_TYPES, type ProviderType } from "@/lib/credentials";
 
+/** Falls back to the raw provider_type for a legacy row whose type is no
+ * longer in PROVIDER_LABELS (e.g. a pre-existing "pinecone" credential --
+ * removed from the addable list, but an old row can still exist and
+ * remains deletable). */
+function providerLabel(providerType: string): string {
+  return PROVIDER_LABELS[providerType as ProviderType] ?? providerType;
+}
+
 interface ApiKeyManagerCopy {
   savedToast: (label: string) => string;
   deletedToast: (label: string) => string;
@@ -119,7 +127,7 @@ export function ApiKeyManager({
               <KeyRound className="size-4 shrink-0 text-muted-foreground" />
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium">
-                  {PROVIDER_LABELS[credential.provider_type]}
+                  {providerLabel(credential.provider_type)}
                 </p>
                 <p className="font-mono text-xs text-muted-foreground">
                   {credential.masked_preview}
@@ -128,7 +136,7 @@ export function ApiKeyManager({
               <Button
                 variant="ghost"
                 size="icon-sm"
-                aria-label={copy.deleteAriaLabel(PROVIDER_LABELS[credential.provider_type])}
+                aria-label={copy.deleteAriaLabel(providerLabel(credential.provider_type))}
                 onClick={() => deleteTarget.request(credential.provider_type)}
               >
                 <Trash2 className="size-4" />
@@ -201,7 +209,7 @@ export function ApiKeyManager({
         onOpenChange={(open) => !open && deleteTarget.clear()}
         title={copy.deleteDialogTitle}
         description={
-          deleteTarget.target ? copy.deleteDialogDescription(PROVIDER_LABELS[deleteTarget.target]) : ""
+          deleteTarget.target ? copy.deleteDialogDescription(providerLabel(deleteTarget.target)) : ""
         }
         confirmLabel="Remove"
         isPending={deleteCredential.isPending}

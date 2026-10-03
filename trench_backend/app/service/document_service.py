@@ -93,10 +93,12 @@ class DocumentService:
 
         Raises:
             HTTPException: 422 on an invalid file; 403 if the free-tier
-                limit is reached and the user has no Pinecone BYOK
-                credential; 409 if the user already has a document
-                pending/processing; 502 if the storage backend rejects
-                the write.
+                limit is reached (a personal Pinecone BYOK credential lifts
+                it, but that provider_type can no longer be added via the
+                API -- see VALID_PROVIDER_TYPES -- so this only still
+                applies to a pre-existing credential row); 409 if the user
+                already has a document pending/processing; 502 if the
+                storage backend rejects the write.
         """
         mime_type = validate_upload(filename, content)
         content_hash = hashlib.sha256(content).hexdigest()
@@ -218,8 +220,7 @@ class DocumentService:
         if not has_own_pinecone:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
-                "You've used all 5 free documents. Delete an existing one "
-                "to upload another.",
+                "You've reached the 5-document free limit.",
             )
 
     @staticmethod
