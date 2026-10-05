@@ -8,8 +8,7 @@ Accessed through this one static method so swapping providers later
 (a different hosted reranker, or a local cross-encoder) never touches
 the retrieval pipeline that calls it -- only this module's internals
 would change. Chosen over a local cross-encoder (sentence-transformers +
-torch) specifically to avoid that dependency's weight; see
-docs/superpowers/specs/2026-10-01-agentic-rag-jev-architecture.md.
+torch) specifically to avoid that dependency's weight.
 """
 
 from functools import lru_cache
@@ -36,6 +35,12 @@ class RerankerService:
         """Returns up to `top_k` of `chunks`, reordered by Cohere's
         relevance scoring for `query`. Returns [] unchanged (no API call)
         if `chunks` is empty -- there's nothing to rerank.
+
+        Each returned chunk's "score" is overwritten with Cohere's own
+        relevance_score for it -- callers downstream (e.g.
+        assess_retrieval_sufficiency) read "score" expecting this
+        reranked relevance number, not the Pinecone hybrid-search score
+        the chunk carried in before reranking.
         """
         if not chunks:
             return []
@@ -45,4 +50,7 @@ class RerankerService:
             documents=[chunk["content"] for chunk in chunks],
             top_n=top_k,
         )
-        return [chunks[result.index] for result in response.results]
+        return [
+            {**chunks[result.index], "score": result.relevance_score}
+            for result in response.results
+        ]

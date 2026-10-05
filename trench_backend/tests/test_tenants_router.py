@@ -28,6 +28,25 @@ def _no_real_ingestion(monkeypatch):
     monkeypatch.setattr(DocumentService, "_run_ingestion", staticmethod(_noop))
 
 
+class _FakeVectorStore:
+    async def delete_by_prefix(self, *, namespace, prefix) -> None:
+        pass
+
+    async def delete_namespace(self, *, namespace) -> None:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _fake_vector_store(monkeypatch):
+    """Document deletion now always calls delete_by_prefix (see
+    DocumentService._delete_document_row) -- avoid a real Pinecone call in
+    the automated test suite."""
+    monkeypatch.setattr(
+        "app.service.document_service.get_vector_store",
+        lambda **kwargs: _FakeVectorStore(),
+    )
+
+
 def _claims(uid: str, email: str) -> dict:
     return {"uid": uid, "email": email, "iat": int(time.time())}
 
@@ -45,9 +64,7 @@ async def cleanup():
         # deleted. Invitation/tenant-scoped Credential rows cascade-delete
         # with their tenant, so no separate cleanup is needed for those.
         await session.execute(
-            update(User)
-            .where(User.email.like(f"%{PREFIX}%"))
-            .values(tenant_id=None)
+            update(User).where(User.email.like(f"%{PREFIX}%")).values(tenant_id=None)
         )
         await session.commit()
 
@@ -626,9 +643,7 @@ async def test_bulk_upload_rejects_the_entire_file_if_any_row_is_invalid(
     invitations are created for ANY row, valid or not."""
     owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
     valid_email = f"{PREFIX}-bulk-valid@{PREFIX}.example.com"
-    csv_content = (
-        f"email,role\n{valid_email},member\nnot-an-email,member\n"
-    ).encode()
+    csv_content = (f"email,role\n{valid_email},member\nnot-an-email,member\n").encode()
 
     with patch("app.service.invitation_service.send_email", new=AsyncMock()):
         response = await client.post(
@@ -728,9 +743,7 @@ def test_parse_bulk_rows_rejects_csv_missing_required_columns():
 def test_parse_bulk_rows_rejects_more_than_fifty_rows():
     from app.router.tenants import _parse_bulk_rows
 
-    rows = "email,role\n" + "".join(
-        f"user{i}@example.com,member\n" for i in range(51)
-    )
+    rows = "email,role\n" + "".join(f"user{i}@example.com,member\n" for i in range(51))
     with pytest.raises(ValueError, match="50"):
         _parse_bulk_rows("employees.csv", rows.encode())
 
@@ -738,9 +751,7 @@ def test_parse_bulk_rows_rejects_more_than_fifty_rows():
 def test_parse_bulk_rows_accepts_exactly_fifty_rows():
     from app.router.tenants import _parse_bulk_rows
 
-    rows = "email,role\n" + "".join(
-        f"user{i}@example.com,member\n" for i in range(50)
-    )
+    rows = "email,role\n" + "".join(f"user{i}@example.com,member\n" for i in range(50))
     assert len(_parse_bulk_rows("employees.csv", rows.encode())) == 50
 
 

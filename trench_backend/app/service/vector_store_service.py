@@ -30,6 +30,29 @@ def company_namespace(tenant_id: uuid.UUID) -> str:
     return f"company:{tenant_id}"
 
 
+# How much weight the dense (semantic) vector gets relative to the sparse
+# (BM25 keyword) vector in Pinecone's combined dotproduct score -- applied
+# identically to documents at upsert time and to queries at query time (see
+# scale_hybrid), since hybrid search only makes sense when both sides were
+# scaled the same way.
+HYBRID_DENSE_WEIGHT = 0.7
+
+
+def scale_hybrid(
+    dense: list[float], sparse: SparseVector, alpha: float = HYBRID_DENSE_WEIGHT
+) -> tuple[list[float], SparseVector]:
+    """Scales a dense vector by `alpha` and a sparse vector's values by
+    `1 - alpha`, leaving the sparse vector's indices untouched -- the
+    standard convex-combination technique for weighting Pinecone's hybrid
+    dotproduct score toward dense or sparse retrieval."""
+    scaled_dense = [value * alpha for value in dense]
+    scaled_sparse: SparseVector = {
+        "indices": sparse["indices"],
+        "values": [value * (1 - alpha) for value in sparse["values"]],
+    }
+    return scaled_dense, scaled_sparse
+
+
 class VectorRecord:
     def __init__(
         self,
@@ -66,6 +89,10 @@ class VectorStoreProvider(Protocol):
 
     async def delete(self, *, namespace: str, ids: list[str]) -> None: ...
 
+    async def delete_by_prefix(self, *, namespace: str, prefix: str) -> None: ...
+
+    async def delete_namespace(self, *, namespace: str) -> None: ...
+
 
 class PineconeVectorStore:
     """Thin async-friendly wrapper -- the official `pinecone` client is
@@ -97,18 +124,21 @@ class PineconeVectorStore:
         return self._client.Index(self._index_name)
 
     async def upsert(self, *, namespace: str, records: list[VectorRecord]) -> None:
-        await asyncio.to_thread(
-            self._index.upsert,
-            vectors=[
+        vectors = []
+        for record in records:
+            scaled_dense, scaled_sparse = scale_hybrid(
+                record.dense_vector, record.sparse_vector
+            )
+            vectors.append(
                 {
                     "id": record.chunk_id,
-                    "values": record.dense_vector,
-                    "sparse_values": record.sparse_vector,
+                    "values": scaled_dense,
+                    "sparse_values": scaled_sparse,
                     "metadata": record.metadata,
                 }
-                for record in records
-            ],
-            namespace=namespace,
+            )
+        await asyncio.to_thread(
+            self._index.upsert, vectors=vectors, namespace=namespace
         )
 
     async def query(
@@ -119,10 +149,11 @@ class PineconeVectorStore:
         sparse_vector: SparseVector,
         top_k: int,
     ) -> list[ScoredChunk]:
+        scaled_dense, scaled_sparse = scale_hybrid(dense_vector, sparse_vector)
         response = await asyncio.to_thread(
             self._index.query,
-            vector=dense_vector,
-            sparse_vector=sparse_vector,
+            vector=scaled_dense,
+            sparse_vector=scaled_sparse,
             top_k=top_k,
             namespace=namespace,
             include_metadata=True,
@@ -138,6 +169,28 @@ class PineconeVectorStore:
 
     async def delete(self, *, namespace: str, ids: list[str]) -> None:
         await asyncio.to_thread(self._index.delete, ids=ids, namespace=namespace)
+
+    async def delete_by_prefix(self, *, namespace: str, prefix: str) -> None:
+        """Deletes every vector whose id starts with `prefix` -- used for
+        document deletion instead of trusting Document.chunk_count, which
+        can drift from what's actually in Pinecone (a failed/partial
+        ingestion, a retried upsert, etc). Pinecone has no server-side
+        "delete by prefix", so this lists matching ids (paginated, up to
+        1000 per page) and deletes each page's batch."""
+
+        def _list_and_delete() -> None:
+            for page_ids in self._index.list(
+                prefix=prefix, limit=1000, namespace=namespace
+            ):
+                if page_ids:
+                    self._index.delete(ids=page_ids, namespace=namespace)
+
+        await asyncio.to_thread(_list_and_delete)
+
+    async def delete_namespace(self, *, namespace: str) -> None:
+        await asyncio.to_thread(
+            self._index.delete, delete_all=True, namespace=namespace
+        )
 
 
 @lru_cache

@@ -103,8 +103,7 @@ class LlamaParseConfig(BaseModel):
 class CohereRerankerConfig(BaseModel):
     """Cohere's hosted Rerank API -- reranks already-retrieved (hybrid
     dense+sparse) chunks against the actual query (see
-    app/service/reranker_service.py and docs/superpowers/specs/2026-10-
-    01-agentic-rag-jev-architecture.md). Chosen over a local cross-encoder
+    app/service/reranker_service.py). Chosen over a local cross-encoder
     to avoid the torch/sentence-transformers dependency weight."""
 
     api_key: str
@@ -121,17 +120,6 @@ class SMTPConfig(BaseModel):
     password: str
     from_address: str
     use_tls: bool = True
-
-
-class TypeSafeConfig(BaseModel):
-    """TypeSafe/JEV decision-model access -- optional and unset until a
-    real API key exists (see docs/superpowers/specs/2026-10-01-agentic-
-    rag-jev-architecture.md). Every JevService call falls back to a
-    documented heuristic while this is unset ("stub mode"), so its
-    absence from .env is never a startup error, unlike the other
-    required TRENCH_CONFIG sections."""
-
-    api_key: str | None = None
 
 
 class TrenchConfig(BaseModel):
@@ -155,7 +143,6 @@ class TrenchConfig(BaseModel):
     COHERE_RERANKER: CohereRerankerConfig
     GEMINI: GeminiConfig
     SMTP: SMTPConfig
-    TYPESAFE: TypeSafeConfig = TypeSafeConfig()
 
 
 class Settings(BaseSettings):

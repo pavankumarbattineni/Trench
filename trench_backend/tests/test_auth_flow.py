@@ -1,6 +1,6 @@
 import time
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -11,6 +11,22 @@ from app.database.session import async_session_factory
 
 TEST_FIREBASE_UID = "test-firebase-uid-1"
 TEST_EMAIL = "test.user@example.com"
+
+
+class _FakeVectorStore:
+    def __init__(self) -> None:
+        self.delete_namespace = AsyncMock()
+
+
+@pytest.fixture(autouse=True)
+def _fake_vector_store(monkeypatch):
+    """delete_account now best-effort wipes the caller's personal Pinecone
+    namespace -- avoid a real Pinecone call in the automated test suite."""
+    fake = _FakeVectorStore()
+    monkeypatch.setattr(
+        "app.service.auth_service.get_vector_store", lambda **kwargs: fake
+    )
+    return fake
 
 
 def _fake_claims(
@@ -258,9 +274,7 @@ async def test_users_me_requires_authentication(client: AsyncClient):
 async def test_users_me_returns_profile_after_owner_signup(client: AsyncClient):
     access_token = await _signup_owner_and_get_token(client)
 
-    response = await client.get(
-        "/api/v1/users/me", headers=_auth_headers(access_token)
-    )
+    response = await client.get("/api/v1/users/me", headers=_auth_headers(access_token))
     assert response.status_code == 200
     assert response.json()["email"] == TEST_EMAIL
     assert response.json()["tenant"]["role"] == "owner"

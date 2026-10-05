@@ -18,9 +18,11 @@ TEST_EMAIL_PREFIX = "test-ingestion"
 class _FakeVectorStore:
     def __init__(self) -> None:
         self.upserted: list[tuple[str, int]] = []
+        self.records: list = []
 
     async def upsert(self, *, namespace, records) -> None:
         self.upserted.append((namespace, len(records)))
+        self.records.extend(records)
 
     async def delete(self, *, namespace, ids) -> None:
         pass
@@ -91,14 +93,17 @@ def _fake_vector_store(monkeypatch):
 def _fake_embeddings(monkeypatch):
     """Avoids real Gemini API calls in the automated test suite -- embedding
     quality itself is exercised separately (see manual verification)."""
+    captured_calls: list[list[str]] = []
 
     async def _fake_embed_texts(texts: list[str]) -> list[list[float]]:
+        captured_calls.append(texts)
         return [[0.0] * EmbeddingService.DIMENSIONS for _ in texts]
 
     monkeypatch.setattr(
         "app.service.document_ingestion_service.EmbeddingService.embed_texts",
         _fake_embed_texts,
     )
+    return captured_calls
 
 
 @pytest.mark.asyncio
@@ -121,6 +126,33 @@ async def test_process_marks_document_completed_and_increments_usage(tmp_path):
         )
         uploaded_count = counter_result.scalar_one()
         assert uploaded_count == 1
+
+
+@pytest.mark.asyncio
+async def test_process_embeds_contextualized_text_but_stores_raw_text_as_metadata(
+    tmp_path, _fake_vector_store, _fake_embeddings
+):
+    async with async_session_factory() as session:
+        document = await _make_document(
+            session, "heading", content_hash=f"{'d':0<64}"[:64]
+        )
+        full_path = tmp_path / document.storage_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(
+            b"# Refunds\n\nRefunds take 5 business days to process once approved."
+        )
+
+        await DocumentIngestionService.process(session, document.id)
+
+    assert len(_fake_vector_store.records) == 1
+    record = _fake_vector_store.records[0]
+    assert record.metadata["heading_path"] == "Refunds"
+    assert record.metadata["index_version"] == 2
+    raw_text = record.metadata["text"]
+    assert not raw_text.startswith("notes.txt")
+
+    [embedded_texts] = _fake_embeddings
+    assert embedded_texts == [f"notes.txt\nRefunds\n\n{raw_text}"]
 
 
 @pytest.mark.asyncio

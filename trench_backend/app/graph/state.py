@@ -16,11 +16,6 @@ class AgentState(TypedDict):
     stream_id: str
     query: str
     knowledge_type: str
-    # Populated by check_input_guardrail -- on by default for every turn
-    # (architecture doc §10). input_guardrail_flagged distinguishes *why*
-    # access_denied is set here from an authorization denial, even though
-    # persist's status logic treats both as "the turn stopped early."
-    input_guardrail_flagged: bool
     # Populated by check_output_guardrail -- every redaction reason, for
     # observability (see Task 5/6's tracing work); empty when nothing
     # was flagged.
@@ -37,14 +32,35 @@ class AgentState(TypedDict):
     # reformulate loop entirely when there is nothing to retrieve.
     knowledge_base_empty: bool
     # The query actually used for retrieval -- the raw query, or an
-    # LLM-condensed standalone rewrite when prior turns exist.
+    # LLM-condensed standalone rewrite when prior turns exist. Mutated by
+    # reformulate_query on each retry.
     condensed_query: str
+    # Set once by condense_query and never touched again -- what
+    # condensed_query *started* this turn as, before any reformulate_
+    # query rewrite. reformulate_query always rewrites from this, never
+    # from condensed_query itself, so a second retry rewrites the
+    # original standalone question again rather than compounding drift
+    # onto an already-once-reformulated query (see app/graph/rag_graph.py).
+    original_condensed_query: str
     retrieved_chunks: list[dict[str, Any]]
+    # The highest-scoring attempt's retrieved_chunks across the retrieve/
+    # reformulate retry loop, tracked by assess_retrieval_sufficiency --
+    # generate() and build_citations() read this, not retrieved_chunks
+    # directly, so a later retry that scores worse than an earlier one
+    # never discards the better context (see app/graph/rag_graph.py).
+    best_retrieved_chunks: list[dict[str, Any]]
     # Populated by assess_retrieval_sufficiency -- gates the
     # retrieve/reformulate retry loop, capped at MAX_RETRIEVAL_ATTEMPTS
     # (see app/graph/rag_graph.py).
     retrieval_sufficient: bool
     retrieval_attempts: int
+    # The latest attempt's top rerank score (not best_retrieved_chunks'
+    # score, which tracks the best attempt so far, not necessarily the
+    # latest one) -- read by _route_after_sufficiency_check to skip
+    # straight to generate() when even the latest attempt scored below
+    # RETRIEVAL_SKIP_RETRY_BELOW, rather than spending a retry on a query
+    # that almost certainly has nothing relevant to find.
+    last_retrieval_top_score: float
     response: str
     citations: list[dict[str, Any]]
     messages: Annotated[list, add_messages]

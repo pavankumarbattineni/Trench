@@ -76,6 +76,16 @@ class LLMClientService:
         )
 
     @staticmethod
+    async def resolve_platform_default(db: AsyncSession) -> ResolvedModel:
+        """The platform-owned Groq default model/key -- for internal
+        rewrite steps (condense_query, reformulate_query) that must never
+        consume the user's own selected model or BYOK credential just to
+        rewrite a search query, and must never fail the turn over a
+        missing BYOK credential for what is only an optimization step."""
+        default_model = await ProviderCatalogService.get_default(db)
+        return LLMClientService._groq_resolved(default_model)
+
+    @staticmethod
     async def resolve_for_user(db: AsyncSession, user: User) -> ResolvedModel:
         default_model = await ProviderCatalogService.get_default(db)
         model_id = user.model_id or default_model.id

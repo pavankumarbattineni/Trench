@@ -15,6 +15,7 @@ Password flow, proves identity via a custom emailed token).
 """
 
 import hashlib
+import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 
@@ -25,8 +26,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database.models import PasswordResetToken, Tenant, User
+from app.service.embedding_service import EmbeddingService
 from app.service.tenant_service import TenantService
 from app.service.user_service import UserService
+from app.service.vector_store_service import get_vector_store, personal_namespace
 from app.utils import firebase as firebase_utils
 from app.utils.email import send_email
 from app.utils.security import (
@@ -36,6 +39,8 @@ from app.utils.security import (
     decode_access_token,
     decode_refresh_token,
 )
+
+logger = logging.getLogger(__name__)
 
 RESET_TOKEN_EXPIRY = timedelta(hours=1)
 
@@ -285,6 +290,23 @@ class AuthService:
         if await TenantService.get_owned_tenant(db, current_user) is not None:
             raise _OWNER_CANNOT_DELETE_ACCOUNT
 
+        # Best-effort: a failed namespace wipe never blocks account
+        # deletion (same rationale as the storage-delete failure handling
+        # elsewhere -- one orphaned namespace is far smaller a problem
+        # than an account the user can never delete). Logged so it can be
+        # cleaned up by hand.
+        try:
+            vector_store = get_vector_store(dimensions=EmbeddingService.DIMENSIONS)
+            await vector_store.delete_namespace(
+                namespace=personal_namespace(current_user.id)
+            )
+        except Exception:
+            logger.error(
+                "Failed to delete personal Pinecone namespace on account "
+                "deletion | user_id=%s",
+                current_user.id,
+            )
+
         firebase_uid = claims["uid"]
         await db.delete(current_user)
         await db.commit()
@@ -322,9 +344,7 @@ class ChangePasswordService:
             user.email, current_password
         )
         if not verified:
-            raise cls.IncorrectCurrentPasswordError(
-                "Current password is incorrect"
-            )
+            raise cls.IncorrectCurrentPasswordError("Current password is incorrect")
         firebase_utils.set_user_password(user.email, new_password)
 
 

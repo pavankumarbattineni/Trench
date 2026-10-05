@@ -18,6 +18,7 @@ from app.schemas.chat import (
     StreamStatusResponse,
 )
 from app.service.chat_service import ChatService
+from app.service.rate_limit_service import require_chat_rate_limit
 from app.service.thread_service import ThreadService
 from app.utils.sse import sse_generator
 
@@ -32,7 +33,7 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 async def send_message(
     thread_id: str,
     body: ChatMessageRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_chat_rate_limit),
     db: AsyncSession = Depends(get_db),
 ) -> ChatMessageAcceptedResponse:
     """Accepts a query and starts the LangGraph run in the background.
@@ -46,7 +47,9 @@ async def send_message(
             the authenticated user.
         body: The user's query and which knowledge base to answer from
             ("personal" or "company").
-        current_user: The authenticated user sending the message.
+        current_user: The authenticated user sending the message, resolved
+            via require_chat_rate_limit (which also caps them to
+            MAX_REQUESTS_PER_WINDOW sends per WINDOW_SECONDS).
         db: An active async SQLAlchemy session.
 
     Returns:
@@ -57,7 +60,8 @@ async def send_message(
     Raises:
         HTTPException: 404 if the thread doesn't exist or isn't owned by
             the caller; 409 if the caller already has a query
-            pending/running in any of their threads.
+            pending/running in any of their threads; 429 if the caller
+            has exceeded the chat rate limit.
     """
     thread = await ThreadService.get_owned(
         db, user_id=current_user.id, thread_id=uuid.UUID(thread_id)

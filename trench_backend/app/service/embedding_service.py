@@ -9,8 +9,17 @@ inside one Pinecone namespace.
 Matryoshka-style truncation via `output_dimensionality` -- 768 is used here
 to keep Pinecone storage/cost down while still comfortably exceeding
 `text-embedding-004`'s fixed 768 dims in retrieval quality.
+
+Per Google's docs (ai.google.dev/gemini-api/docs/embeddings),
+gemini-embedding-001 only returns L2-normalized vectors at the default
+3072 dimensions -- at a truncated output_dimensionality (768, here) the
+API returns raw, *unnormalized* values, so every vector (document and
+query alike) is normalized manually before use. Pinecone's "dotproduct"
+metric needs unit-length dense vectors to behave like cosine similarity;
+skipping this silently biases retrieval toward longer vectors.
 """
 
+import math
 from functools import lru_cache
 
 from google import genai
@@ -20,6 +29,13 @@ from app.config import get_settings
 
 MODEL_NAME = "gemini-embedding-001"
 DIMENSIONS = 768
+
+
+def _l2_normalize(vector: list[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0:
+        return vector
+    return [value / norm for value in vector]
 
 
 @lru_cache
@@ -43,7 +59,7 @@ class EmbeddingService:
                 output_dimensionality=DIMENSIONS,
             ),
         )
-        return [embedding.values for embedding in response.embeddings]
+        return [_l2_normalize(embedding.values) for embedding in response.embeddings]
 
     @staticmethod
     async def embed_query(text: str) -> list[float]:
@@ -55,4 +71,4 @@ class EmbeddingService:
                 output_dimensionality=DIMENSIONS,
             ),
         )
-        return response.embeddings[0].values
+        return _l2_normalize(response.embeddings[0].values)

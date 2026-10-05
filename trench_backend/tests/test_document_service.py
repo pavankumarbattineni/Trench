@@ -35,6 +35,29 @@ def _local_storage(tmp_path: Path):
     )
 
 
+class _FakeVectorStore:
+    def __init__(self) -> None:
+        self.deleted_by_prefix: list[tuple[str, str]] = []
+
+    async def delete_by_prefix(self, *, namespace, prefix) -> None:
+        self.deleted_by_prefix.append((namespace, prefix))
+
+    async def delete_namespace(self, *, namespace) -> None:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _fake_vector_store(monkeypatch):
+    """Document deletion now always calls delete_by_prefix (see
+    DocumentService._delete_document_row) -- avoid real Pinecone calls in
+    the automated test suite, same as test_document_ingestion_service.py."""
+    fake = _FakeVectorStore()
+    monkeypatch.setattr(
+        "app.service.document_service.get_vector_store", lambda **kwargs: fake
+    )
+    return fake
+
+
 @pytest.fixture(autouse=True)
 def _no_real_ingestion(monkeypatch):
     """upload_document fires a real background asyncio task for ingestion
@@ -215,6 +238,36 @@ async def test_delete_removes_row_and_file(tmp_path):
             await DocumentService.get_document(
                 session, user=user, document_id=document.id
             )
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_vectors_by_id_prefix_not_chunk_count(
+    tmp_path, _fake_vector_store
+):
+    """chunk_count can drift from what's actually in Pinecone (a partial
+    or retried ingestion) -- delete must wipe by id prefix regardless of
+    chunk_count, not reconstruct f"{id}:{index}" for range(chunk_count)."""
+    async with async_session_factory() as session:
+        user = await _make_user(session, "delete-prefix")
+
+        with _local_storage(tmp_path):
+            document = await DocumentService.upload_document(
+                session, user=user, filename="to-delete.txt", content=b"temporary"
+            )
+            document.status = "completed"
+            # Deliberately left at 0 (the ingestion that would set this
+            # never ran -- _no_real_ingestion stubs it out) to prove
+            # deletion doesn't gate on it.
+            document.chunk_count = 0
+            await session.commit()
+
+            await DocumentService.delete_document(
+                session, user=user, document_id=document.id
+            )
+
+        assert _fake_vector_store.deleted_by_prefix == [
+            (f"personal:{user.id}", f"{document.id}:")
+        ]
 
 
 @pytest.mark.asyncio
@@ -408,9 +461,10 @@ def _document(
 async def test_has_any_personal_documents_false_when_none_exist():
     async with async_session_factory() as session:
         user = await _make_user(session, "empty-personal")
-        assert await DocumentService.has_any_personal_documents(
-            session, user_id=user.id
-        ) is False
+        assert (
+            await DocumentService.has_any_personal_documents(session, user_id=user.id)
+            is False
+        )
 
 
 @pytest.mark.asyncio
@@ -426,9 +480,10 @@ async def test_has_any_personal_documents_true_once_one_completes():
             )
         )
         await session.commit()
-        assert await DocumentService.has_any_personal_documents(
-            session, user_id=user.id
-        ) is True
+        assert (
+            await DocumentService.has_any_personal_documents(session, user_id=user.id)
+            is True
+        )
 
 
 @pytest.mark.asyncio
@@ -447,9 +502,10 @@ async def test_has_any_personal_documents_ignores_pending_documents():
             )
         )
         await session.commit()
-        assert await DocumentService.has_any_personal_documents(
-            session, user_id=user.id
-        ) is False
+        assert (
+            await DocumentService.has_any_personal_documents(session, user_id=user.id)
+            is False
+        )
 
 
 @pytest.mark.asyncio
@@ -480,12 +536,18 @@ async def test_has_any_company_documents_is_scoped_to_the_tenant():
         )
         await session.commit()
 
-        assert await DocumentService.has_any_company_documents(
-            session, tenant_id=tenant.id
-        ) is False
-        assert await DocumentService.has_any_company_documents(
-            session, tenant_id=other_tenant.id
-        ) is True
+        assert (
+            await DocumentService.has_any_company_documents(
+                session, tenant_id=tenant.id
+            )
+            is False
+        )
+        assert (
+            await DocumentService.has_any_company_documents(
+                session, tenant_id=other_tenant.id
+            )
+            is True
+        )
 
         await session.delete(tenant)
         await session.delete(other_tenant)

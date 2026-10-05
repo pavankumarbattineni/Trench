@@ -1,5 +1,3 @@
-from unittest.mock import patch
-
 import pytest
 
 from app.graph.rag_graph import build_citations
@@ -18,7 +16,10 @@ def _chunk(chunk_id: str, content: str) -> dict:
 
 @pytest.mark.asyncio
 async def test_build_citations_returns_empty_list_for_no_retrieved_chunks():
-    state = {"retrieved_chunks": [], "response": "I don't have enough information."}
+    state = {
+        "best_retrieved_chunks": [],
+        "response": "I don't have enough information.",
+    }
 
     result = await build_citations(state, {})
 
@@ -26,92 +27,99 @@ async def test_build_citations_returns_empty_list_for_no_retrieved_chunks():
 
 
 @pytest.mark.asyncio
-async def test_stub_mode_keeps_every_retrieved_chunk_regardless_of_word_overlap():
-    """Without real JEV configured (the only mode this project currently
-    runs in -- TYPESAFE.api_key is unset), the word-overlap stub isn't
-    filtered on at all: it's unreliable specifically for answers that
-    *compute* something from the source (e.g. "8 x 64 = 512") rather than
-    quoting it, which scores low word-overlap despite being the genuine
-    source -- confirmed to silently drop real citations for that whole
-    class of question. Every retrieved chunk is kept instead, relying on
-    hybrid retrieval + Cohere rerank (already run before this node) for
-    relevance."""
+async def test_build_citations_returns_empty_list_when_response_has_no_markers():
     state = {
-        "retrieved_chunks": [
-            _chunk("a", "Priya Sharma is the project lead for Falcon."),
-            _chunk("b", "Bananas are a good source of potassium."),
-        ],
-        "response": "The project lead for Project Falcon is Priya Sharma.",
+        "best_retrieved_chunks": [_chunk("a", "Priya Sharma leads Project Falcon.")],
+        "response": "I don't have enough information to answer that.",
     }
 
-    with patch("app.graph.rag_graph.JevService.is_configured", return_value=False):
-        result = await build_citations(state, {})
+    result = await build_citations(state, {})
 
-    citation_ids = [c["chunk_id"] for c in result["citations"]]
-    assert citation_ids == ["a", "b"]
+    assert result["citations"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_citations_keeps_only_chunks_with_a_marker_in_the_response():
+    state = {
+        "best_retrieved_chunks": [
+            _chunk("cited", "Priya Sharma leads Project Falcon."),
+            _chunk("not-cited", "Bananas are a good source of potassium."),
+        ],
+        "response": "The project lead for Project Falcon is Priya Sharma [1].",
+    }
+
+    result = await build_citations(state, {})
+
+    assert [c["chunk_id"] for c in result["citations"]] == ["cited"]
+    assert result["citations"][0]["citation_number"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_citations_drops_an_out_of_range_hallucinated_marker():
+    """A "[n]" marker outside 1..len(chunks) means the model cited a
+    passage number nothing was ever put at -- dropped rather than raising
+    or guessing which real chunk it meant."""
+    state = {
+        "best_retrieved_chunks": [_chunk("only", "Priya Sharma leads Project Falcon.")],
+        "response": "Priya Sharma leads Project Falcon [1], per our records [7].",
+    }
+
+    result = await build_citations(state, {})
+
+    assert [c["chunk_id"] for c in result["citations"]] == ["only"]
+
+
+@pytest.mark.asyncio
+async def test_build_citations_deduplicates_a_repeated_marker():
+    state = {
+        "best_retrieved_chunks": [
+            _chunk("only", "Priya Sharma leads Project Falcon.")
+        ],
+        "response": (
+            "Priya Sharma leads Project Falcon [1]. She has led it since "
+            "2024 [1]."
+        ),
+    }
+
+    result = await build_citations(state, {})
+
+    assert len(result["citations"]) == 1
+    assert result["citations"][0]["chunk_id"] == "only"
+
+
+@pytest.mark.asyncio
+async def test_build_citations_orders_by_marker_number_not_mention_order():
+    state = {
+        "best_retrieved_chunks": [
+            _chunk("first", "Priya Sharma leads Project Falcon."),
+            _chunk("second", "The office has a rooftop garden."),
+        ],
+        "response": "The office has a rooftop garden [2], and Priya leads Falcon [1].",
+    }
+
+    result = await build_citations(state, {})
+
     assert [c["citation_number"] for c in result["citations"]] == [1, 2]
 
 
 @pytest.mark.asyncio
-async def test_configured_jev_still_filters_to_chunks_actually_used():
-    """Once a real JEV judge is configured, its per-chunk relevance
-    verdict is trusted and filtering applies as designed -- this is the
-    one mode where dropping unused chunks is reliable enough to do."""
+async def test_citation_number_matches_original_position_even_with_a_gap():
+    """citation_number equals the chunk's 1-based position in
+    best_retrieved_chunks -- the exact numbering generate() put in the
+    prompt -- never the position among only the cited survivors, so a
+    clicked "[2]" always opens the chunk generate() actually labeled [2]."""
     state = {
-        "retrieved_chunks": [
-            _chunk("used", "Priya Sharma is the project lead for Falcon."),
-            _chunk("unused", "Bananas are a good source of potassium."),
+        "best_retrieved_chunks": [
+            _chunk("not-cited-first", "Bananas are a good source of potassium."),
+            _chunk("cited-second", "Priya Sharma leads Project Falcon."),
+            _chunk("not-cited-third", "The office has a rooftop garden."),
         ],
-        "response": "The project lead for Project Falcon is Priya Sharma.",
+        "response": "Priya Sharma leads Project Falcon [2].",
     }
 
-    async def _fake_ask_noul(question, *, stub_fallback):
-        # Simulates a real JEV judge agreeing with the stub's own signal
-        # on this clearly-distinguishable fixture (real overlap vs. none)
-        # -- this test is about the filtering mechanism, not re-testing
-        # the stub heuristic's own accuracy.
-        return 1.0 if stub_fallback() >= 0.5 else 0.0
-
-    with (
-        patch("app.graph.rag_graph.JevService.is_configured", return_value=True),
-        patch("app.graph.rag_graph.JevService.ask_noul", side_effect=_fake_ask_noul),
-    ):
-        result = await build_citations(state, {})
-
-    citation_ids = {c["chunk_id"] for c in result["citations"]}
-    assert citation_ids == {"used"}
-
-
-@pytest.mark.asyncio
-async def test_citation_number_matches_original_position_even_after_filtering():
-    """citation_number must survive filtering as the chunk's position in
-    the ORIGINAL retrieved_chunks list (what generate() told the model to
-    cite as "[n]") -- not its position in the filtered survivors list,
-    which shifts as soon as an earlier chunk is dropped. The frontend
-    matches a clicked "[n]" marker to a chunk by this number, so a
-    mismatch here means clicking a citation opens the wrong source.
-    Exercised here with JEV configured, since stub mode no longer filters
-    at all (see test_stub_mode_keeps_every_retrieved_chunk...)."""
-    state = {
-        "retrieved_chunks": [
-            _chunk("dropped-first", "Bananas are a good source of potassium."),
-            _chunk("kept-second", "Priya Sharma is the project lead for Falcon."),
-            _chunk("dropped-third", "The office has a rooftop garden."),
-        ],
-        "response": "The project lead for Project Falcon is Priya Sharma.",
-    }
-
-    async def _fake_ask_noul(question, *, stub_fallback):
-        return 1.0 if stub_fallback() >= 0.5 else 0.0
-
-    with (
-        patch("app.graph.rag_graph.JevService.is_configured", return_value=True),
-        patch("app.graph.rag_graph.JevService.ask_noul", side_effect=_fake_ask_noul),
-    ):
-        result = await build_citations(state, {})
+    result = await build_citations(state, {})
 
     assert len(result["citations"]) == 1
     kept = result["citations"][0]
-    assert kept["chunk_id"] == "kept-second"
-    # Position 2 in the original list, not position 1 in the filtered one.
+    assert kept["chunk_id"] == "cited-second"
     assert kept["citation_number"] == 2

@@ -60,9 +60,25 @@ class DocumentIngestionService:
                 raw_bytes, document.mime_type, filename=document.document_name
             )
             pieces = ChunkingService.chunk(text)
+            # The embedded/sparse-encoded text is contextualized with the
+            # document name and heading path (e.g. "Refunds > Timelines")
+            # so retrieval can match a query against context a bare chunk
+            # wouldn't carry on its own; the Pinecone "text" metadata (what
+            # generate()/citations actually show the model/user) stays the
+            # raw chunk text, never this prefixed version.
+            embed_texts = [
+                "\n".join(
+                    line
+                    for line in (document.document_name, piece.heading_path)
+                    if line
+                )
+                + "\n\n"
+                + piece.text
+                for piece in pieces
+            ]
 
-            dense_vectors = await EmbeddingService.embed_texts(pieces)
-            sparse_vectors = SparseEncodingService.encode_documents(pieces)
+            dense_vectors = await EmbeddingService.embed_texts(embed_texts)
+            sparse_vectors = SparseEncodingService.encode_documents(embed_texts)
 
             if pieces:
                 namespace = (
@@ -87,7 +103,9 @@ class DocumentIngestionService:
                                 "document_id": str(document.id),
                                 "document_name": document.document_name,
                                 "chunk_index": index,
-                                "text": piece,
+                                "text": piece.text,
+                                "heading_path": piece.heading_path,
+                                "index_version": 2,
                             },
                         )
                         for index, (piece, dense_vector, sparse_vector) in enumerate(
@@ -109,9 +127,7 @@ class DocumentIngestionService:
             if document.knowledge_type == "personal":
                 await DocumentIngestionService._increment_usage(db, document.user_id)
         except Exception as exc:
-            logger.exception(
-                "Document ingestion failed | document_id=%s", document_id
-            )
+            logger.exception("Document ingestion failed | document_id=%s", document_id)
             # The flush above may have already broken this session (e.g. a
             # StaleDataError because the row was deleted mid-ingestion, via
             # a concurrent delete or a cascading account deletion) -- roll

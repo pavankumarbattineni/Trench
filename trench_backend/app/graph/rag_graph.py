@@ -1,8 +1,7 @@
 """The static LangGraph RAG workflow.
 
     START
-      -> check_input_guardrail --(flagged)--> access_denied --> persist --> END
-                                --(clean)--> load_thread_state
+      -> load_thread_state
       -> validate_knowledge_access --(denied)--> access_denied --> persist --> END
                                     --(scope has zero documents)--> generate
                                     --(authorized)--> condense_query
@@ -16,19 +15,35 @@
       -> persist
       -> END
 
-Both guardrails are on by default for every turn (architecture doc §10).
+There is no input guardrail -- removed; see GuardrailService's own
+docstring for why what remains (check_output) is a different category of
+check. access_denied is still reachable, from validate_knowledge_access's
+own authorization failures.
+
+check_output_guardrail is on by default for every turn.
 
 The retrieve/reformulate loop is hard-capped at MAX_RETRIEVAL_ATTEMPTS
-total retrieval attempts (architecture doc §10) -- never unbounded.
+total retrieval attempts -- never unbounded.
 
 Compiled once at import time (stateless aside from the checkpointer) and
 reused across requests; per-request dependencies (the DB session, the
 requesting user, the SSE stream_id) are threaded through via
 `config["configurable"]`, LangGraph's documented mechanism for this,
 rather than being rebuilt into the graph itself.
+
+No node here wraps its own Pinecone or Cohere call in a try/except --
+deliberately. ChatService._run_generation already wraps the entire
+ainvoke() of this graph in one outer try/except: any uncaught exception
+from any node (a Pinecone timeout in hybrid_retrieve, a Cohere error in
+RerankerService.rerank, anything else) is caught there, persisted as the
+ChatHistory row's status="failed" with the exception's message as
+content, and streamed to the client as a {"type": "error"} event. Adding
+a second, narrower try/except around an individual call here would only
+duplicate that handling with a different message, not add any real
+protection.
 """
 
-import asyncio
+import logging
 import re
 import uuid
 
@@ -39,27 +54,55 @@ from app.database.models import ChatHistory
 from app.graph.state import AgentState
 from app.service.document_service import DocumentService
 from app.service.guardrail_service import GuardrailService
-from app.service.jev_service import JevService
 from app.service.llm_client_service import LLMClientService
 from app.service.reranker_service import RerankerService
 from app.service.retrieval_service import KnowledgeScope, RetrievalService
 from app.utils.stream_manager import stream_manager
 
+logger = logging.getLogger(__name__)
+
 # Hard cap on the retrieval-sufficiency retry loop: the initial attempt
 # plus this many retries, after which generation proceeds with the best
-# available context rather than looping forever (architecture doc §10).
-MAX_RETRIEVAL_ATTEMPTS = 3
+# attempt seen so far (see assess_retrieval_sufficiency's best_retrieved_
+# chunks tracking) rather than looping forever.
+MAX_RETRIEVAL_ATTEMPTS = 2
 
-# A Noul-style probability at or above this counts as "sufficient" --
-# applies identically whether the score came from the stub heuristic or
-# (once configured) real JEV, since both return a 0.0-1.0 probability.
-_SUFFICIENCY_THRESHOLD = 0.5
+# If the latest attempt's top rerank score is below even this (well under
+# RETRIEVAL_SUFFICIENCY_MIN_RERANK_SCORE), the namespace almost certainly
+# has nothing relevant at all -- reformulating the same unanswerable
+# query is very unlikely to help, so _route_after_sufficiency_check skips
+# straight to generate() instead of spending a retry on it. Starting
+# point only, meant to be tuned against real traffic.
+RETRIEVAL_SKIP_RETRY_BELOW = 0.05
+
+# How many of the most recent prior messages (user+assistant turns,
+# excluding the current query) are sent as conversation history to both
+# condense_query and generate() -- an unbounded history would eventually
+# make every turn resend the whole conversation, growing token cost and
+# latency without bound as a thread gets long.
+MAX_HISTORY_MESSAGES = 10
+
+# The top chunk's Cohere rerank relevance score (see RerankerService.rerank
+# -- "score" on a retrieved chunk is that relevance score, not Pinecone's
+# hybrid-search score) must be at least this high to count as "sufficient"
+# context to answer from. Not derived from any formal calibration --
+# starting point only, meant to be tuned against real traffic.
+RETRIEVAL_SUFFICIENCY_MIN_RERANK_SCORE = 0.3
+
+# Pinecone (and then Cohere's rerank) almost always return *something*
+# from a non-empty namespace, even when nothing retrieved is genuinely
+# relevant to the query -- a non-empty best_retrieved_chunks is therefore
+# not by itself evidence the question is answerable from it. A chunk must
+# clear this (much lower than the sufficiency bar above) rerank score to
+# count as usable context at all; below it, generate() treats the turn as
+# having no relevant context, same as an empty list. Starting point only,
+# meant to be tuned against real traffic.
+MIN_USABLE_RERANK_SCORE = 0.1
 
 # hybrid_retrieve pulls this many hybrid (dense+sparse) candidates from
 # Pinecone, then RerankerService narrows them down to _FINAL_CHUNK_COUNT
 # -- reranking needs a wider pool to actually improve on Pinecone's own
-# retrieval-time ordering (architecture doc §3: "the top ~20-50 hybrid
-# results").
+# retrieval-time ordering.
 _RETRIEVAL_CANDIDATE_COUNT = 25
 _FINAL_CHUNK_COUNT = 8
 
@@ -201,27 +244,6 @@ def _config_get(config: RunnableConfig, key: str):
         ) from exc
 
 
-async def check_input_guardrail(state: AgentState, config: RunnableConfig) -> dict:
-    """On by default for every turn (architecture doc §10) -- the very
-    first node, so a flagged query never reaches authorization, retrieval,
-    or generation at all. Routes to the same access_denied terminal node
-    as an authorization failure, but with its own denial_reason text so
-    the two are never confused with each other (architecture doc §5)."""
-    flagged, reason = await GuardrailService.check_input(state["query"])
-    return {
-        "input_guardrail_flagged": flagged,
-        # Reused by persist's status logic (failed vs completed) exactly
-        # like an authorization denial -- both are "the turn stopped
-        # early," just for different reasons (denial_reason carries which).
-        "access_denied": flagged,
-        "denial_reason": reason,
-    }
-
-
-def _route_after_input_guardrail(state: AgentState) -> str:
-    return "access_denied" if state["input_guardrail_flagged"] else "load_thread_state"
-
-
 async def load_thread_state(state: AgentState, config: RunnableConfig) -> dict:
     """Placeholder for any per-turn thread-state hydration beyond what the
     checkpointer already restores automatically (prior `messages`). Kept as
@@ -294,29 +316,41 @@ async def access_denied_node(state: AgentState, config: RunnableConfig) -> dict:
 
 
 async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
+    """Sets both condensed_query and original_condensed_query to the same
+    value -- the raw query standalone-rewritten against recent history, or
+    the raw query itself if there's no history or rewriting fails.
+    original_condensed_query is never touched again after this node; it's
+    what reformulate_query rewrites from on every retry (see its own
+    docstring), while condensed_query is what each retry attempt mutates.
+    """
     db = _config_get(config, "db")
-    user = _config_get(config, "user")
     prior_messages = state.get("messages", [])
     if len(prior_messages) <= 1:
-        return {"condensed_query": state["query"]}
+        return {
+            "condensed_query": state["query"],
+            "original_condensed_query": state["query"],
+        }
 
     history_text = "\n".join(
         f"{getattr(m, 'type', 'user')}: {getattr(m, 'content', '')}"
-        for m in prior_messages[:-1]
+        for m in prior_messages[:-1][-MAX_HISTORY_MESSAGES:]
     )
     try:
-        resolved = await LLMClientService.resolve_for_knowledge(
-            db,
-            user,
-            knowledge_type=state["knowledge_type"],
-            tenant_id=uuid.UUID(state["tenant_id"]) if state.get("tenant_id") else None,
-        )
-    except LLMClientService.MissingCredentialError:
+        # The platform default Groq model/key, never the user's selected
+        # model or BYOK credential -- condensing is a cheap, internal
+        # rewrite step, not worth spending a BYOK provider's quota/cost
+        # on, and must not fail the turn just because a credential is
+        # missing (see resolve_platform_default's own docstring).
+        resolved = await LLMClientService.resolve_platform_default(db)
+    except Exception:
         # Not fatal here -- condensing is an optimization, not the actual
-        # generation step. Skip it and use the raw query; `generate` will
-        # hit the same missing-credential condition and surface it to the
-        # user properly.
-        return {"condensed_query": state["query"]}
+        # generation step. Skip it and use the raw query; `generate` still
+        # resolves the user's real model/credential separately and will
+        # surface any real problem there.
+        return {
+            "condensed_query": state["query"],
+            "original_condensed_query": state["query"],
+        }
     rewrite_prompt = (
         "Given this conversation history and a follow-up question, rewrite "
         "the follow-up as a standalone question. Reply with ONLY the "
@@ -330,7 +364,11 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
         messages=[{"role": "user", "content": rewrite_prompt}],
     ):
         condensed += delta
-    return {"condensed_query": condensed.strip() or state["query"]}
+    final_query = condensed.strip() or state["query"]
+    return {
+        "condensed_query": final_query,
+        "original_condensed_query": final_query,
+    }
 
 
 async def hybrid_retrieve(state: AgentState, config: RunnableConfig) -> dict:
@@ -364,69 +402,98 @@ async def hybrid_retrieve(state: AgentState, config: RunnableConfig) -> dict:
     return {"retrieved_chunks": reranked}
 
 
-def _sufficiency_stub_heuristic(retrieved_chunks: list[dict]) -> float:
-    """Stub fallback for JevService.ask_noul while TypeSafe/JEV isn't
-    configured -- the top retrieved chunk's own hybrid-search score,
-    treated as a stand-in probability. Documented placeholder, not a
-    tuned relevance model; replaced by the real JEV call once available."""
-    if not retrieved_chunks:
+def _top_rerank_score(chunks: list[dict]) -> float:
+    if not chunks:
         return 0.0
-    return max(chunk["score"] for chunk in retrieved_chunks)
+    return max(chunk["score"] for chunk in chunks)
 
 
 async def assess_retrieval_sufficiency(
     state: AgentState, config: RunnableConfig
 ) -> dict:
-    """Asks whether the just-retrieved context actually answers the
-    condensed query -- the self-assessment point that decides whether the
+    """Decides whether this attempt's retrieved context is good enough to
+    answer from -- the self-assessment point that decides whether the
     retrieval-reformulate loop should run again (see _route_after_
-    sufficiency_check) or proceed to generation."""
-    score = await JevService.ask_noul(
-        "Does this retrieved context contain enough information to "
-        "answer the query?",
-        stub_fallback=lambda: _sufficiency_stub_heuristic(state["retrieved_chunks"]),
+    sufficiency_check) or proceed to generation. "Good enough" is the top
+    chunk's Cohere rerank score clearing RETRIEVAL_SUFFICIENCY_MIN_RERANK_
+    SCORE; an empty chunk list is never sufficient.
+
+    Also tracks best_retrieved_chunks across the retry loop: a later
+    reformulated attempt is not guaranteed to score higher than an
+    earlier one, so whichever attempt has the highest top score so far is
+    kept here for generate()/build_citations() to use, rather than
+    whatever the *last* attempt happened to retrieve.
+    """
+    chunks = state["retrieved_chunks"]
+    top_score = _top_rerank_score(chunks)
+    attempt_number = state.get("retrieval_attempts", 0) + 1
+    sufficient = top_score >= RETRIEVAL_SUFFICIENCY_MIN_RERANK_SCORE
+
+    best_chunks = state.get("best_retrieved_chunks") or []
+    if not state.get("retrieval_attempts") or top_score > _top_rerank_score(
+        best_chunks
+    ):
+        best_chunks = chunks
+
+    logger.info(
+        "Retrieval sufficiency check | attempt=%d top_score=%.3f sufficient=%s",
+        attempt_number,
+        top_score,
+        sufficient,
     )
+
     return {
-        "retrieval_sufficient": score >= _SUFFICIENCY_THRESHOLD,
-        "retrieval_attempts": state.get("retrieval_attempts", 0) + 1,
+        "retrieval_sufficient": sufficient,
+        "retrieval_attempts": attempt_number,
+        "best_retrieved_chunks": best_chunks,
+        "last_retrieval_top_score": top_score,
     }
 
 
 def _route_after_sufficiency_check(state: AgentState) -> str:
-    attempts_exhausted = state["retrieval_attempts"] >= MAX_RETRIEVAL_ATTEMPTS
-    if state["retrieval_sufficient"] or attempts_exhausted:
+    if state["retrieval_sufficient"]:
+        return "generate"
+    if state["retrieval_attempts"] >= MAX_RETRIEVAL_ATTEMPTS:
+        return "generate"
+    if state["last_retrieval_top_score"] < RETRIEVAL_SKIP_RETRY_BELOW:
+        # Below even the much-lower "is there anything at all" floor --
+        # the namespace almost certainly has nothing relevant, so
+        # reformulating the same unanswerable query and retrying is very
+        # unlikely to help. Spend generate()'s honest "nothing relevant
+        # was found" response instead of a retry that would just burn a
+        # reformulate_query LLM call for the same empty result.
         return "generate"
     return "reformulate_query"
 
 
 async def reformulate_query(state: AgentState, config: RunnableConfig) -> dict:
-    """Rewrites the query with different phrasing/broader terms after an
-    insufficient retrieval attempt, then loops back to hybrid_retrieve.
-    Only reached under MAX_RETRIEVAL_ATTEMPTS (see _route_after_
-    sufficiency_check), so this never runs an unbounded number of times.
+    """Rewrites original_condensed_query (never condensed_query itself --
+    see AgentState's own docstring on the two fields) with different
+    phrasing/broader terms after an insufficient retrieval attempt, then
+    loops back to hybrid_retrieve. Always rewriting from the same
+    original standalone question, rather than from whatever the previous
+    reformulation produced, keeps a second retry from compounding drift
+    onto an already-once-reworded query. Only reached under
+    MAX_RETRIEVAL_ATTEMPTS (see _route_after_sufficiency_check), so this
+    never runs an unbounded number of times.
     """
     db = _config_get(config, "db")
-    user = _config_get(config, "user")
     try:
-        resolved = await LLMClientService.resolve_for_knowledge(
-            db,
-            user,
-            knowledge_type=state["knowledge_type"],
-            tenant_id=uuid.UUID(state["tenant_id"])
-            if state.get("tenant_id")
-            else None,
-        )
-    except LLMClientService.MissingCredentialError:
+        # The platform default Groq model/key -- see condense_query's own
+        # comment on why these internal rewrite steps never use the
+        # user's selected model/BYOK credential.
+        resolved = await LLMClientService.resolve_platform_default(db)
+    except Exception:
         # Not fatal -- reformulation is an optimization; retry with the
-        # same query rather than erroring (generate still enforces the
-        # credential requirement properly once the loop ends).
+        # same query rather than erroring (generate still resolves the
+        # user's real model/credential separately once the loop ends).
         return {}
     reformulate_prompt = (
         "The following search query did not retrieve enough relevant "
         "information to answer the question. Rewrite it with different "
         "phrasing or broader terms that might match more relevant "
         "content. Reply with ONLY the rewritten query.\n\n"
-        f"Original query: {state['condensed_query']}"
+        f"Original query: {state['original_condensed_query']}"
     )
     reformulated = ""
     async for delta in LLMClientService.stream_generate(
@@ -435,7 +502,28 @@ async def reformulate_query(state: AgentState, config: RunnableConfig) -> dict:
         messages=[{"role": "user", "content": reformulate_prompt}],
     ):
         reformulated += delta
-    return {"condensed_query": reformulated.strip() or state["condensed_query"]}
+    return {
+        "condensed_query": reformulated.strip() or state["original_condensed_query"]
+    }
+
+
+def _context_chunks(state: AgentState) -> list[dict]:
+    """The subset of best_retrieved_chunks actually usable as generation
+    context, in their original order -- below MIN_USABLE_RERANK_SCORE, a
+    chunk is noise Pinecone/Cohere returned because *something* has to
+    come back from a non-empty namespace, not a genuinely relevant match.
+
+    Used by BOTH generate() (prompt numbering and the empty/no-context
+    decision) and build_citations() (validating "[n]" markers against
+    this same list's length) so a chunk's position here is the single
+    source of truth for its citation_number in both places -- they can
+    never drift apart into two different ideas of "chunk 2".
+    """
+    return [
+        chunk
+        for chunk in state["best_retrieved_chunks"]
+        if chunk["score"] >= MIN_USABLE_RERANK_SCORE
+    ]
 
 
 def _to_provider_message(message: object) -> dict[str, str]:
@@ -466,30 +554,45 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     stream_id = state["stream_id"]
 
     scope_label, scope_note = _KNOWLEDGE_SCOPE_PROMPTS[state["knowledge_type"]]
+    context_chunks = _context_chunks(state)
     if state["knowledge_base_empty"]:
+        prompt_case = "empty_kb"
         system_prompt = _EMPTY_KNOWLEDGE_BASE_SYSTEM_PROMPT.format(
             knowledge_scope_label=scope_label,
             empty_scope_suggestion=_EMPTY_SCOPE_SUGGESTIONS[state["knowledge_type"]],
         )
-    elif not state["retrieved_chunks"]:
+    elif not context_chunks:
+        prompt_case = "no_context"
         system_prompt = _NO_RELEVANT_CONTEXT_SYSTEM_PROMPT.format(
             knowledge_scope_label=scope_label
         )
     else:
+        prompt_case = "normal"
         context = "\n\n".join(
             f"[{i + 1}] (from {chunk['document_name']}) {chunk['content']}"
-            for i, chunk in enumerate(state["retrieved_chunks"])
+            for i, chunk in enumerate(context_chunks)
         )
         system_prompt = _BASE_SYSTEM_PROMPT.format(
             knowledge_scope_label=scope_label,
             knowledge_scope_note=scope_note,
             context=context,
         )
+    logger.info(
+        "Generate | prompt_case=%s context_chunks=%d",
+        prompt_case,
+        len(context_chunks),
+    )
 
     # Every message so far is `state["messages"]` up to (but not
     # including) the current turn's own raw query, which `initial_state`
-    # always appends last -- see ChatService._run_generation.
-    history = [_to_provider_message(m) for m in state["messages"][:-1]]
+    # always appends last -- see ChatService._run_generation. Windowed to
+    # the last MAX_HISTORY_MESSAGES so an unbounded thread doesn't keep
+    # growing this turn's token cost/latency without bound; the full
+    # history is still what's persisted (see ChatHistory/Thread), only
+    # what's sent to the model here is capped.
+    history = [
+        _to_provider_message(m) for m in state["messages"][:-1][-MAX_HISTORY_MESSAGES:]
+    ]
     conversation = [*history, {"role": "user", "content": state["query"]}]
 
     try:
@@ -523,7 +626,7 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
 
 
 async def check_output_guardrail(state: AgentState, config: RunnableConfig) -> dict:
-    """On by default for every turn (architecture doc §10) -- redacts any
+    """On by default for every turn -- redacts any
     credential-shaped substring from the generated response before it's
     persisted or included in the stream's final "done" event.
 
@@ -532,9 +635,9 @@ async def check_output_guardrail(state: AgentState, config: RunnableConfig) -> d
     append_chunk(..., {"type": "token", ...})` calls), so this guardrail
     cannot retroactively un-stream tokens the client already received --
     it protects the persisted ChatHistory record and the final "done"
-    event's content, which is real, worthwhile defense-in-depth (the
-    architecture doc's own framing), just not a guarantee against a leak
-    having been visible transiently during streaming. Closing that fully
+    event's content, which is real, worthwhile defense-in-depth, just not
+    a guarantee against a leak having been visible transiently during
+    streaming. Closing that fully
     would mean buffering the entire response before streaming any of it,
     which trades away streaming itself -- flagged here rather than
     silently implemented as a stronger guarantee than it actually is.
@@ -543,95 +646,39 @@ async def check_output_guardrail(state: AgentState, config: RunnableConfig) -> d
     return {"response": sanitized, "guardrail_flags": flags}
 
 
-_CITATION_RELEVANCE_THRESHOLD = 0.5
-
-# A small, documented, non-exhaustive stopword list for the citation-
-# relevance stub heuristic -- not a general-purpose NLP tool, just enough
-# to keep the word-overlap signal from being dominated by filler words.
-_STOPWORDS = frozenset(
-    "a an the is are was were be been being of for to in on at by with "
-    "and or but not this that these those it its as".split()
-)
-
-
-def _significant_words(text: str) -> set[str]:
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    return {w for w in words if w not in _STOPWORDS}
-
-
-def _citation_relevance_stub_heuristic(chunk_content: str, response: str) -> float:
-    """Stub fallback for JevService.ask_noul while TypeSafe/JEV isn't
-    configured -- what fraction of the chunk's significant words also
-    appear in the generated response. Documented placeholder, not a
-    tuned relevance model."""
-    chunk_words = _significant_words(chunk_content)
-    if not chunk_words:
-        return 0.0
-    response_words = _significant_words(response)
-    overlap = chunk_words & response_words
-    return len(overlap) / len(chunk_words)
+_CITATION_MARKER_RE = re.compile(r"\[(\d+)\]")
 
 
 async def build_citations(state: AgentState, config: RunnableConfig) -> dict:
-    """Keeps only the retrieved chunks actually reflected in the generated
-    response -- replaces blindly echoing back every retrieved chunk
-    regardless of whether the model used it. Each chunk's relevance is
-    asked independently and in parallel (asyncio.gather), matching JEV's
-    own atomic-question design (architecture doc §4).
+    """Keeps only the retrieved chunks the model actually cited in its
+    response, by reading the "[n]" markers back out of the generated text
+    -- replaces blindly echoing back every retrieved chunk regardless of
+    whether the model used it.
 
     Each surviving chunk keeps a `citation_number` equal to its 1-based
-    position in `state["retrieved_chunks"]` -- the exact numbering
-    `generate()` put in the prompt and told the model to cite with
-    ("[1]", "[2]", ...). Without this, a filtered-out chunk shifts every
-    later survivor's array position, so "the 2nd surviving chunk" would
-    stop meaning the same thing as the model's own "[2]" the moment
-    anything earlier gets dropped -- the frontend's citation markers must
-    match by this number, never by position in the returned list.
-
-    Without real JEV configured, this judgment falls back to
-    _citation_relevance_stub_heuristic -- plain word-overlap between the
-    chunk and the response. That signal breaks down specifically for any
-    answer that *computes* something from the source rather than quoting
-    it (e.g. "512 x 8 = 4,096" when the chunk only states the formula and
-    rank, never the product) -- confirmed scoring ~0.26 against a
-    genuinely-correct source chunk, well under the threshold, for exactly
-    this kind of question. Filtering on that signal would silently drop
-    real citations for a whole common class of questions, which is worse
-    than not filtering at all. So in stub mode every retrieved chunk is
-    kept, unfiltered, relying on hybrid retrieval + Cohere rerank (both
-    already run before this node) to have done the actual relevance
-    work -- real per-chunk "was this actually used" filtering only
-    applies once a real JEV judge is configured and can be trusted with
-    that narrower, harder question.
+    position in `_context_chunks(state)` -- the exact same filtered,
+    ordered list generate() builds its numbered prompt from (see
+    _context_chunks's own docstring for why both read the same helper
+    rather than each filtering independently), and the same number the
+    regex here pulls back out of the response. A marker outside that
+    range (the model hallucinated a citation number nothing was ever put
+    at) is dropped rather than raising or guessing which chunk it meant;
+    a duplicate marker keeps only one citation. The frontend's citation
+    markers must match by this number, never by position in the returned
+    list.
     """
-    chunks = state["retrieved_chunks"]
+    chunks = _context_chunks(state)
     if not chunks:
         return {"citations": []}
 
-    if not JevService.is_configured():
-        return {
-            "citations": [
-                {**chunk, "citation_number": i + 1} for i, chunk in enumerate(chunks)
-            ]
-        }
+    cited_numbers = {
+        int(match) for match in _CITATION_MARKER_RE.findall(state["response"])
+    }
+    valid_numbers = sorted(n for n in cited_numbers if 1 <= n <= len(chunks))
 
-    scores = await asyncio.gather(
-        *(
-            JevService.ask_noul(
-                "Was this chunk's content actually used or referenced in "
-                "the final answer?",
-                stub_fallback=lambda c=chunk: _citation_relevance_stub_heuristic(
-                    c["content"], state["response"]
-                ),
-            )
-            for chunk in chunks
-        )
-    )
     return {
         "citations": [
-            {**chunk, "citation_number": i + 1}
-            for i, (chunk, score) in enumerate(zip(chunks, scores, strict=True))
-            if score >= _CITATION_RELEVANCE_THRESHOLD
+            {**chunks[n - 1], "citation_number": n} for n in valid_numbers
         ]
     }
 
@@ -660,7 +707,6 @@ async def persist(state: AgentState, config: RunnableConfig) -> dict:
 
 def build_graph():
     graph = StateGraph(AgentState)
-    graph.add_node("check_input_guardrail", check_input_guardrail)
     graph.add_node("load_thread_state", load_thread_state)
     graph.add_node("validate_knowledge_access", validate_knowledge_access)
     graph.add_node("access_denied", access_denied_node)
@@ -673,12 +719,7 @@ def build_graph():
     graph.add_node("build_citations", build_citations)
     graph.add_node("persist", persist)
 
-    graph.add_edge(START, "check_input_guardrail")
-    graph.add_conditional_edges(
-        "check_input_guardrail",
-        _route_after_input_guardrail,
-        {"access_denied": "access_denied", "load_thread_state": "load_thread_state"},
-    )
+    graph.add_edge(START, "load_thread_state")
     graph.add_edge("load_thread_state", "validate_knowledge_access")
     graph.add_conditional_edges(
         "validate_knowledge_access",

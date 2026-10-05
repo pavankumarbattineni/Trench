@@ -33,13 +33,23 @@ from app.schemas.error import ErrorResponse
 logger = logging.getLogger(__name__)
 
 
-def _error_response(status_code: int, error_status: str, message: str) -> JSONResponse:
+def _error_response(
+    status_code: int,
+    error_status: str,
+    message: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     body = ErrorResponse(status_code=status_code, status=error_status, message=message)
-    return JSONResponse(status_code=status_code, content=body.model_dump())
+    return JSONResponse(
+        status_code=status_code, content=body.model_dump(), headers=headers
+    )
 
 
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    return _error_response(exc.status_code, exc.__class__.__name__, str(exc.detail))
+    return _error_response(
+        exc.status_code, exc.__class__.__name__, str(exc.detail), headers=exc.headers
+    )
 
 
 async def validation_exception_handler(

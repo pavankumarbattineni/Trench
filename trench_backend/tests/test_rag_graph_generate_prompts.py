@@ -23,7 +23,7 @@ def _state(**overrides) -> dict:
         "knowledge_type": "personal",
         "tenant_id": None,
         "knowledge_base_empty": False,
-        "retrieved_chunks": [],
+        "best_retrieved_chunks": [],
         "messages": [{"role": "user", "content": "What's the revenue?"}],
     }
     base.update(overrides)
@@ -38,7 +38,7 @@ async def test_knowledge_base_empty_uses_the_empty_kb_prompt():
         captured["system_prompt"] = system_prompt
         yield "ok"
 
-    state = _state(knowledge_base_empty=True, retrieved_chunks=[])
+    state = _state(knowledge_base_empty=True, best_retrieved_chunks=[])
     with (
         patch(
             "app.graph.rag_graph.LLMClientService.resolve_for_knowledge",
@@ -67,7 +67,7 @@ async def test_empty_retrieval_uses_the_no_relevant_context_prompt():
         captured["system_prompt"] = system_prompt
         yield "ok"
 
-    state = _state(knowledge_base_empty=False, retrieved_chunks=[])
+    state = _state(knowledge_base_empty=False, best_retrieved_chunks=[])
     with (
         patch(
             "app.graph.rag_graph.LLMClientService.resolve_for_knowledge",
@@ -96,7 +96,7 @@ async def test_normal_case_with_chunks_builds_numbered_context():
 
     state = _state(
         knowledge_base_empty=False,
-        retrieved_chunks=[
+        best_retrieved_chunks=[
             {
                 "chunk_id": "c1",
                 "document_id": "d1",

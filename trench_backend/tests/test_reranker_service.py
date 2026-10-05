@@ -47,6 +47,24 @@ async def test_rerank_reorders_chunks_per_cohere_result_order():
 
 
 @pytest.mark.asyncio
+async def test_rerank_overwrites_score_with_cohere_relevance_score():
+    """Downstream callers (assess_retrieval_sufficiency) read a reranked
+    chunk's "score" expecting Cohere's own relevance score, not the
+    Pinecone hybrid-search score it carried in with -- each input chunk
+    here starts at 0.5 (see _chunk()), which must not survive reranking."""
+    chunks = [_chunk("a"), _chunk("b")]
+    fake_client = AsyncMock()
+    fake_client.rerank = AsyncMock(
+        return_value=_cohere_response(result_indexes=[0, 1])
+    )
+
+    with patch("app.service.reranker_service._client", return_value=fake_client):
+        result = await RerankerService.rerank("some query", chunks)
+
+    assert [c["score"] for c in result] == [1.0, 0.9]
+
+
+@pytest.mark.asyncio
 async def test_rerank_passes_query_and_document_contents_to_cohere():
     chunks = [_chunk("a"), _chunk("b")]
     fake_client = AsyncMock()

@@ -8,6 +8,7 @@ from sqlalchemy import select, update
 
 from app.database.models import Document, Tenant, User
 from app.database.session import async_session_factory
+from app.graph.rag_graph import MAX_RETRIEVAL_ATTEMPTS
 from app.service.retrieval_service import RetrievedChunk
 
 PREFIX = "test-chat-flow"
@@ -467,12 +468,15 @@ async def test_continue_after_interruption_carries_partial_answer_forward(
 
 
 @pytest.mark.asyncio
-async def test_insufficient_retrieval_retries_then_still_completes(
+async def test_empty_retrieval_skips_retry_and_completes_after_one_attempt(
     client: AsyncClient,
 ):
-    """When retrieval never turns up a good-enough chunk, the graph
-    retries up to the hard cap (3 total attempts) rather than looping
-    forever, then still completes the turn with whatever it has."""
+    """An always-empty retrieval scores 0.0, well below
+    RETRIEVAL_SKIP_RETRY_BELOW -- the graph treats that as strong evidence
+    the namespace has nothing relevant at all and proceeds straight to
+    generate() rather than spending a retry on a reformulated query that
+    almost certainly won't fare any better (see
+    _route_after_sufficiency_check in rag_graph.py)."""
     await _login(client)
     # Without a document on file, validate_knowledge_access would route
     # straight to generate (knowledge_base_empty), and RetrievalService
@@ -508,7 +512,61 @@ async def test_insufficient_retrieval_retries_then_still_completes(
             client, response.json()["stream_id"], "completed"
         )
 
-    assert retrieve_calls == 3
+    assert retrieve_calls == 1
+    assert final["content"] == "Hello there!"
+
+
+@pytest.mark.asyncio
+async def test_insufficient_retrieval_retries_up_to_the_cap_then_completes(
+    client: AsyncClient,
+):
+    """When retrieval keeps turning up a chunk that's weak but not weak
+    enough to skip retrying outright (above RETRIEVAL_SKIP_RETRY_BELOW,
+    below RETRIEVAL_SUFFICIENCY_MIN_RERANK_SCORE), the graph retries up to
+    MAX_RETRIEVAL_ATTEMPTS total attempts rather than looping forever,
+    then still completes the turn with whatever it has."""
+    await _login(client)
+    await _seed_completed_personal_document(_EMAIL)
+    thread = (await client.post("/api/v1/threads")).json()
+
+    retrieve_calls = 0
+
+    async def _always_mediocre_retrieve(*, query, scope, top_k=8):
+        nonlocal retrieve_calls
+        retrieve_calls += 1
+        return [
+            RetrievedChunk(
+                chunk_id="weak-chunk",
+                document_id="fake-doc-1",
+                document_name="notes.txt",
+                chunk_index=0,
+                content="tangentially related content",
+                score=0.15,
+            )
+        ]
+
+    async def _fast_stream_generate(resolved, *, system_prompt, messages):
+        for word in ["Hello", " ", "there", "!"]:
+            yield word
+
+    with (
+        patch(
+            "app.service.llm_client_service.LLMClientService.stream_generate",
+            _fast_stream_generate,
+        ),
+        patch(
+            "app.graph.rag_graph.RetrievalService.retrieve", _always_mediocre_retrieve
+        ),
+    ):
+        response = await client.post(
+            f"/api/v1/chat/threads/{thread['id']}/messages",
+            json={"query": "What's in my notes?", "knowledge_type": "personal"},
+        )
+        final = await _wait_for_status(
+            client, response.json()["stream_id"], "completed"
+        )
+
+    assert retrieve_calls == MAX_RETRIEVAL_ATTEMPTS
     assert final["content"] == "Hello there!"
 
 

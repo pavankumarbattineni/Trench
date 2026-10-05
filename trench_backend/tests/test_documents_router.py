@@ -55,6 +55,25 @@ def _no_real_ingestion(monkeypatch):
     monkeypatch.setattr(DocumentService, "_run_ingestion", staticmethod(_noop))
 
 
+class _FakeVectorStore:
+    async def delete_by_prefix(self, *, namespace, prefix) -> None:
+        pass
+
+    async def delete_namespace(self, *, namespace) -> None:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _fake_vector_store(monkeypatch):
+    """Document deletion now always calls delete_by_prefix (see
+    DocumentService._delete_document_row) -- avoid a real Pinecone call in
+    the automated test suite."""
+    monkeypatch.setattr(
+        "app.service.document_service.get_vector_store",
+        lambda **kwargs: _FakeVectorStore(),
+    )
+
+
 @pytest.fixture(autouse=True)
 async def cleanup():
     yield
@@ -66,9 +85,7 @@ async def cleanup():
         )
         await session.commit()
         tenant_result = await session.execute(
-            select(Tenant).where(
-                Tenant.domain.like("%test-documents-router%")
-            )
+            select(Tenant).where(Tenant.domain.like("%test-documents-router%"))
         )
         for tenant in tenant_result.scalars().all():
             await session.delete(tenant)
@@ -205,9 +222,7 @@ async def test_download_returns_presigned_url(client: AsyncClient, tmp_path):
     with patch(
         "app.service.document_service.get_storage_provider", return_value=storage
     ):
-        default_response = await client.get(
-            f"/api/v1/documents/{document_id}/download"
-        )
+        default_response = await client.get(f"/api/v1/documents/{document_id}/download")
         attachment_response = await client.get(
             f"/api/v1/documents/{document_id}/download",
             params={"disposition": "attachment"},

@@ -45,8 +45,7 @@ _ALREADY_PROCESSING = HTTPException(
 )
 _STILL_PROCESSING = HTTPException(
     status.HTTP_409_CONFLICT,
-    "This document is still being processed. Wait for it to finish before "
-    "deleting it.",
+    "This document is still being processed. Wait for it to finish before deleting it.",
 )
 
 _ACTIVE_STATUSES = ("pending", "processing")
@@ -409,19 +408,19 @@ class DocumentService:
         if document.status in _ACTIVE_STATUSES:
             raise _STILL_PROCESSING
 
-        if document.chunk_count > 0:
-            namespace = (
-                company_namespace(document.tenant_id)
-                if document.knowledge_type == "company"
-                else personal_namespace(document.user_id)
-            )
-            # Chunk ids are deterministic (document_id:index), so they can
-            # be reconstructed here without any Postgres record of them.
-            chunk_ids = [
-                f"{document.id}:{index}" for index in range(document.chunk_count)
-            ]
-            vector_store = get_vector_store(dimensions=EmbeddingService.DIMENSIONS)
-            await vector_store.delete(namespace=namespace, ids=chunk_ids)
+        namespace = (
+            company_namespace(document.tenant_id)
+            if document.knowledge_type == "company"
+            else personal_namespace(document.user_id)
+        )
+        # Deletes by id prefix rather than reconstructing f"{id}:{index}"
+        # for range(chunk_count) -- chunk_count can drift from what's
+        # actually in Pinecone (a partial/retried ingestion), so trusting
+        # it risks leaving orphaned vectors behind.
+        vector_store = get_vector_store(dimensions=EmbeddingService.DIMENSIONS)
+        await vector_store.delete_by_prefix(
+            namespace=namespace, prefix=f"{document.id}:"
+        )
 
         # A failed storage delete deliberately does NOT block the DB delete:
         # one orphaned object left in the bucket is a far smaller problem

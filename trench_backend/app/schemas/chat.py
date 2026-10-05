@@ -6,7 +6,7 @@ KnowledgeType = Literal["personal", "company"]
 
 
 class ChatMessageRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=8000)
+    query: str = Field(min_length=1, max_length=4000)
     knowledge_type: KnowledgeType = "personal"
 
 
