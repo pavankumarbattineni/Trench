@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Download, Eye, FileText, Trash2 } from "lucide-react";
+import { Download, Eye, FileText, RotateCcw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ConfirmDialog, useConfirmTarget } from "@/components/confirm-dialog";
@@ -13,6 +13,7 @@ import {
   useDeleteDocument,
   useDocuments,
   useDownloadDocument,
+  useRetryDocument,
   useUploadDocument,
   useViewDocument,
 } from "@/hooks/use-documents";
@@ -25,6 +26,7 @@ export default function DocumentsPage() {
   const remove = useDeleteDocument();
   const view = useViewDocument();
   const download = useDownloadDocument();
+  const retry = useRetryDocument();
   const deleteTarget = useConfirmTarget<DocumentSummary>();
   const [uploadError, setUploadError] = useState<string | null>(null);
 
@@ -36,6 +38,13 @@ export default function DocumentsPage() {
 
   const handleDownload = (doc: DocumentSummary) => {
     download.mutate(doc.id, {
+      onError: (err) => toast.error(getErrorMessage(err)),
+    });
+  };
+
+  const handleRetry = (doc: DocumentSummary) => {
+    retry.mutate(doc.id, {
+      onSuccess: () => toast.success(`Retrying "${doc.document_name}"…`),
       onError: (err) => toast.error(getErrorMessage(err)),
     });
   };
@@ -135,6 +144,17 @@ export default function DocumentsPage() {
             >
               <Download className="size-4" />
             </Button>
+            {doc.status === "failed" && (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Retry processing"
+                disabled={retry.isPending && retry.variables === doc.id}
+                onClick={() => handleRetry(doc)}
+              >
+                <RotateCcw className="size-4" />
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="icon-sm"

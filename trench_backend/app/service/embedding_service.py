@@ -30,6 +30,12 @@ from app.config import get_settings
 MODEL_NAME = "gemini-embedding-001"
 DIMENSIONS = 768
 
+# Google's embed_content API rejects a `contents` list over 100 items in
+# one call -- documents with more chunks than this would otherwise fail
+# ingestion outright. Batches sequentially rather than concurrently to
+# stay well clear of per-minute rate limits on top of the per-call cap.
+_EMBED_BATCH_SIZE = 100
+
 
 def _l2_normalize(vector: list[float]) -> list[float]:
     norm = math.sqrt(sum(value * value for value in vector))
@@ -51,15 +57,21 @@ class EmbeddingService:
     async def embed_texts(texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        response = await _client().aio.models.embed_content(
-            model=MODEL_NAME,
-            contents=texts,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=DIMENSIONS,
-            ),
-        )
-        return [_l2_normalize(embedding.values) for embedding in response.embeddings]
+        all_embeddings: list[list[float]] = []
+        for i in range(0, len(texts), _EMBED_BATCH_SIZE):
+            batch = texts[i : i + _EMBED_BATCH_SIZE]
+            response = await _client().aio.models.embed_content(
+                model=MODEL_NAME,
+                contents=batch,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_DOCUMENT",
+                    output_dimensionality=DIMENSIONS,
+                ),
+            )
+            all_embeddings.extend(
+                _l2_normalize(embedding.values) for embedding in response.embeddings
+            )
+        return all_embeddings
 
     @staticmethod
     async def embed_query(text: str) -> list[float]:

@@ -47,6 +47,9 @@ _STILL_PROCESSING = HTTPException(
     status.HTTP_409_CONFLICT,
     "This document is still being processed. Wait for it to finish before deleting it.",
 )
+_NOT_FAILED = HTTPException(
+    status.HTTP_409_CONFLICT, "Only a failed document can be retried."
+)
 
 _ACTIVE_STATUSES = ("pending", "processing")
 
@@ -353,6 +356,74 @@ class DocumentService:
         """
         document = await cls.get_document(db, user=user, document_id=document_id)
         await cls._delete_document_row(db, document)
+
+    @classmethod
+    async def retry_document(
+        cls, db: AsyncSession, *, user: User, document_id: uuid.UUID
+    ) -> Document:
+        """Re-triggers ingestion for a failed personal document the
+        requester owns, without re-uploading the file -- the original
+        bytes are still in storage, and DocumentIngestionService.process
+        reuses the cached `parsed_text` too if parsing had already
+        succeeded (see that column's own docstring), so a retry only ever
+        re-runs the step(s) that actually failed.
+
+        Raises:
+            HTTPException: 404 if the document doesn't exist, isn't
+                personal, or isn't owned by `user`; 409 if the document
+                isn't currently "failed" (nothing to retry), or if the
+                user already has another document pending/processing.
+        """
+        document = await cls.get_document(db, user=user, document_id=document_id)
+        if document.knowledge_type != "personal":
+            raise _ACCESS_DENIED
+        if document.status != "failed":
+            raise _NOT_FAILED
+        await cls._enforce_no_concurrent_processing(db, user_id=user.id)
+
+        document.status = "pending"
+        document.error_message = None
+        await db.commit()
+        await db.refresh(document)
+        logger.info("Document retry triggered | document_id=%s", document.id)
+
+        asyncio.create_task(DocumentService._run_ingestion(document.id))
+        return document
+
+    @classmethod
+    async def retry_company_document(
+        cls,
+        db: AsyncSession,
+        *,
+        admin: User,
+        tenant_id: uuid.UUID,
+        document_id: uuid.UUID,
+    ) -> Document:
+        """Same as retry_document, scoped to a tenant's company documents.
+        Admin only -- enforced by the router's require_tenant_admin_or_owner
+        dependency, same as upload/delete.
+
+        Raises:
+            HTTPException: 404 if the document doesn't exist or belongs to
+                a different tenant; 409 if the document isn't currently
+                "failed", or if this admin already has another document
+                pending/processing.
+        """
+        document = await cls.get_company_document(
+            db, tenant_id=tenant_id, document_id=document_id
+        )
+        if document.status != "failed":
+            raise _NOT_FAILED
+        await cls._enforce_no_concurrent_processing(db, user_id=admin.id)
+
+        document.status = "pending"
+        document.error_message = None
+        await db.commit()
+        await db.refresh(document)
+        logger.info("Company document retry triggered | document_id=%s", document.id)
+
+        asyncio.create_task(DocumentService._run_ingestion(document.id))
+        return document
 
     @classmethod
     async def get_company_document(

@@ -6,6 +6,7 @@ import {
   deleteDocument,
   getDownloadUrl,
   listDocuments,
+  retryDocument,
   uploadDocument,
 } from "@/lib/documents";
 
@@ -43,6 +44,19 @@ export function useDeleteDocument() {
   return useMutation({
     mutationFn: deleteDocument,
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: documentsQueryKey });
+    },
+  });
+}
+
+export function useRetryDocument() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: retryDocument,
+    onSuccess: () => {
+      // Retry resets the document to "pending", so useDocuments' own
+      // refetchInterval picks the poll back up automatically once this
+      // invalidation refetches the list -- no extra polling logic needed.
       queryClient.invalidateQueries({ queryKey: documentsQueryKey });
     },
   });

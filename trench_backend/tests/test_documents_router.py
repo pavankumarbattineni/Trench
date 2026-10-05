@@ -178,6 +178,78 @@ async def test_rejects_invalid_file(client: AsyncClient):
     assert response.status_code == 422
 
 
+@pytest.mark.asyncio
+async def test_rejects_upload_with_neither_file_nor_retry(client: AsyncClient):
+    await _login(client)
+
+    response = await client.post("/api/v1/documents")
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_rejects_retry_true_without_document_id(client: AsyncClient):
+    await _login(client)
+
+    response = await client.post("/api/v1/documents", data={"retry": "true"})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_retry_reprocesses_a_failed_document_without_a_new_file(
+    client: AsyncClient, tmp_path
+):
+    await _login(client)
+
+    document_id = await _upload(client, LocalFilesystemStorageProvider(tmp_path))
+    async with async_session_factory() as session:
+        db_document = await session.get(Document, document_id)
+        db_document.status = "failed"
+        db_document.error_message = "embedding is down"
+        await session.commit()
+
+    retry_response = await client.post(
+        "/api/v1/documents", data={"document_id": document_id, "retry": "true"}
+    )
+    assert retry_response.status_code == 200
+    body = retry_response.json()
+    assert body["id"] == document_id
+    assert body["status"] == "pending"
+    assert body["error_message"] is None
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_a_document_that_is_not_failed_via_api(
+    client: AsyncClient, tmp_path
+):
+    await _login(client)
+    document_id = await _upload(client, LocalFilesystemStorageProvider(tmp_path))
+    async with async_session_factory() as session:
+        db_document = await session.get(Document, document_id)
+        db_document.status = "completed"
+        await session.commit()
+
+    response = await client.post(
+        "/api/v1/documents", data={"document_id": document_id, "retry": "true"}
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_another_users_document(client: AsyncClient, tmp_path):
+    await _login(client)
+    document_id = await _upload(client, LocalFilesystemStorageProvider(tmp_path))
+    async with async_session_factory() as session:
+        db_document = await session.get(Document, document_id)
+        db_document.status = "failed"
+        await session.commit()
+
+    await _login(client, uid=OTHER_FIREBASE_UID, email=OTHER_EMAIL)
+    response = await client.post(
+        "/api/v1/documents", data={"document_id": document_id, "retry": "true"}
+    )
+    assert response.status_code == 404
+
+
 class _SigningStorage(LocalFilesystemStorageProvider):
     """Local storage that also "signs" download URLs, recording each call."""
 

@@ -45,6 +45,17 @@ export async function deleteDocument(documentId: string): Promise<void> {
   await apiClient.delete(`/api/v1/documents/${documentId}`);
 }
 
+export async function retryDocument(documentId: string): Promise<DocumentSummary> {
+  const form = new FormData();
+  form.append("document_id", documentId);
+  form.append("retry", "true");
+  const { data } = await apiClient.post<DocumentSummary>(
+    "/api/v1/documents",
+    form
+  );
+  return data;
+}
+
 export interface DownloadUrlResponse {
   url: string;
   expires_in: number;

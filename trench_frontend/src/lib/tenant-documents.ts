@@ -23,6 +23,20 @@ export async function uploadCompanyDocument(
   return data;
 }
 
+export async function retryCompanyDocument(
+  tenantId: string,
+  documentId: string
+): Promise<DocumentSummary> {
+  const form = new FormData();
+  form.append("document_id", documentId);
+  form.append("retry", "true");
+  const { data } = await apiClient.post<DocumentSummary>(
+    `/api/v1/tenants/${tenantId}/documents`,
+    form
+  );
+  return data;
+}
+
 export async function deleteCompanyDocument(
   tenantId: string,
   documentId: string

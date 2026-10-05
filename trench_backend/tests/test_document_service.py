@@ -271,6 +271,104 @@ async def test_delete_removes_vectors_by_id_prefix_not_chunk_count(
 
 
 @pytest.mark.asyncio
+async def test_retry_resets_a_failed_document_to_pending_and_retriggers_ingestion(
+    tmp_path, monkeypatch
+):
+    retried_ids = []
+
+    async def _tracking_noop(document_id) -> None:
+        retried_ids.append(document_id)
+
+    monkeypatch.setattr(DocumentService, "_run_ingestion", staticmethod(_tracking_noop))
+
+    async with async_session_factory() as session:
+        user = await _make_user(session, "retry")
+
+        with _local_storage(tmp_path):
+            document = await DocumentService.upload_document(
+                session, user=user, filename="to-retry.txt", content=b"temporary"
+            )
+        document.status = "failed"
+        document.error_message = "embedding is down"
+        await session.commit()
+
+        retried = await DocumentService.retry_document(
+            session, user=user, document_id=document.id
+        )
+
+        assert retried.status == "pending"
+        assert retried.error_message is None
+        assert retried_ids == [document.id]
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_a_document_that_is_not_failed(tmp_path):
+    async with async_session_factory() as session:
+        user = await _make_user(session, "retry-not-failed")
+
+        with _local_storage(tmp_path):
+            document = await DocumentService.upload_document(
+                session, user=user, filename="to-retry.txt", content=b"temporary"
+            )
+        document.status = "completed"
+        await session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await DocumentService.retry_document(
+                session, user=user, document_id=document.id
+            )
+        assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_a_document_owned_by_another_user(tmp_path):
+    async with async_session_factory() as session:
+        owner = await _make_user(session, "retry-owner")
+        other = await _make_user(session, "retry-other")
+
+        with _local_storage(tmp_path):
+            document = await DocumentService.upload_document(
+                session, user=owner, filename="private.txt", content=b"owner only"
+            )
+        document.status = "failed"
+        await session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await DocumentService.retry_document(
+                session, user=other, document_id=document.id
+            )
+        assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_when_another_document_is_already_processing(tmp_path):
+    async with async_session_factory() as session:
+        user = await _make_user(session, "retry-busy")
+
+        with _local_storage(tmp_path):
+            failed_document = await DocumentService.upload_document(
+                session, user=user, filename="failed.txt", content=b"one"
+            )
+        failed_document.status = "failed"
+        await session.commit()
+
+        with _local_storage(tmp_path):
+            # A second, still-pending document occupies the one-active-
+            # upload-at-a-time slot (see _enforce_no_concurrent_processing)
+            # -- "failed" isn't an active status, so this upload itself
+            # succeeds fine.
+            await DocumentService.upload_document(
+                session, user=user, filename="pending.txt", content=b"two"
+            )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await DocumentService.retry_document(
+                session, user=user, document_id=failed_document.id
+            )
+        assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_personal_document_not_visible_to_another_user(tmp_path):
     async with async_session_factory() as session:
         owner = await _make_user(session, "owner")

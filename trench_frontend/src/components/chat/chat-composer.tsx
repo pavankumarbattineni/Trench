@@ -16,7 +16,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useConfig } from "@/hooks/use-config";
 import { useUpdateModel } from "@/hooks/use-update-model";
-import type { KnowledgeType } from "@/lib/chat";
+import { MAX_QUERY_LENGTH, type KnowledgeType } from "@/lib/chat";
 import { getErrorMessage } from "@/lib/errors";
 
 interface ChatComposerProps {
@@ -64,9 +64,11 @@ export function ChatComposer({
     });
   };
 
+  const isOverLimit = query.length > MAX_QUERY_LENGTH;
+
   const handleSubmit = () => {
     const trimmed = query.trim();
-    if (!trimmed || isBusy) return;
+    if (!trimmed || isBusy || isOverLimit) return;
     onSend(trimmed, knowledgeType);
     setQuery("");
   };
@@ -91,6 +93,13 @@ export function ChatComposer({
           autoFocus
           className="max-h-40 min-h-9 resize-none border-none bg-transparent px-1 shadow-none focus-visible:ring-0"
         />
+
+        {isOverLimit && (
+          <p className="px-1 text-xs text-destructive">
+            {query.length.toLocaleString()} / {MAX_QUERY_LENGTH.toLocaleString()}{" "}
+            characters -- shorten your message to send it.
+          </p>
+        )}
 
         <div className="flex items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">
@@ -151,7 +160,7 @@ export function ChatComposer({
               type="button"
               size="icon"
               aria-label="Send message"
-              disabled={!query.trim() || isBusy}
+              disabled={!query.trim() || isBusy || isOverLimit}
               onClick={handleSubmit}
             >
               <ArrowUp className="size-4" />

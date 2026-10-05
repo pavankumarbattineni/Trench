@@ -166,11 +166,11 @@ _EMPTY_KNOWLEDGE_BASE_SYSTEM_PROMPT = (
     "individual's personal knowledge base and an organization's shared "
     "company knowledge base.\n\n"
     "You are currently answering from {knowledge_scope_label}, and it "
-    "currently has ZERO documents in it -- this is not \"nothing matched "
+    'currently has ZERO documents in it -- this is not "nothing matched '
     "this query\", it's that nothing has ever been uploaded there yet.\n\n"
     "Guidance:\n"
     "1. If the user's message is small talk or a greeting that doesn't "
-    "need document content (e.g. \"hi\", \"how are you\"), just respond "
+    'need document content (e.g. "hi", "how are you"), just respond '
     "naturally and warmly -- don't volunteer the empty-knowledge-base "
     "situation unprompted.\n"
     "2. If answering would require looking something up in this knowledge "
@@ -208,14 +208,14 @@ _NO_RELEVANT_CONTEXT_SYSTEM_PROMPT = (
     "found among the documents there.\n\n"
     "Guidance:\n"
     "1. If the user's message is small talk or a greeting that doesn't "
-    "need document content (e.g. \"hi\", \"how are you\"), just respond "
+    'need document content (e.g. "hi", "how are you"), just respond '
     "naturally and warmly.\n"
     "2. Otherwise, tell them plainly and briefly that nothing relevant to "
     "this question was found in {knowledge_scope_label} -- never answer "
     "from outside/general knowledge instead, even if you're confident "
     "you know the answer; that would be presenting unverified information "
     "as if it came from their documents.\n"
-    "3. NEVER include citation markers like \"[1]\" or \"[2]\" anywhere in "
+    '3. NEVER include citation markers like "[1]" or "[2]" anywhere in '
     "this reply -- there is no retrieved passage to cite, and a citation "
     "number with nothing behind it is actively misleading.\n"
     "4. Be direct and brief -- a sentence or two."
@@ -646,14 +646,23 @@ async def check_output_guardrail(state: AgentState, config: RunnableConfig) -> d
     return {"response": sanitized, "guardrail_flags": flags}
 
 
-_CITATION_MARKER_RE = re.compile(r"\[(\d+)\]")
+# Matches both the instructed ASCII "[n]" and the full-width/CJK "【n】"
+# variant as a defensive fallback -- despite _BASE_SYSTEM_PROMPT explicitly
+# requiring ASCII brackets and forbidding full-width ones, models have been
+# observed to drift into "【1】" anyway. The frontend's own linkifyCitations
+# already treats both as valid (see trench_frontend/src/lib/citation-links.
+# ts); matching only ASCII here would silently return citations=[] for a
+# response that used full-width markers, even though the model did cite
+# real chunks -- which also hides the "N sources" panel entirely, since
+# that's driven by this same citations list, not by scanning the text.
+_CITATION_MARKER_RE = re.compile(r"\[(\d+)\]|【(\d+)】")
 
 
 async def build_citations(state: AgentState, config: RunnableConfig) -> dict:
     """Keeps only the retrieved chunks the model actually cited in its
-    response, by reading the "[n]" markers back out of the generated text
-    -- replaces blindly echoing back every retrieved chunk regardless of
-    whether the model used it.
+    response, by reading the "[n]"/"【n】" markers back out of the generated
+    text -- replaces blindly echoing back every retrieved chunk regardless
+    of whether the model used it.
 
     Each surviving chunk keeps a `citation_number` equal to its 1-based
     position in `_context_chunks(state)` -- the exact same filtered,
@@ -672,14 +681,15 @@ async def build_citations(state: AgentState, config: RunnableConfig) -> dict:
         return {"citations": []}
 
     cited_numbers = {
-        int(match) for match in _CITATION_MARKER_RE.findall(state["response"])
+        int(ascii_digits or fullwidth_digits)
+        for ascii_digits, fullwidth_digits in _CITATION_MARKER_RE.findall(
+            state["response"]
+        )
     }
     valid_numbers = sorted(n for n in cited_numbers if 1 <= n <= len(chunks))
 
     return {
-        "citations": [
-            {**chunks[n - 1], "citation_number": n} for n in valid_numbers
-        ]
+        "citations": [{**chunks[n - 1], "citation_number": n} for n in valid_numbers]
     }
 
 

@@ -211,3 +211,106 @@ async def test_process_marks_document_failed_when_storage_read_fails(monkeypatch
             select(User.documents_uploaded_count).where(User.id == document.user_id)
         )
         assert counter_result.scalar_one() == 0
+
+
+@pytest.mark.asyncio
+async def test_process_caches_parsed_text_after_a_successful_parse(
+    tmp_path, monkeypatch
+):
+    """parsed_text must be written as soon as parsing succeeds, before
+    chunking/embedding/indexing even run -- otherwise a later-pipeline
+    failure would lose the already-successfully-parsed text instead of
+    letting a retry skip re-parsing. (It's cleared again once the
+    document reaches "completed" -- see
+    test_process_clears_parsed_text_once_completed below -- so a failure
+    partway through is the only window where it's actually observable.)"""
+
+    async def _fake_embed_texts(texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embedding is down")
+
+    monkeypatch.setattr(
+        "app.service.document_ingestion_service.EmbeddingService.embed_texts",
+        _fake_embed_texts,
+    )
+
+    async with async_session_factory() as session:
+        document = await _make_document(session, "d", content_hash=f"{'d':0<64}"[:64])
+        full_path = tmp_path / document.storage_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(b"Text that should be cached after parsing.")
+
+        await DocumentIngestionService.process(session, document.id)
+
+        await session.refresh(document)
+        assert document.status == "failed"
+        assert document.parsed_text == "Text that should be cached after parsing."
+
+
+@pytest.mark.asyncio
+async def test_process_clears_parsed_text_once_completed(tmp_path):
+    async with async_session_factory() as session:
+        document = await _make_document(session, "g", content_hash=f"{'g':0<64}"[:64])
+        full_path = tmp_path / document.storage_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(b"Text that should not linger after completion.")
+
+        await DocumentIngestionService.process(session, document.id)
+
+        await session.refresh(document)
+        assert document.status == "completed"
+        assert document.parsed_text is None
+
+
+@pytest.mark.asyncio
+async def test_process_reuses_cached_parsed_text_without_touching_storage(
+    monkeypatch,
+):
+    class _ExplodingStorage:
+        async def read(self, path: str) -> bytes:
+            raise AssertionError(
+                "storage should never be read when parsed_text is cached"
+            )
+
+    monkeypatch.setattr(
+        "app.service.document_ingestion_service.get_storage_provider",
+        lambda: _ExplodingStorage(),
+    )
+
+    async with async_session_factory() as session:
+        document = await _make_document(session, "e", content_hash=f"{'e':0<64}"[:64])
+        document.parsed_text = "Cached text from a prior successful parse."
+        await session.commit()
+
+        await DocumentIngestionService.process(session, document.id)
+
+        await session.refresh(document)
+        assert document.status == "completed"
+        assert document.chunk_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_process_keeps_cached_parsed_text_when_a_later_retry_fails_again(
+    monkeypatch,
+):
+    """A retry that reuses the cache but then fails again (e.g. embedding
+    still broken) must not lose the cached text -- the whole point is that
+    the next retry after that doesn't have to re-parse either."""
+
+    async def _fake_embed_texts(texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embedding is down")
+
+    monkeypatch.setattr(
+        "app.service.document_ingestion_service.EmbeddingService.embed_texts",
+        _fake_embed_texts,
+    )
+
+    async with async_session_factory() as session:
+        document = await _make_document(session, "f", content_hash=f"{'f':0<64}"[:64])
+        document.parsed_text = "Cached text that survives a second failure."
+        await session.commit()
+
+        await DocumentIngestionService.process(session, document.id)
+
+        await session.refresh(document)
+        assert document.status == "failed"
+        assert document.parsed_text == "Cached text that survives a second failure."

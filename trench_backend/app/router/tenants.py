@@ -424,29 +424,57 @@ async def revoke_knowledge_access(
 @router.post("/{tenant_id}/documents", response_model=DocumentResponse)
 async def upload_company_document(
     tenant_id: uuid.UUID,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(default=None),
+    document_id: uuid.UUID | None = Form(default=None),
+    retry: bool = Form(default=False),
     admin: User = Depends(require_tenant_admin_or_owner),
     db: AsyncSession = Depends(get_db),
 ) -> Document:
-    """Uploads a company-knowledge document. Admin only -- document
-    management has no delegation path; a member can only ever be granted
-    read/query access (see knowledge-access above).
+    """Uploads a company-knowledge document, or (with retry=true)
+    re-triggers ingestion for an existing failed one. Admin only --
+    document management has no delegation path; a member can only ever be
+    granted read/query access (see knowledge-access above).
 
     Args:
         tenant_id: The tenant this document belongs to.
-        file: The document file (PDF, DOCX, TXT, or Markdown).
-        admin: The authenticated Admin/Owner performing the upload.
+        file: The document file (PDF, DOCX, TXT, or Markdown). Required
+            unless retry=true, since a retry reuses the bytes already in
+            storage from the original upload.
+        document_id: The document to retry. Required when retry=true;
+            ignored otherwise.
+        retry: When true, re-triggers ingestion for `document_id` instead
+            of accepting a new upload.
+        admin: The authenticated Admin/Owner performing the upload/retry.
         db: An active async SQLAlchemy session.
 
     Returns:
         The created (or, if this exact file was already uploaded for this
-        tenant, the existing) document.
+        tenant, the existing) document on a normal upload; the retried
+        Document (status reset to "pending") when retry=true.
 
     Raises:
-        HTTPException: 422 on an invalid file; 404 if the tenant doesn't
-            exist; 403 if the caller isn't an admin of it; 409 if the
-            admin already has a document pending/processing.
+        HTTPException: 422 if neither a file nor retry=true+document_id
+            was given, or on an invalid file; 404 if the tenant doesn't
+            exist, or (on retry) document_id doesn't belong to it; 403 if
+            the caller isn't an admin of it; 409 if the admin already has
+            a document pending/processing, or (on retry) the document
+            isn't currently "failed".
     """
+    if retry:
+        if document_id is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "document_id is required when retry=true.",
+            )
+        return await DocumentService.retry_company_document(
+            db, admin=admin, tenant_id=tenant_id, document_id=document_id
+        )
+
+    if file is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "A file is required unless retry=true.",
+        )
     content = await file.read()
     return await DocumentService.upload_document(
         db,

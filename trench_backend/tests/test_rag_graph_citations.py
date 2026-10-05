@@ -72,12 +72,9 @@ async def test_build_citations_drops_an_out_of_range_hallucinated_marker():
 @pytest.mark.asyncio
 async def test_build_citations_deduplicates_a_repeated_marker():
     state = {
-        "best_retrieved_chunks": [
-            _chunk("only", "Priya Sharma leads Project Falcon.")
-        ],
+        "best_retrieved_chunks": [_chunk("only", "Priya Sharma leads Project Falcon.")],
         "response": (
-            "Priya Sharma leads Project Falcon [1]. She has led it since "
-            "2024 [1]."
+            "Priya Sharma leads Project Falcon [1]. She has led it since 2024 [1]."
         ),
     }
 
@@ -95,6 +92,40 @@ async def test_build_citations_orders_by_marker_number_not_mention_order():
             _chunk("second", "The office has a rooftop garden."),
         ],
         "response": "The office has a rooftop garden [2], and Priya leads Falcon [1].",
+    }
+
+    result = await build_citations(state, {})
+
+    assert [c["citation_number"] for c in result["citations"]] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_build_citations_recognizes_full_width_cjk_brackets():
+    """Despite _BASE_SYSTEM_PROMPT explicitly requiring ASCII "[n]" and
+    forbidding full-width brackets, models have been observed to drift
+    into "【n】" anyway -- these must still be recognized as real citation
+    markers, or build_citations silently returns citations=[] (and the
+    frontend's "N sources" panel never appears) even though the model did
+    cite a real chunk."""
+    state = {
+        "best_retrieved_chunks": [_chunk("only", "Priya Sharma leads Project Falcon.")],
+        "response": "Priya Sharma leads Project Falcon 【1】.",
+    }
+
+    result = await build_citations(state, {})
+
+    assert [c["chunk_id"] for c in result["citations"]] == ["only"]
+    assert result["citations"][0]["citation_number"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_citations_recognizes_mixed_ascii_and_full_width_markers():
+    state = {
+        "best_retrieved_chunks": [
+            _chunk("first", "Priya Sharma leads Project Falcon."),
+            _chunk("second", "The office has a rooftop garden."),
+        ],
+        "response": "Priya leads Falcon [1], and the office has a garden 【2】.",
     }
 
     result = await build_citations(state, {})

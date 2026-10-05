@@ -10,7 +10,16 @@ since they require admin authorization.
 import uuid
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Document, User
@@ -28,28 +37,56 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 @router.post("", response_model=DocumentResponse)
 async def upload_document(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(default=None),
+    document_id: uuid.UUID | None = Form(default=None),
+    retry: bool = Form(default=False),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Document:
-    """Uploads a personal-knowledge document for processing.
+    """Uploads a personal-knowledge document for processing, or (with
+    retry=true) re-triggers ingestion for an existing failed one.
 
     Args:
-        file: The document file (PDF, DOCX, TXT, or Markdown).
+        file: The document file (PDF, DOCX, TXT, or Markdown). Required
+            unless retry=true, since a retry reuses the bytes already in
+            storage from the original upload.
+        document_id: The document to retry. Required when retry=true;
+            ignored otherwise.
+        retry: When true, re-triggers ingestion for `document_id` instead
+            of accepting a new upload.
         current_user: The authenticated uploader; the document is scoped
             to this user's personal knowledge base.
         db: An active async SQLAlchemy session.
 
     Returns:
         The created (or, if this exact file was already uploaded, the
-        existing) Document.
+        existing) Document on a normal upload; the retried Document
+        (status reset to "pending") when retry=true.
 
     Raises:
-        HTTPException: 422 on an invalid file; 403 if the free-tier
+        HTTPException: 422 if neither a file nor retry=true+document_id
+            was given, or on an invalid file; 403 if the free-tier
             document limit is reached (see DocumentService.upload_document
-            for the legacy Pinecone-credential exception); 409 if the user
-            already has a document pending/processing.
+            for the legacy Pinecone-credential exception); 404 if
+            document_id doesn't exist or isn't owned by the caller; 409 if
+            the user already has a document pending/processing, or (on
+            retry) the document isn't currently "failed".
     """
+    if retry:
+        if document_id is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "document_id is required when retry=true.",
+            )
+        return await DocumentService.retry_document(
+            db, user=current_user, document_id=document_id
+        )
+
+    if file is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "A file is required unless retry=true.",
+        )
     content = await file.read()
     return await DocumentService.upload_document(
         db,

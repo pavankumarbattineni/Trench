@@ -391,6 +391,78 @@ async def test_admin_and_member_can_upload_or_be_denied_company_documents(
         assert delete_response.status_code == 204
 
 
+@pytest.mark.asyncio
+async def test_member_cannot_retry_company_document_only_admin_can(
+    client: AsyncClient, tmp_path
+):
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    member_token = await _invite_and_accept(
+        client, tenant_id, owner_token, role="member"
+    )
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=LocalFilesystemStorageProvider(tmp_path),
+    ):
+        upload = await client.post(
+            f"/api/v1/tenants/{tenant_id}/documents",
+            files={"file": ("notes.txt", b"hello from the owner", "text/plain")},
+            headers=_auth_headers(owner_token),
+        )
+    document_id = upload.json()["id"]
+    async with async_session_factory() as session:
+        db_document = await session.get(Document, document_id)
+        db_document.status = "failed"
+        db_document.error_message = "embedding is down"
+        await session.commit()
+
+    member_retry = await client.post(
+        f"/api/v1/tenants/{tenant_id}/documents",
+        data={"document_id": document_id, "retry": "true"},
+        headers=_auth_headers(member_token),
+    )
+    assert member_retry.status_code == 403
+
+    owner_retry = await client.post(
+        f"/api/v1/tenants/{tenant_id}/documents",
+        data={"document_id": document_id, "retry": "true"},
+        headers=_auth_headers(owner_token),
+    )
+    assert owner_retry.status_code == 200
+    body = owner_retry.json()
+    assert body["status"] == "pending"
+    assert body["error_message"] is None
+
+
+@pytest.mark.asyncio
+async def test_retry_company_document_rejects_a_document_that_is_not_failed(
+    client: AsyncClient, tmp_path
+):
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=LocalFilesystemStorageProvider(tmp_path),
+    ):
+        upload = await client.post(
+            f"/api/v1/tenants/{tenant_id}/documents",
+            files={"file": ("notes.txt", b"hello from the owner", "text/plain")},
+            headers=_auth_headers(owner_token),
+        )
+    document_id = upload.json()["id"]
+    async with async_session_factory() as session:
+        db_document = await session.get(Document, document_id)
+        db_document.status = "completed"
+        await session.commit()
+
+    response = await client.post(
+        f"/api/v1/tenants/{tenant_id}/documents",
+        data={"document_id": document_id, "retry": "true"},
+        headers=_auth_headers(owner_token),
+    )
+    assert response.status_code == 409
+
+
 class _SigningStorage(LocalFilesystemStorageProvider):
     """Local storage that also "signs" download URLs, recording each call."""
 

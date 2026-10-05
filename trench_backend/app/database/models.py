@@ -199,6 +199,17 @@ class Document(BaseModel):
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # The text ParsingService.parse extracted from the raw file, cached so
+    # a retry (see DocumentService.retry_document) after a chunking/
+    # embedding/indexing failure never re-downloads from storage or
+    # re-runs LlamaParse -- both real costs -- for a document whose
+    # parsing already succeeded. Set once, right after parsing; cleared
+    # back to NULL the moment the document reaches status="completed"
+    # (see DocumentIngestionService.process), since nothing reads it past
+    # that point and keeping it around would permanently duplicate every
+    # document's full text in Postgres on top of what's already in
+    # Pinecone's chunk metadata.
+    parsed_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Provider(BaseModel):
@@ -366,9 +377,7 @@ class Invitation(BaseModel):
     """
 
     __tablename__ = "invitations"
-    __table_args__ = (
-        UniqueConstraint("token_hash", name="uq_invitations_token_hash"),
-    )
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_invitations_token_hash"),)
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

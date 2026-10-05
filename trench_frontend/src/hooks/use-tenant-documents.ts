@@ -6,6 +6,7 @@ import {
   deleteCompanyDocument,
   getCompanyDownloadUrl,
   listCompanyDocuments,
+  retryCompanyDocument,
   uploadCompanyDocument,
 } from "@/lib/tenant-documents";
 
@@ -36,6 +37,19 @@ export function useUploadCompanyDocument(tenantId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (file: File) => uploadCompanyDocument(tenantId, file),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: companyDocumentsQueryKey(tenantId),
+      });
+    },
+  });
+}
+
+export function useRetryCompanyDocument(tenantId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (documentId: string) =>
+      retryCompanyDocument(tenantId, documentId),
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: companyDocumentsQueryKey(tenantId),

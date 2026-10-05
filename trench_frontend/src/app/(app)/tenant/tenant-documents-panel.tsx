@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Download, Eye, FileText, ShieldAlert, Trash2 } from "lucide-react";
+import { Download, Eye, FileText, RotateCcw, ShieldAlert, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ConfirmDialog, useConfirmTarget } from "@/components/confirm-dialog";
@@ -13,6 +13,7 @@ import {
   useCompanyDocuments,
   useDeleteCompanyDocument,
   useDownloadCompanyDocument,
+  useRetryCompanyDocument,
   useUploadCompanyDocument,
   useViewCompanyDocument,
 } from "@/hooks/use-tenant-documents";
@@ -43,6 +44,7 @@ export function TenantDocumentsPanel({
   const remove = useDeleteCompanyDocument(tenantId);
   const view = useViewCompanyDocument(tenantId);
   const download = useDownloadCompanyDocument(tenantId);
+  const retry = useRetryCompanyDocument(tenantId);
   const deleteTarget = useConfirmTarget<DocumentSummary>();
   const [uploadError, setUploadError] = useState<string | null>(null);
 
@@ -54,6 +56,13 @@ export function TenantDocumentsPanel({
 
   const handleDownload = (doc: DocumentSummary) => {
     download.mutate(doc.id, {
+      onError: (err) => toast.error(getErrorMessage(err)),
+    });
+  };
+
+  const handleRetry = (doc: DocumentSummary) => {
+    retry.mutate(doc.id, {
+      onSuccess: () => toast.success(`Retrying "${doc.document_name}"…`),
       onError: (err) => toast.error(getErrorMessage(err)),
     });
   };
@@ -171,6 +180,17 @@ export function TenantDocumentsPanel({
                 >
                   <Download className="size-4" />
                 </Button>
+                {doc.status === "failed" && (
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Retry processing"
+                    disabled={retry.isPending && retry.variables === doc.id}
+                    onClick={() => handleRetry(doc)}
+                  >
+                    <RotateCcw className="size-4" />
+                  </Button>
+                )}
                 <Button
                   variant="ghost"
                   size="icon-sm"

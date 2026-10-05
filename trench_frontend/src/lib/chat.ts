@@ -3,6 +3,11 @@ import type { MessageStatus, RetrievedChunk } from "@/lib/threads";
 
 export type KnowledgeType = "personal" | "company";
 
+// Mirrors ChatMessageRequest.query's max_length in app/schemas/chat.py --
+// the backend rejects anything longer with a 422, so the composer should
+// never let the user submit past this in the first place.
+export const MAX_QUERY_LENGTH = 4000;
+
 export interface SendMessageAccepted {
   stream_id: string;
   status: MessageStatus;

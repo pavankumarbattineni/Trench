@@ -8,7 +8,6 @@ directly rather than sent through LlamaParse for no benefit.
 
 import asyncio
 import selectors
-from functools import lru_cache
 
 import nest_asyncio
 from llama_cloud_services import LlamaParse
@@ -21,10 +20,47 @@ _EXTENSION_BY_MIME = {
 }
 
 
-@lru_cache
-def _llamaparse_client() -> LlamaParse:
+def _new_llamaparse_client() -> LlamaParse:
     api_key = get_settings().TRENCH_CONFIG.LLAMAPARSE.api_key
     return LlamaParse(api_key=api_key, result_type="markdown")
+
+
+async def _parse_async(content: bytes, extension: str) -> str:
+    """Builds a fresh LlamaParse client for this call and closes its
+    underlying httpx connection before returning.
+
+    LlamaParse lazily opens its own httpx.AsyncClient the first time it's
+    used, bound to whichever event loop is running at that moment (see
+    llama_cloud_services.parse.base.BaseAsyncParse.aclient). A single
+    *cached* client (the previous design, via @lru_cache) would therefore
+    end up holding a connection tied to this call's loop even after
+    _parse_sync's own `finally` closes that loop -- the next call, with a
+    fresh loop, would reuse the same cached client, and the moment httpx
+    tried to clean up that leftover connection it would call back into
+    the long-dead first loop and raise "RuntimeError: Event loop is
+    closed". A new client per call, explicitly closed here before this
+    loop closes, keeps every connection's lifetime scoped to exactly the
+    one loop that created it.
+    """
+    client = _new_llamaparse_client()
+    try:
+        result = await client.aparse(
+            content, extra_info={"file_name": f"upload.{extension}"}
+        )
+        # result.aget_text(), not the sync result.get_text() -- get_text()
+        # calls llama_index's asyncio_run(), which (correctly) detects
+        # we're already inside a running loop here and "solves" that by
+        # spawning a brand new thread with a brand new, unpatched loop to
+        # run aget_text() on instead. That inner call still reuses this
+        # same client's httpx.AsyncClient/anyio primitives, which were
+        # created on *this* loop/thread -- using them from the spawned
+        # thread's different loop raises "bound to a different event
+        # loop" (or, worse, intermittently just hangs/half-fails,
+        # depending on timing). Awaiting aget_text() directly keeps
+        # everything on this one loop and thread, where it belongs.
+        return await result.aget_text()
+    finally:
+        await client.aclient.aclose()
 
 
 def _parse_sync(content: bytes, extension: str) -> str:
@@ -45,19 +81,14 @@ def _parse_sync(content: bytes, extension: str) -> str:
     """
     loop = asyncio.SelectorEventLoop(selectors.DefaultSelector())
     nest_asyncio.apply(loop)
-    # `result.get_text()` below is a sync method that itself internally
-    # runs a further nested coroutine via `asyncio.get_event_loop()` --
-    # without setting this as the thread's current loop, that call would
-    # fall back to the (unpatchable) uvloop policy instead of reusing our
-    # patched loop.
+    # Some of LlamaParse's internals still fall back to
+    # `asyncio.get_event_loop()` rather than using whatever loop is
+    # actually driving the current call -- setting this as the thread's
+    # current loop makes sure that falls back to our patched loop instead
+    # of the (unpatchable) uvloop policy uvicorn installs process-wide.
     asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(
-            _llamaparse_client().aparse(
-                content, extra_info={"file_name": f"upload.{extension}"}
-            )
-        )
-        return result.get_text()
+        return loop.run_until_complete(_parse_async(content, extension))
     finally:
         asyncio.set_event_loop(None)
         loop.close()

@@ -50,15 +50,26 @@ class DocumentIngestionService:
             document.status = "processing"
             await db.commit()
 
-            # A storage failure raises DocumentStorageError, whose message
-            # is written for the user ("Failed to read the document from
-            # storage.") -- it's handled by the same catch-all below as any
-            # parse/embed/index failure, landing as status="failed" with
-            # that message as error_message.
-            raw_bytes = await get_storage_provider().read(document.storage_path)
-            text = await ParsingService.parse(
-                raw_bytes, document.mime_type, filename=document.document_name
-            )
+            # Reuses a prior successful parse if one is cached (see
+            # Document.parsed_text's own docstring) -- a retry after a
+            # chunking/embedding/indexing failure shouldn't re-download
+            # from storage or re-run LlamaParse, both real per-call costs,
+            # for a document whose text was already correctly extracted.
+            if document.parsed_text is not None:
+                text = document.parsed_text
+            else:
+                # A storage failure raises DocumentStorageError, whose
+                # message is written for the user ("Failed to read the
+                # document from storage.") -- it's handled by the same
+                # catch-all below as any parse/embed/index failure,
+                # landing as status="failed" with that message as
+                # error_message.
+                raw_bytes = await get_storage_provider().read(document.storage_path)
+                text = await ParsingService.parse(
+                    raw_bytes, document.mime_type, filename=document.document_name
+                )
+                document.parsed_text = text
+                await db.commit()
             pieces = ChunkingService.chunk(text)
             # The embedded/sparse-encoded text is contextualized with the
             # document name and heading path (e.g. "Refunds > Timelines")
@@ -117,6 +128,14 @@ class DocumentIngestionService:
             document.chunk_count = len(pieces)
             document.status = "completed"
             document.processed_at = datetime.now(UTC)
+            # Nothing reads parsed_text once a document has successfully
+            # completed -- it only exists to let a retry skip re-parsing
+            # after a chunking/embedding/indexing failure (see its own
+            # docstring). Clearing it here, in the same transaction as the
+            # completion itself, avoids permanently duplicating every
+            # document's full text in Postgres on top of what's already
+            # in Pinecone's chunk metadata.
+            document.parsed_text = None
             await db.commit()
             logger.info(
                 "Document ingestion completed | document_id=%s chunks=%d",
