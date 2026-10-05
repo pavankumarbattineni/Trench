@@ -17,42 +17,49 @@ export interface DocumentSummary {
   processed_at: string | null;
 }
 
-export async function listDocuments(): Promise<DocumentSummary[]> {
+// Every function below is personal-scoped unless `tenantId` is given, in
+// which case it operates on that tenant's company documents instead --
+// mirrors the backend's single /documents router (see
+// app/router/documents.py), which distinguishes the two scopes the same
+// way rather than exposing two separate sets of endpoints.
+
+export async function listDocuments(tenantId?: string): Promise<DocumentSummary[]> {
   const { data } = await apiClient.get<{ documents: DocumentSummary[] }>(
-    "/api/v1/documents"
+    "/api/v1/documents",
+    { params: tenantId ? { tenant_id: tenantId } : undefined }
   );
   return data.documents;
 }
 
-export async function getDocument(documentId: string): Promise<DocumentSummary> {
-  const { data } = await apiClient.get<DocumentSummary>(
-    `/api/v1/documents/${documentId}`
-  );
-  return data;
-}
-
-export async function uploadDocument(file: File): Promise<DocumentSummary> {
+export async function uploadDocument(
+  file: File,
+  tenantId?: string
+): Promise<DocumentSummary> {
   const form = new FormData();
   form.append("file", file);
-  const { data } = await apiClient.post<DocumentSummary>(
-    "/api/v1/documents",
-    form
-  );
+  if (tenantId) form.append("tenant_id", tenantId);
+  const { data } = await apiClient.post<DocumentSummary>("/api/v1/documents", form);
   return data;
 }
 
-export async function deleteDocument(documentId: string): Promise<void> {
-  await apiClient.delete(`/api/v1/documents/${documentId}`);
+export async function deleteDocument(
+  documentId: string,
+  tenantId?: string
+): Promise<void> {
+  await apiClient.delete(`/api/v1/documents/${documentId}`, {
+    params: tenantId ? { tenant_id: tenantId } : undefined,
+  });
 }
 
-export async function retryDocument(documentId: string): Promise<DocumentSummary> {
+export async function retryDocument(
+  documentId: string,
+  tenantId?: string
+): Promise<DocumentSummary> {
   const form = new FormData();
   form.append("document_id", documentId);
   form.append("retry", "true");
-  const { data } = await apiClient.post<DocumentSummary>(
-    "/api/v1/documents",
-    form
-  );
+  if (tenantId) form.append("tenant_id", tenantId);
+  const { data } = await apiClient.post<DocumentSummary>("/api/v1/documents", form);
   return data;
 }
 
@@ -63,11 +70,12 @@ export interface DownloadUrlResponse {
 
 export async function getDownloadUrl(
   documentId: string,
-  disposition: "inline" | "attachment"
+  disposition: "inline" | "attachment",
+  tenantId?: string
 ): Promise<DownloadUrlResponse> {
   const { data } = await apiClient.get<DownloadUrlResponse>(
     `/api/v1/documents/${documentId}/download`,
-    { params: { disposition } }
+    { params: { disposition, ...(tenantId ? { tenant_id: tenantId } : {}) } }
   );
   return data;
 }

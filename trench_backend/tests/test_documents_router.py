@@ -127,9 +127,6 @@ async def test_upload_list_get_and_delete_document_via_api(
         assert list_response.status_code == 200
         assert len(list_response.json()["documents"]) == 1
 
-        get_response = await client.get(f"/api/v1/documents/{document['id']}")
-        assert get_response.status_code == 200
-
         # Ingestion is stubbed out (see `_no_real_ingestion` above), so the
         # document would otherwise sit in "pending" forever -- delete
         # correctly refuses to remove a pending/processing document (see
@@ -148,7 +145,7 @@ async def test_upload_list_get_and_delete_document_via_api(
 
 
 @pytest.mark.asyncio
-async def test_cannot_access_another_users_document(client: AsyncClient, tmp_path):
+async def test_cannot_delete_another_users_document(client: AsyncClient, tmp_path):
     await _login(client)
 
     with patch(
@@ -163,7 +160,7 @@ async def test_cannot_access_another_users_document(client: AsyncClient, tmp_pat
 
     await _login(client, uid=OTHER_FIREBASE_UID, email=OTHER_EMAIL)
 
-    response = await client.get(f"/api/v1/documents/{document_id}")
+    response = await client.delete(f"/api/v1/documents/{document_id}")
     assert response.status_code == 404
 
 
@@ -401,5 +398,5 @@ async def test_delete_succeeds_even_if_storage_delete_fails(
         response = await client.delete(f"/api/v1/documents/{document_id}")
     assert response.status_code == 204
 
-    get_response = await client.get(f"/api/v1/documents/{document_id}")
-    assert get_response.status_code == 404
+    list_response = await client.get("/api/v1/documents")
+    assert document_id not in [doc["id"] for doc in list_response.json()["documents"]]

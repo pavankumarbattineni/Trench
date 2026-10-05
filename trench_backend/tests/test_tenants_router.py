@@ -351,6 +351,9 @@ async def test_standalone_list_knowledge_access_endpoint_was_removed(
     assert response.status_code == 405
 
 
+# --- Company documents via the unified /documents endpoint (tenant_id) ------
+
+
 @pytest.mark.asyncio
 async def test_admin_and_member_can_upload_or_be_denied_company_documents(
     client: AsyncClient, tmp_path
@@ -365,14 +368,16 @@ async def test_admin_and_member_can_upload_or_be_denied_company_documents(
         return_value=LocalFilesystemStorageProvider(tmp_path),
     ):
         member_upload = await client.post(
-            f"/api/v1/tenants/{tenant_id}/documents",
+            "/api/v1/documents",
+            data={"tenant_id": tenant_id},
             files={"file": ("notes.txt", b"hello", "text/plain")},
             headers=_auth_headers(_member_token),
         )
         assert member_upload.status_code == 403
 
         owner_upload = await client.post(
-            f"/api/v1/tenants/{tenant_id}/documents",
+            "/api/v1/documents",
+            data={"tenant_id": tenant_id},
             files={"file": ("notes.txt", b"hello from the owner", "text/plain")},
             headers=_auth_headers(owner_token),
         )
@@ -385,7 +390,8 @@ async def test_admin_and_member_can_upload_or_be_denied_company_documents(
             await session.commit()
 
         delete_response = await client.delete(
-            f"/api/v1/tenants/{tenant_id}/documents/{document_id}",
+            f"/api/v1/documents/{document_id}",
+            params={"tenant_id": tenant_id},
             headers=_auth_headers(owner_token),
         )
         assert delete_response.status_code == 204
@@ -405,7 +411,8 @@ async def test_member_cannot_retry_company_document_only_admin_can(
         return_value=LocalFilesystemStorageProvider(tmp_path),
     ):
         upload = await client.post(
-            f"/api/v1/tenants/{tenant_id}/documents",
+            "/api/v1/documents",
+            data={"tenant_id": tenant_id},
             files={"file": ("notes.txt", b"hello from the owner", "text/plain")},
             headers=_auth_headers(owner_token),
         )
@@ -417,15 +424,15 @@ async def test_member_cannot_retry_company_document_only_admin_can(
         await session.commit()
 
     member_retry = await client.post(
-        f"/api/v1/tenants/{tenant_id}/documents",
-        data={"document_id": document_id, "retry": "true"},
+        "/api/v1/documents",
+        data={"tenant_id": tenant_id, "document_id": document_id, "retry": "true"},
         headers=_auth_headers(member_token),
     )
     assert member_retry.status_code == 403
 
     owner_retry = await client.post(
-        f"/api/v1/tenants/{tenant_id}/documents",
-        data={"document_id": document_id, "retry": "true"},
+        "/api/v1/documents",
+        data={"tenant_id": tenant_id, "document_id": document_id, "retry": "true"},
         headers=_auth_headers(owner_token),
     )
     assert owner_retry.status_code == 200
@@ -445,7 +452,8 @@ async def test_retry_company_document_rejects_a_document_that_is_not_failed(
         return_value=LocalFilesystemStorageProvider(tmp_path),
     ):
         upload = await client.post(
-            f"/api/v1/tenants/{tenant_id}/documents",
+            "/api/v1/documents",
+            data={"tenant_id": tenant_id},
             files={"file": ("notes.txt", b"hello from the owner", "text/plain")},
             headers=_auth_headers(owner_token),
         )
@@ -456,8 +464,8 @@ async def test_retry_company_document_rejects_a_document_that_is_not_failed(
         await session.commit()
 
     response = await client.post(
-        f"/api/v1/tenants/{tenant_id}/documents",
-        data={"document_id": document_id, "retry": "true"},
+        "/api/v1/documents",
+        data={"tenant_id": tenant_id, "document_id": document_id, "retry": "true"},
         headers=_auth_headers(owner_token),
     )
     assert response.status_code == 409
@@ -482,7 +490,8 @@ async def _upload_company_document(
         "app.service.document_service.get_storage_provider", return_value=storage
     ):
         response = await client.post(
-            f"/api/v1/tenants/{tenant_id}/documents",
+            "/api/v1/documents",
+            data={"tenant_id": tenant_id},
             files={"file": ("policy.txt", b"company policy text", "text/plain")},
             headers=_auth_headers(owner_token),
         )
@@ -506,12 +515,14 @@ async def test_company_document_download_is_admin_or_owner_only(
     document_id = await _upload_company_document(
         client, tenant_id, owner_token, storage
     )
-    url = f"/api/v1/tenants/{tenant_id}/documents/{document_id}/download"
+    url = f"/api/v1/documents/{document_id}/download"
 
     with patch(
         "app.service.document_service.get_storage_provider", return_value=storage
     ):
-        owner_response = await client.get(url, headers=_auth_headers(owner_token))
+        owner_response = await client.get(
+            url, params={"tenant_id": tenant_id}, headers=_auth_headers(owner_token)
+        )
         assert owner_response.status_code == 200
         assert owner_response.json() == {
             "url": "https://signed.example/company-download",
@@ -524,7 +535,7 @@ async def test_company_document_download_is_admin_or_owner_only(
         # download is the point of this test.
         member_response = await client.get(
             url,
-            params={"disposition": "attachment"},
+            params={"tenant_id": tenant_id, "disposition": "attachment"},
             headers=_auth_headers(member_token),
         )
         assert member_response.status_code == 403
@@ -575,12 +586,14 @@ async def test_company_document_download_is_scoped_to_the_callers_tenant(
     ):
         # Asking under tenant B's id: no company-knowledge access there.
         other_tenant = await client.get(
-            f"/api/v1/tenants/{tenant_b_id}/documents/{document_b_id}/download",
+            f"/api/v1/documents/{document_b_id}/download",
+            params={"tenant_id": tenant_b_id},
             headers=_auth_headers(owner_a_token),
         )
         # Asking under the caller's own tenant id for tenant B's document.
         wrong_scope = await client.get(
-            f"/api/v1/tenants/{tenant_a_id}/documents/{document_b_id}/download",
+            f"/api/v1/documents/{document_b_id}/download",
+            params={"tenant_id": tenant_a_id},
             headers=_auth_headers(owner_a_token),
         )
 
@@ -1006,11 +1019,13 @@ async def test_bulk_revoke_then_bulk_grant_knowledge_access(client: AsyncClient)
     assert revoke.json()["revoked_count"] == 1
 
     member_docs = await client.get(
-        f"/api/v1/tenants/{tenant_id}/documents",
+        "/api/v1/documents",
+        params={"tenant_id": tenant_id},
         headers=_auth_headers(member_token),
     )
     admin_docs = await client.get(
-        f"/api/v1/tenants/{tenant_id}/documents",
+        "/api/v1/documents",
+        params={"tenant_id": tenant_id},
         headers=_auth_headers(admin_token),
     )
     assert member_docs.status_code == 403
@@ -1027,7 +1042,8 @@ async def test_bulk_revoke_then_bulk_grant_knowledge_access(client: AsyncClient)
     assert grant.json()["granted_count"] == 3
 
     member_docs = await client.get(
-        f"/api/v1/tenants/{tenant_id}/documents",
+        "/api/v1/documents",
+        params={"tenant_id": tenant_id},
         headers=_auth_headers(member_token),
     )
     assert member_docs.status_code == 200

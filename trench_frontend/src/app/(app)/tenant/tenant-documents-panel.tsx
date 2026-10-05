@@ -10,13 +10,13 @@ import { UploadDropzone } from "@/components/documents/upload-dropzone";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  useCompanyDocuments,
-  useDeleteCompanyDocument,
-  useDownloadCompanyDocument,
-  useRetryCompanyDocument,
-  useUploadCompanyDocument,
-  useViewCompanyDocument,
-} from "@/hooks/use-tenant-documents";
+  useDeleteDocument,
+  useDocuments,
+  useDownloadDocument,
+  useRetryDocument,
+  useUploadDocument,
+  useViewDocument,
+} from "@/hooks/use-documents";
 import { getErrorMessage } from "@/lib/errors";
 import { formatBytes, type DocumentSummary } from "@/lib/documents";
 
@@ -36,15 +36,15 @@ export function TenantDocumentsPanel({
   canManage,
   canView,
 }: TenantDocumentsPanelProps) {
-  const { data: documents, isLoading, isError, error } = useCompanyDocuments(
+  const { data: documents, isLoading, isError, error } = useDocuments(
     tenantId,
     canView
   );
-  const upload = useUploadCompanyDocument(tenantId);
-  const remove = useDeleteCompanyDocument(tenantId);
-  const view = useViewCompanyDocument(tenantId);
-  const download = useDownloadCompanyDocument(tenantId);
-  const retry = useRetryCompanyDocument(tenantId);
+  const upload = useUploadDocument(tenantId);
+  const remove = useDeleteDocument(tenantId);
+  const view = useViewDocument(tenantId);
+  const download = useDownloadDocument(tenantId);
+  const retry = useRetryDocument(tenantId);
   const deleteTarget = useConfirmTarget<DocumentSummary>();
   const [uploadError, setUploadError] = useState<string | null>(null);
 

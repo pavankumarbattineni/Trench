@@ -1,19 +1,20 @@
-"""Membership management, company-knowledge access grants, and
-company-document management for a tenant.
+"""Membership management and company-knowledge access grants for a
+tenant.
 
 Tenant creation happens only via POST /auth/signup/owner (see
 app/router/auth.py) -- invitation-only onboarding means there is no
 self-service "create a tenant" endpoint here.
 
-Most mutations here (grant/revoke knowledge access, upload/delete a
-company document, remove a Member) require the caller to be an Admin or
-the Owner of the tenant in question -- enforced by the
-`require_tenant_admin_or_owner` dependency, never by trusting a frontend's
-decision to hide a button. A smaller set (promoting a Member to Admin,
-removing an Admin, bulk-removing every member) is Owner-only, enforced by
-an explicit `role == "owner"` check. Document management (upload/delete)
-has no delegation path -- a member can only ever be granted read/query
-access via `knowledge-access`, never the ability to manage documents.
+Company-document management (upload/retry/list/download/delete) lives in
+app/router/documents.py instead, as the `tenant_id`-parameterized half of
+the same four endpoints personal documents use -- not here.
+
+Most mutations here (grant/revoke knowledge access, remove a Member)
+require the caller to be an Admin or the Owner of the tenant in question
+-- enforced by the `require_tenant_admin_or_owner` dependency, never by
+trusting a frontend's decision to hide a button. A smaller set (promoting
+a Member to Admin, removing an Admin, bulk-removing every member) is
+Owner-only, enforced by an explicit `role == "owner"` check.
 
 Knowledge-access grant/revoke and member removal both take their target as
 a query parameter (not a path segment), and both support a bulk "apply to
@@ -37,7 +38,6 @@ target, and rejects one that gives both (ambiguous) with a 422.
 import csv
 import io
 import uuid
-from typing import Literal
 
 import openpyxl
 from fastapi import (
@@ -53,18 +53,12 @@ from fastapi import (
 from pydantic import EmailStr, TypeAdapter, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Document, Invitation, Tenant, User
+from app.database.models import Invitation, Tenant, User
 from app.database.session import get_db
 from app.router.deps import (
     get_current_user,
-    require_company_knowledge_access,
     require_tenant_admin_or_owner,
     require_tenant_member,
-)
-from app.schemas.document import (
-    DocumentListResponse,
-    DocumentResponse,
-    DownloadUrlResponse,
 )
 from app.schemas.invitation import (
     BulkInvitationResult,
@@ -80,7 +74,6 @@ from app.schemas.tenant import (
     TenantMemberResponse,
     UpdateMemberRoleRequest,
 )
-from app.service.document_service import DOWNLOAD_URL_EXPIRES_IN, DocumentService
 from app.service.invitation_service import (
     DomainMismatchError,
     InvitationService,
@@ -419,171 +412,6 @@ async def revoke_knowledge_access(
     if member is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Member not found")
     return _member_response(member)
-
-
-@router.post("/{tenant_id}/documents", response_model=DocumentResponse)
-async def upload_company_document(
-    tenant_id: uuid.UUID,
-    file: UploadFile | None = File(default=None),
-    document_id: uuid.UUID | None = Form(default=None),
-    retry: bool = Form(default=False),
-    admin: User = Depends(require_tenant_admin_or_owner),
-    db: AsyncSession = Depends(get_db),
-) -> Document:
-    """Uploads a company-knowledge document, or (with retry=true)
-    re-triggers ingestion for an existing failed one. Admin only --
-    document management has no delegation path; a member can only ever be
-    granted read/query access (see knowledge-access above).
-
-    Args:
-        tenant_id: The tenant this document belongs to.
-        file: The document file (PDF, DOCX, TXT, or Markdown). Required
-            unless retry=true, since a retry reuses the bytes already in
-            storage from the original upload.
-        document_id: The document to retry. Required when retry=true;
-            ignored otherwise.
-        retry: When true, re-triggers ingestion for `document_id` instead
-            of accepting a new upload.
-        admin: The authenticated Admin/Owner performing the upload/retry.
-        db: An active async SQLAlchemy session.
-
-    Returns:
-        The created (or, if this exact file was already uploaded for this
-        tenant, the existing) document on a normal upload; the retried
-        Document (status reset to "pending") when retry=true.
-
-    Raises:
-        HTTPException: 422 if neither a file nor retry=true+document_id
-            was given, or on an invalid file; 404 if the tenant doesn't
-            exist, or (on retry) document_id doesn't belong to it; 403 if
-            the caller isn't an admin of it; 409 if the admin already has
-            a document pending/processing, or (on retry) the document
-            isn't currently "failed".
-    """
-    if retry:
-        if document_id is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                "document_id is required when retry=true.",
-            )
-        return await DocumentService.retry_company_document(
-            db, admin=admin, tenant_id=tenant_id, document_id=document_id
-        )
-
-    if file is None:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "A file is required unless retry=true.",
-        )
-    content = await file.read()
-    return await DocumentService.upload_document(
-        db,
-        user=admin,
-        filename=file.filename or "untitled",
-        content=content,
-        knowledge_type="company",
-        tenant_id=tenant_id,
-    )
-
-
-@router.get("/{tenant_id}/documents", response_model=DocumentListResponse)
-async def list_company_documents(
-    tenant_id: uuid.UUID,
-    _access: uuid.UUID = Depends(require_company_knowledge_access),
-    db: AsyncSession = Depends(get_db),
-) -> DocumentListResponse:
-    """Lists a tenant's company documents. Requires company-knowledge
-    access (an admin, or a member explicitly granted it) -- members can
-    view/list documents without being able to upload or delete them.
-
-    Args:
-        tenant_id: The tenant whose company documents to list.
-        _access: The resolved, authorized tenant_id (only used to enforce
-            that the caller has company-knowledge access).
-        db: An active async SQLAlchemy session.
-
-    Returns:
-        Every company document for the tenant.
-
-    Raises:
-        HTTPException: 403 if the caller doesn't have company-knowledge
-            access to this tenant.
-    """
-    documents = await DocumentService.list_company_documents(db, tenant_id=tenant_id)
-    return DocumentListResponse(documents=documents)
-
-
-@router.get(
-    "/{tenant_id}/documents/{document_id}/download",
-    response_model=DownloadUrlResponse,
-)
-async def download_company_document(
-    tenant_id: uuid.UUID,
-    document_id: uuid.UUID,
-    disposition: Literal["inline", "attachment"] = Query("inline"),
-    _admin: User = Depends(require_tenant_admin_or_owner),
-    db: AsyncSession = Depends(get_db),
-) -> DownloadUrlResponse:
-    """Returns a short-lived presigned URL to a company document.
-
-    Deliberately stricter than listing: any member with company-knowledge
-    access can have these documents searched on their behalf in chat
-    (see RetrievalService), but opening/saving the raw file is
-    Admin/Owner-only -- a member's grant is a *retrieval* permission, not
-    a document-management one. Enforced here, not just hidden in the UI,
-    so a member can't reach the file by calling this endpoint directly.
-
-    Args:
-        tenant_id: The tenant the document belongs to.
-        document_id: The document to download.
-        disposition: "inline" to view in the browser, "attachment" to
-            force a download.
-        _admin: The resolved caller, who must be an Admin or the Owner of
-            `tenant_id` (only used to enforce that).
-        db: An active async SQLAlchemy session.
-
-    Returns:
-        The presigned URL and its lifetime in seconds.
-
-    Raises:
-        HTTPException: 403 if the caller isn't an Admin/Owner of this
-            tenant; 404 if the document doesn't exist or belongs to a
-            different tenant; 502 if the storage backend can't sign the
-            URL.
-    """
-    url = await DocumentService.generate_company_download_url(
-        db, tenant_id=tenant_id, document_id=document_id, disposition=disposition
-    )
-    return DownloadUrlResponse(url=url, expires_in=DOWNLOAD_URL_EXPIRES_IN)
-
-
-@router.delete(
-    "/{tenant_id}/documents/{document_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def delete_company_document(
-    tenant_id: uuid.UUID,
-    document_id: uuid.UUID,
-    _admin: User = Depends(require_tenant_admin_or_owner),
-    db: AsyncSession = Depends(get_db),
-) -> None:
-    """Deletes a company document. Admin only.
-
-    Args:
-        tenant_id: The tenant the document belongs to.
-        document_id: The document to delete.
-        _admin: The caller (only used to enforce the admin-only
-            requirement).
-        db: An active async SQLAlchemy session.
-
-    Raises:
-        HTTPException: 404 if the document doesn't exist or belongs to a
-            different tenant; 403 if the caller isn't an admin of it; 409
-            if the document is still pending/processing.
-    """
-    await DocumentService.delete_company_document(
-        db, tenant_id=tenant_id, document_id=document_id
-    )
 
 
 def _invitation_response(invitation: Invitation) -> InvitationResponse:
