@@ -129,7 +129,7 @@ export function ApiKeyManager({
                 <p className="text-sm font-medium">
                   {providerLabel(credential.provider_type)}
                 </p>
-                <p className="font-mono text-xs text-muted-foreground">
+                <p className="truncate font-mono text-xs text-muted-foreground">
                   {credential.masked_preview}
                 </p>
               </div>

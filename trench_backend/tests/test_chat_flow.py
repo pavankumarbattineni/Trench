@@ -571,6 +571,70 @@ async def test_insufficient_retrieval_retries_up_to_the_cap_then_completes(
 
 
 @pytest.mark.asyncio
+async def test_retrieval_retry_count_does_not_leak_into_the_next_turn(
+    client: AsyncClient,
+):
+    """retrieval_attempts/retrieval_sufficient/last_retrieval_top_score
+    are per-turn bookkeeping for the retrieve/reformulate retry loop, but
+    the LangGraph checkpointer persists the *entire* graph state across
+    turns in the same thread -- any of those keys ChatService._run_
+    generation's initial_state forgot to reset would carry over the
+    previous turn's final value instead of starting fresh. Exhausts the
+    retry loop on turn 1 (maxing retrieval_attempts out at
+    MAX_RETRIEVAL_ATTEMPTS), then asserts turn 2 still gets its own full
+    set of retries rather than immediately short-circuiting to generate()
+    because the carried-over count already looks maxed out."""
+    await _login(client)
+    await _seed_completed_personal_document(_EMAIL)
+    thread = (await client.post("/api/v1/threads")).json()
+
+    retrieve_calls = 0
+
+    async def _always_mediocre_retrieve(*, query, scope, top_k=8):
+        nonlocal retrieve_calls
+        retrieve_calls += 1
+        return [
+            RetrievedChunk(
+                chunk_id="weak-chunk",
+                document_id="fake-doc-1",
+                document_name="notes.txt",
+                chunk_index=0,
+                content="tangentially related content",
+                score=0.15,
+            )
+        ]
+
+    async def _fast_stream_generate(resolved, *, system_prompt, messages):
+        for word in ["Hello", " ", "there", "!"]:
+            yield word
+
+    with (
+        patch(
+            "app.service.llm_client_service.LLMClientService.stream_generate",
+            _fast_stream_generate,
+        ),
+        patch(
+            "app.graph.rag_graph.RetrievalService.retrieve", _always_mediocre_retrieve
+        ),
+    ):
+        first = await client.post(
+            f"/api/v1/chat/threads/{thread['id']}/messages",
+            json={"query": "What's in my notes?", "knowledge_type": "personal"},
+        )
+        await _wait_for_status(client, first.json()["stream_id"], "completed")
+        assert retrieve_calls == MAX_RETRIEVAL_ATTEMPTS
+
+        retrieve_calls = 0
+        second = await client.post(
+            f"/api/v1/chat/threads/{thread['id']}/messages",
+            json={"query": "Anything else in there?", "knowledge_type": "personal"},
+        )
+        await _wait_for_status(client, second.json()["stream_id"], "completed")
+
+    assert retrieve_calls == MAX_RETRIEVAL_ATTEMPTS
+
+
+@pytest.mark.asyncio
 async def test_chat_turn_tags_its_langsmith_trace(client: AsyncClient):
     """Every turn's LangGraph invocation carries tags/metadata (knowledge
     type, user, thread) so a real LangSmith trace can be filtered/found --

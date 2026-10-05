@@ -63,6 +63,23 @@ export async function retryDocument(
   return data;
 }
 
+export interface DocumentStatusSummary {
+  status: DocumentStatus;
+}
+
+// Deliberately not tenant-scoped -- the backend resolves visibility from
+// the document's own knowledge_type (see
+// app/router/documents.py:get_document_status), so there's no tenant_id
+// to pass here even for a company document.
+export async function getDocumentStatus(
+  documentId: string
+): Promise<DocumentStatusSummary> {
+  const { data } = await apiClient.get<DocumentStatusSummary>(
+    `/api/v1/documents/${documentId}/status`
+  );
+  return data;
+}
+
 export interface DownloadUrlResponse {
   url: string;
   expires_in: number;

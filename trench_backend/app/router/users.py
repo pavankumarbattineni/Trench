@@ -53,8 +53,13 @@ async def update_current_user_model(
         The user's updated profile.
 
     Raises:
-        HTTPException: 404 if the model id doesn't exist; 422 if it exists
-            but is no longer active/selectable.
+        HTTPException: 404 if the model id doesn't exist; 403 if
+            `body.knowledge_type="company"` but the user has no company
+            knowledge access; 422 if the model exists but is no longer
+            active/selectable, or needs a BYOK credential the relevant
+            scope doesn't have.
     """
-    user = await UserPreferenceService.update_model(db, current_user, body.model_id)
+    user = await UserPreferenceService.update_model(
+        db, current_user, body.model_id, knowledge_type=body.knowledge_type
+    )
     return await UserProfileService.build_response(db, user)

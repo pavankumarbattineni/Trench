@@ -39,10 +39,10 @@ export function ChatComposer({
 }: ChatComposerProps) {
   const isBusy = isSending || isStreaming;
   const { user } = useAuth();
-  const { data: config } = useConfig();
-  const updateModel = useUpdateModel();
   const [query, setQuery] = useState("");
   const [knowledgeType, setKnowledgeType] = useState<KnowledgeType>("personal");
+  const { data: config } = useConfig(knowledgeType);
+  const updateModel = useUpdateModel();
 
   // Passed to Select's `items` prop (a value -> label map) so SelectValue
   // can resolve the trigger's displayed label immediately -- without it,
@@ -59,9 +59,10 @@ export function ChatComposer({
 
   const handleModelChange = (value: string | null) => {
     if (!value) return;
-    updateModel.mutate(value, {
-      onError: (err) => toast.error(getErrorMessage(err)),
-    });
+    updateModel.mutate(
+      { modelId: value, knowledgeType },
+      { onError: (err) => toast.error(getErrorMessage(err)) }
+    );
   };
 
   const isOverLimit = query.length > MAX_QUERY_LENGTH;

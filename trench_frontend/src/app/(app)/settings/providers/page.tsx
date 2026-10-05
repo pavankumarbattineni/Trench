@@ -13,7 +13,10 @@ import { getErrorMessage } from "@/lib/errors";
 
 export default function ProvidersPage() {
   const { user } = useAuth();
-  const { data: config, isLoading, isError, error } = useConfig();
+  // This list is purely informational (every model Trench offers, not
+  // whether the viewer can use it right now) -- "personal" is just a
+  // fixed scope to satisfy the query, since has_credential isn't shown here.
+  const { data: config, isLoading, isError, error } = useConfig("personal");
   const isOwner = user?.tenant?.role === "owner";
 
   return (

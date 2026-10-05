@@ -34,6 +34,9 @@ export function useSaveTenantCredential(tenantId: string) {
       queryClient.invalidateQueries({
         queryKey: tenantCredentialsQueryKey(tenantId),
       });
+      // The company-scope /config list's has_credential reflects this
+      // same tenant credential -- see lib/config.ts/use-config.ts.
+      queryClient.invalidateQueries({ queryKey: ["config", "company"] });
     },
   });
 }
@@ -47,6 +50,7 @@ export function useDeleteTenantCredential(tenantId: string) {
       queryClient.invalidateQueries({
         queryKey: tenantCredentialsQueryKey(tenantId),
       });
+      queryClient.invalidateQueries({ queryKey: ["config", "company"] });
     },
   });
 }

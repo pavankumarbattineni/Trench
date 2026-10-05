@@ -4,11 +4,18 @@ import { useMutation } from "@tanstack/react-query";
 
 import { useAuth } from "@/components/auth-provider";
 import { updateSelectedModel } from "@/lib/api";
+import type { KnowledgeType } from "@/lib/chat";
+
+interface UpdateModelVariables {
+  modelId: string;
+  knowledgeType: KnowledgeType;
+}
 
 export function useUpdateModel() {
   const { user, setUser } = useAuth();
   return useMutation({
-    mutationFn: updateSelectedModel,
+    mutationFn: ({ modelId, knowledgeType }: UpdateModelVariables) =>
+      updateSelectedModel(modelId, knowledgeType),
     // Optimistic update: reflect the new selection immediately rather
     // than waiting for the round-trip, so a fast select-then-send can't
     // race a chat message out the door against the still-stale model_id
@@ -16,7 +23,7 @@ export function useUpdateModel() {
     // the user's current model on every turn regardless -- see
     // ChatService._run_generation -- this is purely about the frontend's
     // own display/state staying in sync with what was just clicked).
-    onMutate: async (modelId: string) => {
+    onMutate: async ({ modelId }: UpdateModelVariables) => {
       const previousUser = user;
       if (previousUser) {
         setUser({ ...previousUser, model_id: modelId });
@@ -24,7 +31,7 @@ export function useUpdateModel() {
       return { previousUser };
     },
     onSuccess: (profile) => setUser(profile),
-    onError: (_err, _modelId, context) => {
+    onError: (_err, _variables, context) => {
       if (context?.previousUser) {
         setUser(context.previousUser);
       }

@@ -36,6 +36,12 @@ export interface UserProfile {
   // state new code should expect to handle.
   tenant: UserTenant | null;
   has_company_access: boolean;
+  // Lifetime count of personal documents ever uploaded (never decremented
+  // by deletion) and the free-tier cap it's checked against -- doesn't
+  // account for the personal-Pinecone-BYOK exemption that lifts the cap
+  // server-side, so a BYOK user may see these equal yet still upload fine.
+  personal_documents_uploaded_count: number;
+  personal_document_limit: number;
 }
 
 // Trench uses Bearer-token auth, not cookies for the API itself: the
@@ -142,9 +148,13 @@ export async function getCurrentUser(): Promise<UserProfile> {
   return data;
 }
 
-export async function updateSelectedModel(modelId: string): Promise<UserProfile> {
+export async function updateSelectedModel(
+  modelId: string,
+  knowledgeType: "personal" | "company" = "personal"
+): Promise<UserProfile> {
   const { data } = await apiClient.patch<UserProfile>("/api/v1/users/me", {
     model_id: modelId,
+    knowledge_type: knowledgeType,
   });
   return data;
 }

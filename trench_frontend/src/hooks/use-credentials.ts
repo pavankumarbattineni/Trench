@@ -22,6 +22,9 @@ export function useSaveCredential() {
       saveCredential(providerType, apiKey),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: credentialsQueryKey });
+      // The personal-scope /config list's has_credential reflects this
+      // same credential -- see lib/config.ts/use-config.ts.
+      queryClient.invalidateQueries({ queryKey: ["config", "personal"] });
     },
   });
 }
@@ -32,6 +35,7 @@ export function useDeleteCredential() {
     mutationFn: deleteCredential,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: credentialsQueryKey });
+      queryClient.invalidateQueries({ queryKey: ["config", "personal"] });
     },
   });
 }

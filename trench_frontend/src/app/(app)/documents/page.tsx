@@ -5,6 +5,7 @@ import { Download, Eye, FileText, RotateCcw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ConfirmDialog, useConfirmTarget } from "@/components/confirm-dialog";
+import { useAuth } from "@/components/auth-provider";
 import { DocumentStatusBadge } from "@/components/documents/document-status-badge";
 import { UploadDropzone } from "@/components/documents/upload-dropzone";
 import { Button } from "@/components/ui/button";
@@ -22,6 +23,7 @@ import { formatBytes, type DocumentSummary } from "@/lib/documents";
 
 export default function DocumentsPage() {
   const { data: documents, isLoading, isError, error } = useDocuments();
+  const { user, refreshUser } = useAuth();
   const upload = useUploadDocument();
   const remove = useDeleteDocument();
   const view = useViewDocument();
@@ -52,10 +54,20 @@ export default function DocumentsPage() {
   const handleUpload = (file: File) => {
     setUploadError(null);
     upload.mutate(file, {
-      onSuccess: () => toast.success(`"${file.name}" uploaded -- processing started.`),
+      onSuccess: () => {
+        toast.success(`"${file.name}" uploaded -- processing started.`);
+        // Keeps the free-tier count (used for the blur/limit UI below) in
+        // sync -- the list refetch alone wouldn't update it, since it's
+        // part of the user profile, not the documents response.
+        void refreshUser();
+      },
       onError: (err) => setUploadError(getErrorMessage(err)),
     });
   };
+
+  const personalLimitReached =
+    user != null &&
+    user.personal_documents_uploaded_count >= user.personal_document_limit;
 
   const handleConfirmDelete = () => {
     if (!deleteTarget.target) return;
@@ -81,7 +93,12 @@ export default function DocumentsPage() {
         </p>
       </div>
 
-      <UploadDropzone onFileSelected={handleUpload} disabled={upload.isPending} />
+      <UploadDropzone
+        onFileSelected={handleUpload}
+        disabled={upload.isPending}
+        blurred={personalLimitReached}
+        blurredMessage="Document limit reached"
+      />
       {upload.isPending && (
         <p className="text-sm text-muted-foreground">Uploading…</p>
       )}

@@ -160,6 +160,7 @@ class ChatService:
                     "stream_id": stream_id,
                     "query": query,
                     "knowledge_type": knowledge_type,
+                    "guardrail_flags": [],
                     "tenant_id": None,
                     "access_denied": False,
                     "denial_reason": None,
@@ -168,6 +169,22 @@ class ChatService:
                     "original_condensed_query": "",
                     "retrieved_chunks": [],
                     "best_retrieved_chunks": [],
+                    # These three gate the per-turn retrieve/reformulate
+                    # retry loop (see assess_retrieval_sufficiency/
+                    # _route_after_sufficiency_check in rag_graph.py) and
+                    # MUST be reset here: the checkpointer persists the
+                    # full graph state across turns in the same thread, so
+                    # any key left out of this dict silently carries over
+                    # the *previous* turn's final value instead of
+                    # starting fresh -- without this, retrieval_attempts
+                    # keeps climbing turn over turn (e.g. logging
+                    # "attempt=4" on someone's first retry of their
+                    # fourth message) until it permanently exceeds
+                    # MAX_RETRIEVAL_ATTEMPTS, silently disabling retries
+                    # for the rest of the conversation.
+                    "retrieval_sufficient": False,
+                    "retrieval_attempts": 0,
+                    "last_retrieval_top_score": 0.0,
                     "response": "",
                     "citations": [],
                     "messages": [{"role": "user", "content": query}],

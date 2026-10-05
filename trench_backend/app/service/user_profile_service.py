@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import ProviderModel, User
 from app.schemas.user import SelectedTenantResponse, UserResponse
+from app.service.document_service import DocumentService
 from app.service.knowledge_access_service import KnowledgeAccessService
 from app.service.tenant_service import TenantService
 from app.service.user_preference_service import UserPreferenceService
@@ -40,4 +41,6 @@ class UserProfileService:
             tenant=selected_tenant,
             has_company_access=selected_tenant is not None
             and KnowledgeAccessService.has_company_access(user),
+            personal_documents_uploaded_count=user.documents_uploaded_count,
+            personal_document_limit=DocumentService.FREE_DOCUMENT_LIMIT,
         )

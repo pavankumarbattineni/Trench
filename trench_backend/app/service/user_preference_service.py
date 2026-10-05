@@ -12,7 +12,9 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Provider, ProviderModel, User
+from app.schemas.chat import KnowledgeType
 from app.service.credential_service import CredentialService
+from app.service.knowledge_access_service import KnowledgeAccessService
 from app.service.provider_catalog_service import ProviderCatalogService
 
 _MODEL_NOT_FOUND = HTTPException(
@@ -20,6 +22,10 @@ _MODEL_NOT_FOUND = HTTPException(
 )
 _MODEL_INACTIVE = HTTPException(
     status.HTTP_422_UNPROCESSABLE_CONTENT, "This model is no longer available"
+)
+_COMPANY_ACCESS_DENIED = HTTPException(
+    status.HTTP_403_FORBIDDEN,
+    "You don't have access to this tenant's company knowledge",
 )
 
 
@@ -36,16 +42,26 @@ class UserPreferenceService:
         return user
 
     @staticmethod
-    async def update_model(db: AsyncSession, user: User, model_id) -> User:
+    async def update_model(
+        db: AsyncSession,
+        user: User,
+        model_id,
+        *,
+        knowledge_type: KnowledgeType = "personal",
+    ) -> User:
         """Raises:
-        HTTPException: 404 if `model_id` doesn't exist; 422 if it exists
-            but has been deactivated (e.g. removed from the catalog), or
-            if it belongs to a BYOK provider (OpenAI/Anthropic/Google) the
-            user has no saved API key for -- selection-time validation, so
-            a user can never end up with a model selected that generation
-            can't actually honor (see LLMClientService.resolve_for_user,
-            which would otherwise silently substitute the platform
-            default without the user ever being told).
+        HTTPException: 404 if `model_id` doesn't exist; 403 if
+            `knowledge_type="company"` but the user has no company
+            knowledge access; 422 if the model has been deactivated (e.g.
+            removed from the catalog), or if it belongs to a BYOK provider
+            (OpenAI/Anthropic/Google) that the relevant scope -- the
+            user's own credential for "personal", their tenant's shared
+            one for "company" -- has no saved API key for. Selection-time
+            validation, so a user can never end up with a model selected
+            that generation can't actually honor for the scope they picked
+            it in (see LLMClientService.resolve_for_knowledge, which would
+            otherwise silently substitute the platform default without the
+            user ever being told).
         """
         model = await db.get(ProviderModel, model_id)
         if model is None:
@@ -56,9 +72,19 @@ class UserPreferenceService:
         provider = await db.get(Provider, model.provider_id)
         required_type = CredentialService.required_credential_type(provider.name)
         if required_type is not None:
-            has_key = await CredentialService.has_credential(
-                db, user_id=user.id, provider_type=required_type
-            )
+            if knowledge_type == "company":
+                tenant_id = await KnowledgeAccessService.authorized_company_tenant_id(
+                    db, user_id=user.id
+                )
+                if tenant_id is None:
+                    raise _COMPANY_ACCESS_DENIED
+                has_key = await CredentialService.has_credential(
+                    db, tenant_id=tenant_id, provider_type=required_type
+                )
+            else:
+                has_key = await CredentialService.has_credential(
+                    db, user_id=user.id, provider_type=required_type
+                )
             if not has_key:
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_CONTENT,
