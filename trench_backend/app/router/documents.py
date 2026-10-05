@@ -13,9 +13,12 @@ dependency functions the rest of app/router/tenants.py uses, just called
 directly rather than injected, since `tenant_id` here is an optional
 form/query value rather than always being a path segment.
 
-There is no GET /{document_id} (fetch a single document) -- nothing in the
-frontend ever called it, and list already returns everything a client
-needs to render a document row.
+There is no GET /{document_id} (fetch a full single document) -- nothing in
+the frontend ever called it, and list already returns everything a client
+needs to render a document row. GET /{document_id}/status exists alongside
+it, though: a lighter poll returning just the processing status, for a
+client tracking one specific document (e.g. right after its own upload)
+without re-fetching/re-rendering the whole list on every poll tick.
 """
 
 import uuid
@@ -43,6 +46,7 @@ from app.router.deps import (
 from app.schemas.document import (
     DocumentListResponse,
     DocumentResponse,
+    DocumentStatusResponse,
     DownloadUrlResponse,
 )
 from app.service.document_service import DOWNLOAD_URL_EXPIRES_IN, DocumentService
@@ -163,6 +167,41 @@ async def list_documents(
             db, user_id=current_user.id
         )
     return DocumentListResponse(documents=documents)
+
+
+@router.get("/{document_id}/status", response_model=DocumentStatusResponse)
+async def get_document_status(
+    document_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentStatusResponse:
+    """Returns just a document's current processing status -- a lighter
+    poll than re-fetching the full list, for a client tracking one
+    specific document's progress (e.g. right after its own upload).
+
+    Visibility matches GET /documents (list), for either scope: the owner
+    for a personal document, or anyone with company-knowledge access to
+    its tenant for a company one -- `tenant_id` isn't needed as a
+    parameter here since DocumentService.get_document already resolves
+    the right check from the document's own knowledge_type.
+
+    Args:
+        document_id: The document to check.
+        current_user: The authenticated caller.
+        db: An active async SQLAlchemy session.
+
+    Returns:
+        The document's current status ("pending" | "processing" |
+        "completed" | "failed").
+
+    Raises:
+        HTTPException: 404 if the document doesn't exist or isn't visible
+            to the caller.
+    """
+    document = await DocumentService.get_document(
+        db, user=current_user, document_id=document_id
+    )
+    return DocumentStatusResponse.model_validate(document)
 
 
 @router.get("/{document_id}/download", response_model=DownloadUrlResponse)

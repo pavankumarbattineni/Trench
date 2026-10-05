@@ -2,11 +2,22 @@
 delete has no server-side equivalent in Pinecone, so it's list-then-delete
 (paginated), and must actually delete every page's batch rather than only
 the first -- and scale_hybrid, the dense/sparse weighting applied
-identically to documents (upsert) and queries (query)."""
+identically to documents (upsert) and queries (query).
+
+The fake index's `list()` returns real pinecone ListResponse/ListItem
+objects, not plain strings -- a page of "ids" is actually a ListResponse
+whose `.vectors` are ListItem(id=...), confirmed directly against the
+installed client (see delete_by_prefix's own docstring). A fake returning
+plain `list[str]` pages would hide exactly the bug this guards against:
+delete_by_prefix once passed a page straight to `delete(ids=...)`, which
+only failed against the real API ("ids[0] must be a string, got
+ListItem"), never against a too-convenient fake.
+"""
 
 from unittest.mock import MagicMock
 
 import pytest
+from pinecone.models.vectors.responses import ListItem, ListResponse
 
 from app.service.vector_store_service import (
     HYBRID_DENSE_WEIGHT,
@@ -16,14 +27,24 @@ from app.service.vector_store_service import (
 )
 
 
+def _list_response(ids: list[str], *, namespace: str = "ns") -> ListResponse:
+    return ListResponse(
+        vectors=[ListItem(id=i) for i in ids], pagination=None, namespace=namespace
+    )
+
+
 class _FakeIndex:
     def __init__(self, pages: list[list[str]] | None = None) -> None:
-        self._pages = pages or []
+        self._pages = [_list_response(page) for page in (pages or [])]
         self.delete_calls: list[dict] = []
         self.upsert_calls: list[dict] = []
         self.query_calls: list[dict] = []
 
     def list(self, *, prefix, limit, namespace):
+        self.list_calls = getattr(self, "list_calls", [])
+        self.list_calls.append(
+            {"prefix": prefix, "limit": limit, "namespace": namespace}
+        )
         return iter(self._pages)
 
     def delete(self, **kwargs):
@@ -120,6 +141,10 @@ async def test_delete_by_prefix_deletes_every_page():
         {"ids": ["doc:0", "doc:1"], "namespace": "personal:u1"},
         {"ids": ["doc:2"], "namespace": "personal:u1"},
     ]
+    # Pinecone's list endpoint rejects anything over 100 ("limit must be
+    # between 1 and 100") -- a separate, lower cap than delete's own
+    # 1000-ids-per-call limit, easy to conflate the two.
+    assert fake_index.list_calls[0]["limit"] <= 100
 
 
 @pytest.mark.asyncio

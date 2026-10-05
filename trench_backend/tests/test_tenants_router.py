@@ -389,10 +389,55 @@ async def test_admin_and_member_can_upload_or_be_denied_company_documents(
             db_document.status = "completed"
             await session.commit()
 
+        member_delete = await client.delete(
+            f"/api/v1/documents/{document_id}",
+            params={"tenant_id": tenant_id},
+            headers=_auth_headers(_member_token),
+        )
+        assert member_delete.status_code == 403
+
         delete_response = await client.delete(
             f"/api/v1/documents/{document_id}",
             params={"tenant_id": tenant_id},
             headers=_auth_headers(owner_token),
+        )
+        assert delete_response.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_non_owner_admin_can_manage_company_documents_too(
+    client: AsyncClient, tmp_path
+):
+    """require_tenant_admin_or_owner's ADMIN_ROLES = (OWNER, ADMIN) --
+    document management isn't actually Owner-exclusive, just Admin+ --
+    confirmed here with a non-owner Admin succeeding end to end, not just
+    the Owner succeeding and a plain Member being denied (see the test
+    above)."""
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    admin_token = await _invite_and_accept(client, tenant_id, owner_token, role="admin")
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=LocalFilesystemStorageProvider(tmp_path),
+    ):
+        upload = await client.post(
+            "/api/v1/documents",
+            data={"tenant_id": tenant_id},
+            files={"file": ("notes.txt", b"hello from an admin", "text/plain")},
+            headers=_auth_headers(admin_token),
+        )
+        assert upload.status_code == 200
+        document_id = upload.json()["id"]
+
+        async with async_session_factory() as session:
+            db_document = await session.get(Document, document_id)
+            db_document.status = "completed"
+            await session.commit()
+
+        delete_response = await client.delete(
+            f"/api/v1/documents/{document_id}",
+            params={"tenant_id": tenant_id},
+            headers=_auth_headers(admin_token),
         )
         assert delete_response.status_code == 204
 
@@ -469,6 +514,59 @@ async def test_retry_company_document_rejects_a_document_that_is_not_failed(
         headers=_auth_headers(owner_token),
     )
     assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_company_document_status_respects_company_knowledge_access(
+    client: AsyncClient, tmp_path
+):
+    """Unlike download/delete (admin/owner only), status visibility
+    matches list: an Admin/Owner, or any member with company-knowledge
+    access -- but a member whose access has been revoked, same as an
+    outsider, must not be able to tell the document even exists (404, not
+    403 -- see DocumentService.get_document's own docstring)."""
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    member_with_access_token = await _invite_and_accept(
+        client, tenant_id, owner_token, role="member"
+    )
+    member_without_access_token, revoked_user_id = await _invite_and_accept(
+        client, tenant_id, owner_token, role="member", return_user_id=True
+    )
+    revoke = await client.delete(
+        f"/api/v1/tenants/{tenant_id}/knowledge-access",
+        params={"user_id": revoked_user_id},
+        headers=_auth_headers(owner_token),
+    )
+    assert revoke.status_code == 200
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=LocalFilesystemStorageProvider(tmp_path),
+    ):
+        upload = await client.post(
+            "/api/v1/documents",
+            data={"tenant_id": tenant_id},
+            files={"file": ("notes.txt", b"hello from the owner", "text/plain")},
+            headers=_auth_headers(owner_token),
+        )
+    document_id = upload.json()["id"]
+
+    owner_status = await client.get(
+        f"/api/v1/documents/{document_id}/status", headers=_auth_headers(owner_token)
+    )
+    member_status = await client.get(
+        f"/api/v1/documents/{document_id}/status",
+        headers=_auth_headers(member_with_access_token),
+    )
+    revoked_status = await client.get(
+        f"/api/v1/documents/{document_id}/status",
+        headers=_auth_headers(member_without_access_token),
+    )
+
+    assert owner_status.status_code == 200
+    assert owner_status.json() == {"status": "pending"}
+    assert member_status.status_code == 200
+    assert revoked_status.status_code == 404
 
 
 class _SigningStorage(LocalFilesystemStorageProvider):

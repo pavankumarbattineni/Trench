@@ -165,6 +165,56 @@ async def test_cannot_delete_another_users_document(client: AsyncClient, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_get_status_returns_just_the_status_field(client: AsyncClient, tmp_path):
+    await _login(client)
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=LocalFilesystemStorageProvider(tmp_path),
+    ):
+        upload_response = await client.post(
+            "/api/v1/documents",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+        )
+    document_id = upload_response.json()["id"]
+
+    status_response = await client.get(f"/api/v1/documents/{document_id}/status")
+    assert status_response.status_code == 200
+    assert status_response.json() == {"status": "pending"}
+
+    async with async_session_factory() as session:
+        db_document = await session.get(Document, document_id)
+        db_document.status = "failed"
+        db_document.error_message = "embedding is down"
+        await session.commit()
+
+    status_response = await client.get(f"/api/v1/documents/{document_id}/status")
+    assert status_response.json() == {"status": "failed"}
+
+
+@pytest.mark.asyncio
+async def test_cannot_get_status_of_another_users_document(
+    client: AsyncClient, tmp_path
+):
+    await _login(client)
+
+    with patch(
+        "app.service.document_service.get_storage_provider",
+        return_value=LocalFilesystemStorageProvider(tmp_path),
+    ):
+        upload_response = await client.post(
+            "/api/v1/documents",
+            files={"file": ("private.txt", b"owner-only content", "text/plain")},
+        )
+    document_id = upload_response.json()["id"]
+
+    await _login(client, uid=OTHER_FIREBASE_UID, email=OTHER_EMAIL)
+
+    response = await client.get(f"/api/v1/documents/{document_id}/status")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_rejects_invalid_file(client: AsyncClient):
     await _login(client)
 

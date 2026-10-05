@@ -175,15 +175,23 @@ class PineconeVectorStore:
         document deletion instead of trusting Document.chunk_count, which
         can drift from what's actually in Pinecone (a failed/partial
         ingestion, a retried upsert, etc). Pinecone has no server-side
-        "delete by prefix", so this lists matching ids (paginated, up to
-        1000 per page) and deletes each page's batch."""
+        "delete by prefix", so this lists matching ids (paginated -- `list`
+        caps `limit` at 100 per page, a separate, lower limit than
+        `delete`'s own 1000-ids-per-call cap) and deletes each page's
+        batch.
+
+        `index.list(...)` yields one `ListResponse` per page, not a plain
+        list of id strings -- each id is `item.id` on that page's
+        `.vectors` (a list of `ListItem`s), per Pinecone's own documented
+        usage. Passing a ListResponse/ListItem straight to `delete(ids=...)`
+        fails with "ids[0] must be a string, got ListItem".
+        """
 
         def _list_and_delete() -> None:
-            for page_ids in self._index.list(
-                prefix=prefix, limit=1000, namespace=namespace
-            ):
-                if page_ids:
-                    self._index.delete(ids=page_ids, namespace=namespace)
+            for page in self._index.list(prefix=prefix, limit=100, namespace=namespace):
+                ids = [item.id for item in page.vectors]
+                if ids:
+                    self._index.delete(ids=ids, namespace=namespace)
 
         await asyncio.to_thread(_list_and_delete)
 
