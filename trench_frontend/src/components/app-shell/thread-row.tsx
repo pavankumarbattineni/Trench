@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import Link from "next/link";
 import { MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 
@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { PromptDialog } from "@/components/prompt-dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useRenameThread } from "@/hooks/use-threads";
 import { getErrorMessage } from "@/lib/errors";
 import type { ThreadSummary } from "@/lib/threads";
@@ -35,6 +36,17 @@ export function ThreadRow({
   const [menuOpen, setMenuOpen] = useState(false);
   const rename = useRenameThread(thread.id);
 
+  // The sidebar keeps long titles truncated; the full title shows in a
+  // themed tooltip to the right instead -- but only when the title is
+  // actually cut off (nothing to reveal otherwise).
+  const linkRef = useRef<HTMLAnchorElement>(null);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+  const handleTooltipOpenChange = (open: boolean) => {
+    const el = linkRef.current;
+    const truncated = !!el && el.scrollWidth > el.clientWidth;
+    setTooltipOpen(open && truncated && !!thread.title);
+  };
+
   return (
     <div
       className={cn(
@@ -42,15 +54,25 @@ export function ThreadRow({
         (active || menuOpen) && "bg-muted"
       )}
     >
-      <Link
-        href={href}
-        onClick={onNavigate}
-        className="min-w-0 flex-1 truncate px-2 py-1.5 text-sm text-foreground"
-      >
-        {thread.title ?? (
-          <span className="text-muted-foreground italic">New conversation</span>
-        )}
-      </Link>
+      <Tooltip open={tooltipOpen} onOpenChange={handleTooltipOpenChange}>
+        <TooltipTrigger
+          render={
+            <Link
+              ref={linkRef}
+              href={href}
+              onClick={onNavigate}
+              className="min-w-0 flex-1 truncate px-2 py-1.5 text-sm text-foreground"
+            />
+          }
+        >
+          {thread.title ?? (
+            <span className="text-muted-foreground italic">New conversation</span>
+          )}
+        </TooltipTrigger>
+        <TooltipContent side="right" sideOffset={8} className="break-words">
+          {thread.title}
+        </TooltipContent>
+      </Tooltip>
 
       <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenuTrigger
