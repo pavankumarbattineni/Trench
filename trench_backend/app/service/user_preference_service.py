@@ -8,12 +8,18 @@ selection without another migration. Embedding/chunking have no
 equivalent column -- both are fixed, code-level choices.
 """
 
+import uuid
+
 from fastapi import HTTPException, status
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Provider, ProviderModel, User
+from app.database.models import Credential, Provider, ProviderModel, User
 from app.schemas.chat import KnowledgeType
-from app.service.credential_service import CredentialService
+from app.service.credential_service import (
+    LLM_PROVIDER_TO_CREDENTIAL_TYPE,
+    CredentialService,
+)
 from app.service.knowledge_access_service import KnowledgeAccessService
 from app.service.provider_catalog_service import ProviderCatalogService
 
@@ -96,3 +102,62 @@ class UserPreferenceService:
         await db.commit()
         await db.refresh(user)
         return user
+
+    @staticmethod
+    async def reset_models_requiring_credential(
+        db: AsyncSession,
+        provider_type: str,
+        *,
+        user_id: uuid.UUID | None = None,
+        tenant_id: uuid.UUID | None = None,
+    ) -> int:
+        """Resets `model_id` to the platform default for users whose
+        selected model needs the BYOK credential (`provider_type`) that was
+        just removed -- so the model selector never keeps showing a model
+        that can no longer run. Call right after deleting that credential.
+
+        - Personal removal (`user_id`): resets that user, if their model
+          belongs to a provider needing this credential type.
+        - Tenant removal (`tenant_id`): resets every member of that tenant
+          whose model needs it -- except members who still hold their own
+          personal credential of the same type, for whom the model still
+          works.
+
+        Returns how many users were reset. A no-op for credential types no
+        LLM provider needs.
+        """
+        provider_names = [
+            name
+            for name, cred_type in LLM_PROVIDER_TO_CREDENTIAL_TYPE.items()
+            if cred_type == provider_type
+        ]
+        if not provider_names:
+            return 0
+
+        default_model = await ProviderCatalogService.get_default(db)
+        affected_model_ids = (
+            select(ProviderModel.id)
+            .join(Provider, Provider.id == ProviderModel.provider_id)
+            .where(Provider.name.in_(provider_names))
+        )
+        stmt = update(User).where(User.model_id.in_(affected_model_ids))
+        if user_id is not None:
+            stmt = stmt.where(User.id == user_id)
+        else:
+            has_personal_key = (
+                select(Credential.id)
+                .where(
+                    Credential.user_id == User.id,
+                    Credential.provider_type == provider_type,
+                )
+                .exists()
+            )
+            stmt = stmt.where(User.tenant_id == tenant_id, ~has_personal_key)
+
+        result = await db.execute(
+            stmt.values(model_id=default_model.id).execution_options(
+                synchronize_session=False
+            )
+        )
+        await db.commit()
+        return result.rowcount

@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { useAuth } from "@/components/auth-provider";
 import {
   deleteTenantCredential,
   listTenantCredentials,
@@ -43,6 +44,7 @@ export function useSaveTenantCredential(tenantId: string) {
 
 export function useDeleteTenantCredential(tenantId: string) {
   const queryClient = useQueryClient();
+  const { refreshUser } = useAuth();
   return useMutation({
     mutationFn: (providerType: ProviderType) =>
       deleteTenantCredential(tenantId, providerType),
@@ -51,6 +53,10 @@ export function useDeleteTenantCredential(tenantId: string) {
         queryKey: tenantCredentialsQueryKey(tenantId),
       });
       queryClient.invalidateQueries({ queryKey: ["config", "company"] });
+      // The backend may have reset the Owner's own selected model to the
+      // platform default (see UserPreferenceService.
+      // reset_models_requiring_credential) -- re-fetch to reflect it.
+      void refreshUser();
     },
   });
 }

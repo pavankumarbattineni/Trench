@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { useAuth } from "@/components/auth-provider";
 import {
   deleteCredential,
   listCredentials,
@@ -31,11 +32,16 @@ export function useSaveCredential() {
 
 export function useDeleteCredential() {
   const queryClient = useQueryClient();
+  const { refreshUser } = useAuth();
   return useMutation({
     mutationFn: deleteCredential,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: credentialsQueryKey });
       queryClient.invalidateQueries({ queryKey: ["config", "personal"] });
+      // The backend resets the selected model to the platform default if
+      // it needed the key just removed -- re-fetch the user so the chat's
+      // model selector reflects that instead of the stale selection.
+      void refreshUser();
     },
   });
 }

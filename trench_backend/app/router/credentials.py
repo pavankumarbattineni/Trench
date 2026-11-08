@@ -22,6 +22,7 @@ from app.schemas.credential import (
 )
 from app.service.credential_service import CredentialService
 from app.service.tenant_service import TenantService
+from app.service.user_preference_service import UserPreferenceService
 
 router = APIRouter(prefix="/credentials", tags=["credentials"])
 
@@ -143,7 +144,15 @@ async def delete_credential(
         await CredentialService.delete_credential(
             db, tenant_id=tenant_id, provider_type=provider_type
         )
+        await UserPreferenceService.reset_models_requiring_credential(
+            db, provider_type, tenant_id=tenant_id
+        )
         return
     await CredentialService.delete_credential(
         db, user_id=current_user.id, provider_type=provider_type
+    )
+    # A model that needed the key just removed can no longer run -- fall
+    # back to the platform default instead of leaving it selected.
+    await UserPreferenceService.reset_models_requiring_credential(
+        db, provider_type, user_id=current_user.id
     )
