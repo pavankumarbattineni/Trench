@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
 import { MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 
@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { PromptDialog } from "@/components/prompt-dialog";
+import { RelativeTime } from "@/components/relative-time";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useRenameThread } from "@/hooks/use-threads";
 import { getErrorMessage } from "@/lib/errors";
@@ -36,16 +37,10 @@ export function ThreadRow({
   const [menuOpen, setMenuOpen] = useState(false);
   const rename = useRenameThread(thread.id);
 
-  // The sidebar keeps long titles truncated; the full title shows in a
-  // themed tooltip to the right instead -- but only when the title is
-  // actually cut off (nothing to reveal otherwise).
-  const linkRef = useRef<HTMLAnchorElement>(null);
+  // The sidebar keeps long titles truncated. The themed tooltip to the
+  // right always shows the full title and when the conversation was
+  // created (same format as message timestamps).
   const [tooltipOpen, setTooltipOpen] = useState(false);
-  const handleTooltipOpenChange = (open: boolean) => {
-    const el = linkRef.current;
-    const truncated = !!el && el.scrollWidth > el.clientWidth;
-    setTooltipOpen(open && truncated && !!thread.title);
-  };
 
   return (
     <div
@@ -54,11 +49,10 @@ export function ThreadRow({
         (active || menuOpen) && "bg-muted"
       )}
     >
-      <Tooltip open={tooltipOpen} onOpenChange={handleTooltipOpenChange}>
+      <Tooltip open={tooltipOpen} onOpenChange={setTooltipOpen}>
         <TooltipTrigger
           render={
             <Link
-              ref={linkRef}
               href={href}
               onClick={onNavigate}
               className="min-w-0 flex-1 truncate px-2 py-1.5 text-sm text-foreground"
@@ -69,8 +63,13 @@ export function ThreadRow({
             <span className="text-muted-foreground italic">New conversation</span>
           )}
         </TooltipTrigger>
-        <TooltipContent side="right" sideOffset={8} className="break-words">
-          {thread.title}
+        <TooltipContent
+          side="right"
+          sideOffset={8}
+          className="flex-col items-start gap-0.5 break-words"
+        >
+          <span>{thread.title ?? "New conversation"}</span>
+          <RelativeTime value={thread.created_at} className="text-background/70" />
         </TooltipContent>
       </Tooltip>
 

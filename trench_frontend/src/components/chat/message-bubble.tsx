@@ -11,6 +11,7 @@ import {
 
 import { CopyButton } from "@/components/chat/copy-button";
 import { MarkdownContent } from "@/components/chat/markdown-content";
+import { RelativeTime } from "@/components/relative-time";
 import { cn } from "cn";
 import type { ChatMessage } from "@/lib/threads";
 
@@ -139,7 +140,7 @@ export function MessageBubble({ message, onOpenCitations }: MessageBubbleProps) 
       {canCopy && (
         <div
           className={cn(
-            "mt-1 flex",
+            "mt-1 flex items-center gap-1",
             isUser
               ? // Your own messages: revealed on hover/keyboard focus to keep
                 // the thread calm; always shown where hover doesn't exist.
@@ -147,10 +148,13 @@ export function MessageBubble({ message, onOpenCitations }: MessageBubbleProps) 
               : "pl-2"
           )}
         >
+          {/* Query: time before the copy icon. Response: time after it. */}
+          {isUser && <RelativeTime value={message.created_at} />}
           <CopyButton
             text={message.content}
             label={isUser ? "Copy message" : "Copy response"}
           />
+          {!isUser && <RelativeTime value={message.created_at} />}
         </div>
       )}
     </div>
