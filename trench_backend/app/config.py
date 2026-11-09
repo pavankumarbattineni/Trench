@@ -63,6 +63,11 @@ class FirebaseConfig(BaseModel):
 
 class GroqConfig(BaseModel):
     api_key: str
+    # Groq counts prompt tokens PLUS the requested output limit against the
+    # key's tokens-per-minute quota (8,000 on the free tier); a request over
+    # it fails with 413. LLMClientService sizes each answer's output limit
+    # to fit the budget -- raise this after upgrading the Groq plan.
+    tokens_per_minute: int = 8000
 
 
 class StorageConfig(BaseModel):
@@ -111,6 +116,11 @@ class CohereRerankerConfig(BaseModel):
 
 class GeminiConfig(BaseModel):
     api_key: str
+    # Embedding texts Google allows per minute for this key. Google counts
+    # each text in a batched embed_content call toward its quota. The free
+    # tier allows 100/minute; raise this after enabling billing on the key
+    # (see EmbeddingService, which paces requests to stay under it).
+    embed_requests_per_minute: int = 100
 
 
 class SMTPConfig(BaseModel):

@@ -12,12 +12,65 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from google.genai import errors as genai_errors
 
+from app.service import embedding_service
 from app.service.embedding_service import (
     _EMBED_BATCH_SIZE,
+    _MAX_RATE_LIMIT_RETRIES,
     EmbeddingService,
     _l2_normalize,
+    _RateLimiter,
 )
+
+
+class _FakeClock:
+    """Stands in for time.monotonic/asyncio.sleep: sleeping just advances
+    the clock, so rate-limit waits are instant and observable."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture(autouse=True)
+def fake_clock(monkeypatch):
+    """Fresh rate limiter + fake clock per test, so the process-wide budget
+    never leaks between tests and no test really waits."""
+    clock = _FakeClock()
+    monkeypatch.setattr(embedding_service, "_rate_limiter", _RateLimiter())
+    monkeypatch.setattr(embedding_service, "_now", clock.monotonic)
+    monkeypatch.setattr(embedding_service, "_sleep", clock.sleep)
+    return clock
+
+
+def _quota_error(retry_delay: str | None = "4.285450276s") -> genai_errors.ClientError:
+    details = [{"@type": "type.googleapis.com/google.rpc.QuotaFailure"}]
+    if retry_delay:
+        details.append(
+            {
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": retry_delay,
+            }
+        )
+    return genai_errors.ClientError(
+        429,
+        {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "message": "quota",
+                "details": details,
+            }
+        },
+    )
 
 
 def _norm(vector: list[float]) -> float:
@@ -133,3 +186,131 @@ async def test_embed_texts_preserves_order_across_batches():
     expected = [_l2_normalize(raw_vectors[text]) for text in texts]
     for actual_vector, expected_vector in zip(result, expected, strict=True):
         assert actual_vector == pytest.approx(expected_vector)
+
+
+# --- Rate limiting (Google's free tier: 100 embedded texts per minute) ---
+
+
+def _client_returning_vectors():
+    async def _fake_embed_content(*, model, contents, config):
+        return _fake_response([[1.0, 0.0] for _ in contents])
+
+    return SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(embed_content=_fake_embed_content))
+    )
+
+
+@pytest.mark.asyncio
+async def test_texts_over_the_per_minute_budget_wait_for_the_window(fake_clock):
+    # 105 texts = a batch of 100 (uses the whole minute) + a batch of 5,
+    # which must wait until the first batch leaves the 60s window.
+    texts = [f"chunk-{i}" for i in range(105)]
+    with patch(
+        "app.service.embedding_service._client",
+        return_value=_client_returning_vectors(),
+    ):
+        result = await EmbeddingService.embed_texts(texts)
+
+    assert len(result) == 105
+    assert len(fake_clock.sleeps) == 1
+    assert fake_clock.sleeps[0] == pytest.approx(60.05)
+
+
+@pytest.mark.asyncio
+async def test_within_budget_never_waits(fake_clock):
+    with patch(
+        "app.service.embedding_service._client",
+        return_value=_client_returning_vectors(),
+    ):
+        await EmbeddingService.embed_texts([f"chunk-{i}" for i in range(60)])
+        await EmbeddingService.embed_query("question")
+
+    assert fake_clock.sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_batch_size_shrinks_to_a_lower_configured_limit(monkeypatch):
+    monkeypatch.setattr(embedding_service, "_items_per_minute", lambda: 40)
+    call_sizes: list[int] = []
+
+    async def _fake_embed_content(*, model, contents, config):
+        call_sizes.append(len(contents))
+        return _fake_response([[1.0, 0.0] for _ in contents])
+
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(embed_content=_fake_embed_content))
+    )
+    with patch("app.service.embedding_service._client", return_value=fake_client):
+        await EmbeddingService.embed_texts([f"chunk-{i}" for i in range(90)])
+
+    assert call_sizes == [40, 40, 10]
+
+
+@pytest.mark.asyncio
+async def test_429_is_retried_after_googles_suggested_delay(fake_clock):
+    embed_content = AsyncMock(
+        side_effect=[_quota_error("4.285450276s"), _fake_response([[3.0, 4.0]])]
+    )
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(embed_content=embed_content))
+    )
+    with patch("app.service.embedding_service._client", return_value=fake_client):
+        result = await EmbeddingService.embed_query("hello")
+
+    assert embed_content.await_count == 2
+    assert fake_clock.sleeps == [
+        pytest.approx(4.785450276)
+    ]  # Google's delay + 0.5s margin
+    assert abs(_norm(result) - 1.0) < 1e-6
+
+
+@pytest.mark.asyncio
+async def test_429_without_a_retry_delay_backs_off_exponentially(fake_clock):
+    embed_content = AsyncMock(
+        side_effect=[
+            _quota_error(None),
+            _quota_error(None),
+            _fake_response([[1.0, 0.0]]),
+        ]
+    )
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(embed_content=embed_content))
+    )
+    with patch("app.service.embedding_service._client", return_value=fake_client):
+        await EmbeddingService.embed_query("hello")
+
+    assert fake_clock.sleeps == [pytest.approx(5.5), pytest.approx(10.5)]
+
+
+@pytest.mark.asyncio
+async def test_429_gives_up_after_the_retry_limit(fake_clock):
+    embed_content = AsyncMock(side_effect=_quota_error())
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(embed_content=embed_content))
+    )
+    with (
+        patch("app.service.embedding_service._client", return_value=fake_client),
+        pytest.raises(genai_errors.ClientError),
+    ):
+        await EmbeddingService.embed_query("hello")
+
+    assert embed_content.await_count == _MAX_RATE_LIMIT_RETRIES + 1
+
+
+@pytest.mark.asyncio
+async def test_non_429_errors_are_not_retried(fake_clock):
+    bad_request = genai_errors.ClientError(
+        400, {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "bad"}}
+    )
+    embed_content = AsyncMock(side_effect=bad_request)
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(embed_content=embed_content))
+    )
+    with (
+        patch("app.service.embedding_service._client", return_value=fake_client),
+        pytest.raises(genai_errors.ClientError),
+    ):
+        await EmbeddingService.embed_query("hello")
+
+    assert embed_content.await_count == 1
+    assert fake_clock.sleeps == []
