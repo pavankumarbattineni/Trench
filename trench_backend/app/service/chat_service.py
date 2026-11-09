@@ -27,6 +27,52 @@ from app.utils.stream_manager import stream_manager
 
 logger = logging.getLogger(__name__)
 
+
+def _user_facing_error(exc: Exception) -> str:
+    """A failed turn's message as the user sees it. Provider SDK errors
+    stringify to raw dumps (status codes, org ids, JSON bodies), so known
+    failures get a plain explanation of what to do instead; the full error
+    is logged for debugging."""
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(exc, "code", None)
+    text = str(exc).lower()
+    # Quota/billing first: e.g. Gemini's free tier has `limit: 0` for its
+    # Pro models and OpenAI returns `insufficient_quota` -- no request to
+    # that model can succeed on the key's current plan, whatever its size.
+    if status == 429 and any(
+        phrase in text
+        for phrase in (
+            "exceeded your current quota",
+            "insufficient_quota",
+            "quota exceeded",
+        )
+    ):
+        return (
+            "Your API key's plan doesn't include this model (quota exceeded). "
+            "Enable billing for this provider's key, or choose another model."
+        )
+    # Only a genuinely oversized request (Groq: 413 "Request too large").
+    if status == 413 or "request too large" in text:
+        return (
+            "This question, together with the conversation so far and the "
+            "passages retrieved for it, is too large for the model's "
+            "per-minute limit. Start a new chat or ask a shorter question, "
+            "then try again."
+        )
+    if status == 429:
+        return (
+            "The model is receiving too many requests right now. Wait a "
+            "minute and try again."
+        )
+    if status in (401, 403):
+        return (
+            "The API key for this model was rejected. Check it in "
+            "Settings → Providers, or choose another model."
+        )
+    return "Something went wrong while generating this response. Please try again."
+
+
 _compiled_graph = None
 
 _ACTIVE_STATUSES = ("pending", "running")
@@ -276,19 +322,21 @@ class ChatService:
                         stream_id,
                     )
         except Exception as exc:
+            logger.exception("Chat turn failed for stream_id=%s", stream_id)
+            user_message = _user_facing_error(exc)
             try:
                 async with async_session_factory() as recovery_db:
                     message = await recovery_db.get(ChatHistory, assistant_message_id)
                     if message is not None:
                         message.status = "failed"
-                        message.content = str(exc)
+                        message.content = user_message
                         await recovery_db.commit()
             except Exception:
                 logger.exception(
                     "Failed to persist failed status for stream_id=%s", stream_id
                 )
             stream_manager.append_chunk(
-                stream_id, {"type": "error", "content": str(exc)}
+                stream_id, {"type": "error", "content": user_message}
             )
             stream_manager.finish(stream_id)
 

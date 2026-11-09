@@ -54,7 +54,7 @@ from app.database.models import ChatHistory
 from app.graph.state import AgentState
 from app.service.document_service import DocumentService
 from app.service.guardrail_service import GuardrailService
-from app.service.llm_client_service import LLMClientService
+from app.service.llm_client_service import TRUNCATION_NOTE, LLMClientService
 from app.service.reranker_service import RerankerService
 from app.service.retrieval_service import KnowledgeScope, RetrievalService
 from app.utils.stream_manager import stream_manager
@@ -144,7 +144,7 @@ _BASE_SYSTEM_PROMPT = (
     "diagram if useful. Build it only from the context, keep "
     # {{ }} -- this string goes through .format(), so literal braces
     # must be doubled or every normal-case turn raises KeyError.
-    'node labels short, and wrap any label containing ( ) [ ] {{ }} in '
+    "node labels short, and wrap any label containing ( ) [ ] {{ }} in "
     'double quotes, e.g. A["Encoder (6 layers)"]. Rule 3 still applies in '
     "full: cite every claim in the text before and after the diagram as "
     "usual -- just keep the [n] markers out of the Mermaid code itself.\n\n"
@@ -172,6 +172,52 @@ _DIAGRAM_FORMAT_REMINDER = (
     "step in a short bullet list, citing every bullet with its passage "
     "number(s) like [1] or [2][3]. An answer without [n] citations is "
     "wrong. Never put [n] inside the Mermaid code."
+)
+
+# Appended after the context on every normal (context-backed) turn, like
+# the diagram reminder above: late instructions are followed more reliably
+# than rules buried before a long context block. Plain concatenation, NOT
+# part of a .format() template -- the LaTeX example's braces (\text{FFN})
+# would otherwise be read as placeholders and raise KeyError. The
+# frontend renders these delimiters with KaTeX (see math-delimiters.ts).
+_ANSWER_FORMATTING_RULES = (
+    "\n\nAnswer formatting:\n"
+    "- Format the answer as clean, well-structured Markdown: short "
+    "headings, bullet points, and tables where they help readability.\n"
+    r"- Mathematics: write valid LaTeX that KaTeX can render. Use \( ... \) "
+    r"for inline math and \[ ... \] on their own lines for standalone "
+    "equations. Never put math inside code blocks or inline code, and "
+    "never use single $ delimiters.\n"
+    "- Keep every formula mathematically exact: correct operators, "
+    "brackets, subscripts, superscripts, fractions and Greek letters; no "
+    "duplicate commas, missing operators or stray characters.\n"
+    "- Below an important equation, explain each variable and symbol in a "
+    "bullet list. Break complex expressions into simple, step-by-step "
+    "explanations.\n"
+    "- Preserve the meaning of formulas taken from the context. Never "
+    "change an equation in a way that alters its meaning; if a source "
+    "formula is ambiguous or malformed, say so instead of guessing.\n"
+    "- Citations still follow rule 3 and are plain text, never LaTeX: "
+    r"write ...the ReLU activation [3]. -- NOT \([3]\) or \[ [3] \]. "
+    "Never put [n] inside any math expression.\n\n"
+    "Example (citations stay in the text, outside the math):\n"
+    "Each position passes through the same two-layer feed-forward network "
+    "[2]:\n"
+    r"\["
+    "\n"
+    r"\text{FFN}(x) = \max(0,\, xW_1 + b_1)\,W_2 + b_2"
+    "\n"
+    r"\]"
+    "\n"
+    "Where:\n"
+    r"- \(x\): input representation."
+    "\n"
+    r"- \(W_1, W_2\): weight matrices."
+    "\n"
+    r"- \(b_1, b_2\): bias vectors."
+    "\n"
+    r"- \(\max(0, z)\): the ReLU activation, applied between the two linear "
+    "layers [2]."
 )
 
 _KNOWLEDGE_SCOPE_PROMPTS = {
@@ -399,7 +445,8 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
         messages=[{"role": "user", "content": rewrite_prompt}],
     ):
         condensed += delta
-    final_query = condensed.strip() or state["query"]
+    # The truncation note is for answers shown to people, never a query.
+    final_query = condensed.removesuffix(TRUNCATION_NOTE).strip() or state["query"]
     return {
         "condensed_query": final_query,
         "original_condensed_query": final_query,
@@ -537,6 +584,7 @@ async def reformulate_query(state: AgentState, config: RunnableConfig) -> dict:
         messages=[{"role": "user", "content": reformulate_prompt}],
     ):
         reformulated += delta
+    reformulated = reformulated.removesuffix(TRUNCATION_NOTE)
     return {
         "condensed_query": reformulated.strip() or state["original_condensed_query"]
     }
@@ -607,10 +655,13 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
             f"[{i + 1}] (from {chunk['document_name']}) {chunk['content']}"
             for i, chunk in enumerate(context_chunks)
         )
-        system_prompt = _BASE_SYSTEM_PROMPT.format(
-            knowledge_scope_label=scope_label,
-            knowledge_scope_note=scope_note,
-            context=context,
+        system_prompt = (
+            _BASE_SYSTEM_PROMPT.format(
+                knowledge_scope_label=scope_label,
+                knowledge_scope_note=scope_note,
+                context=context,
+            )
+            + _ANSWER_FORMATTING_RULES
         )
         # Rule 7 sits before a long context block, and models routinely
         # drift back to ASCII art or numbered lists by the time they
