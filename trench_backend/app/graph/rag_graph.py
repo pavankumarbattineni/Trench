@@ -132,11 +132,46 @@ _BASE_SYSTEM_PROMPT = (
     "concerned, nothing else exists -- don't acknowledge other scopes, "
     "other users' documents, or the existence of a broader knowledge "
     "base.\n"
-    "6. If asked to do something the context can't support (write code, "
+    "6. If asked to do something the context can't support (write "
+    "software code, "
     "give opinions unrelated to the documents, etc.), politely redirect "
-    "to what you *can* help with using the available knowledge.\n\n"
+    "to what you *can* help with using the available knowledge.\n"
+    "7. If the user asks for a flowchart, diagram, chart of steps, or "
+    "process map, you MUST include it as Mermaid in a fenced code block "
+    "tagged mermaid (```mermaid ... ```) -- the app renders that block as "
+    "a visual diagram. A numbered or bulleted list is NOT a flowchart and "
+    "does not satisfy the request; add explanatory text around the "
+    "diagram if useful. Build it only from the context, keep "
+    # {{ }} -- this string goes through .format(), so literal braces
+    # must be doubled or every normal-case turn raises KeyError.
+    'node labels short, and wrap any label containing ( ) [ ] {{ }} in '
+    'double quotes, e.g. A["Encoder (6 layers)"]. Rule 3 still applies in '
+    "full: cite every claim in the text before and after the diagram as "
+    "usual -- just keep the [n] markers out of the Mermaid code itself.\n\n"
     "Context:\n"
     "{context}"
+)
+
+# A request for something the app can render as a Mermaid diagram (see
+# rule 7 above and the frontend's MermaidDiagram component).
+_DIAGRAM_REQUEST = re.compile(
+    r"\b(flow\s?-?charts?|diagrams?|process\s+maps?|mermaid|"
+    r"sequence\s+diagrams?|mind\s?-?maps?|visuali[sz]e)\b",
+    re.IGNORECASE,
+)
+# Without the explicit citation requirement, models drawing a diagram
+# frequently drop citations entirely -- and since build_citations keeps
+# only the chunks an answer actually cites, the turn then shows no
+# citation markers and no sources at all.
+_DIAGRAM_FORMAT_REMINDER = (
+    "\n\nFormat reminder: the user asked for a diagram.\n"
+    "- Include it as a ```mermaid fenced code block (e.g. `flowchart TD`), "
+    "not ASCII art, an untagged code block, or a numbered list. Quote "
+    'labels containing ( ) [ ] { }, e.g. A["Encoder (6 layers)"].\n'
+    "- Citations are still required: after the diagram, explain each main "
+    "step in a short bullet list, citing every bullet with its passage "
+    "number(s) like [1] or [2][3]. An answer without [n] citations is "
+    "wrong. Never put [n] inside the Mermaid code."
 )
 
 _KNOWLEDGE_SCOPE_PROMPTS = {
@@ -577,6 +612,12 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
             knowledge_scope_note=scope_note,
             context=context,
         )
+        # Rule 7 sits before a long context block, and models routinely
+        # drift back to ASCII art or numbered lists by the time they
+        # answer -- a short reminder AFTER the context, only when the user
+        # actually asked for a diagram, is what makes them follow it.
+        if _DIAGRAM_REQUEST.search(state["query"]):
+            system_prompt += _DIAGRAM_FORMAT_REMINDER
     logger.info(
         "Generate | prompt_case=%s context_chunks=%d",
         prompt_case,

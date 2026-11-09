@@ -1,10 +1,40 @@
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { MermaidDiagram } from "@/components/chat/mermaid-diagram";
 import { CITATION_HREF_PREFIX, linkifyCitations } from "@/lib/citation-links";
 import { cn } from "cn";
 
-function buildComponents(onCitationClick?: (index: number) => void): Components {
+interface HastLike {
+  type?: string;
+  tagName?: string;
+  value?: string;
+  properties?: { className?: unknown };
+  children?: HastLike[];
+}
+
+/** If a <pre>'s hast node wraps a ```mermaid code block, returns its raw
+ * source; otherwise null. Handled at the <pre> level (not <code>) so the
+ * diagram isn't nested inside a <pre> element. */
+function mermaidSource(node: unknown): string | null {
+  const code = (node as HastLike | undefined)?.children?.[0];
+  const classes = code?.properties?.className;
+  if (
+    code?.tagName !== "code" ||
+    !Array.isArray(classes) ||
+    !classes.includes("language-mermaid")
+  ) {
+    return null;
+  }
+  const text = (n: HastLike): string =>
+    n.type === "text" ? (n.value ?? "") : (n.children ?? []).map(text).join("");
+  return text(code);
+}
+
+function buildComponents(
+  onCitationClick?: (index: number) => void,
+  isStreaming = false
+): Components {
   return {
     a: ({ href, children, ...props }) => {
       if (href?.startsWith(CITATION_HREF_PREFIX)) {
@@ -55,7 +85,13 @@ function buildComponents(onCitationClick?: (index: number) => void): Components 
         </code>
       );
     },
-    pre: ({ ...props }) => <pre {...props} className="mb-3 last:mb-0" />,
+    pre: ({ node, ...props }) => {
+      const mermaid = mermaidSource(node);
+      if (mermaid !== null) {
+        return <MermaidDiagram code={mermaid} isStreaming={isStreaming} />;
+      }
+      return <pre {...props} className="mb-3 last:mb-0" />;
+    },
     table: ({ ...props }) => (
       <div className="mb-3 overflow-x-auto">
         <table {...props} className="w-full border-collapse text-sm" />
@@ -74,12 +110,16 @@ interface MarkdownContentProps {
    * get turned into clickable markers (see linkifyCitations). */
   citationNumbers?: ReadonlySet<number>;
   onCitationClick?: (index: number) => void;
+  /** True while this message is still being generated -- diagrams wait to
+   * render until their (otherwise incomplete) source has fully arrived. */
+  isStreaming?: boolean;
 }
 
 export function MarkdownContent({
   content,
   citationNumbers,
   onCitationClick,
+  isStreaming = false,
 }: MarkdownContentProps) {
   const processed = citationNumbers?.size
     ? linkifyCitations(content, citationNumbers)
@@ -87,7 +127,7 @@ export function MarkdownContent({
 
   return (
     <div className="text-sm leading-relaxed">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={buildComponents(onCitationClick)}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={buildComponents(onCitationClick, isStreaming)}>
         {processed}
       </ReactMarkdown>
     </div>

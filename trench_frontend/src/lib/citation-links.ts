@@ -23,10 +23,22 @@
  * range starting at 1. */
 export function linkifyCitations(content: string, validNumbers: ReadonlySet<number>): string {
   if (validNumbers.size === 0) return content;
-  return content.replace(/\[(\d+)\]|【(\d+)】/g, (match, ascii?: string, fullWidth?: string) => {
-    const index = Number(ascii ?? fullWidth);
-    return validNumbers.has(index) ? `[${match}](#cite-${index})` : match;
-  });
+  // Code is left untouched: "[1]" inside a fenced block or inline code is
+  // literal source (e.g. a Mermaid node `A[1]`), and rewriting it into a
+  // markdown link would corrupt that source. split() with a capture group
+  // puts the code segments at the odd indices. A fence still open at the
+  // end (mid-stream) counts as code until it closes.
+  return content
+    .split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/)
+    .map((segment, i) =>
+      i % 2 === 1
+        ? segment
+        : segment.replace(/\[(\d+)\]|【(\d+)】/g, (match, ascii?: string, fullWidth?: string) => {
+            const index = Number(ascii ?? fullWidth);
+            return validNumbers.has(index) ? `[${match}](#cite-${index})` : match;
+          })
+    )
+    .join("");
 }
 
 export const CITATION_HREF_PREFIX = "#cite-";
