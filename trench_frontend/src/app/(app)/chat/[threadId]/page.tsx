@@ -9,7 +9,9 @@ import { CitationPanel, type CitationSelection } from "@/components/chat/citatio
 import { MessageList } from "@/components/chat/message-list";
 import { Button } from "@/components/ui/button";
 import { useChatStream } from "@/hooks/use-chat-stream";
+import { CHAT_COLUMN, COLUMN_GUTTER } from "@/lib/chat-layout";
 import { getErrorMessage } from "@/lib/errors";
+import { cn } from "cn";
 import type { KnowledgeType } from "@/lib/chat";
 import type { ChatMessage } from "@/lib/threads";
 
@@ -71,20 +73,29 @@ export default function ThreadPage({
   return (
     <div className="flex h-full">
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        {/* `relative` makes this scroller the containing block for any
+            absolutely-positioned content inside messages (sr-only text,
+            popovers' anchors, ...), so it's clipped here instead of
+            stretching the document below the viewport. */}
+        <div className={cn("relative min-h-0 flex-1 overflow-y-auto", COLUMN_GUTTER)}>
           <MessageList messages={messages} onOpenCitations={handleOpenCitations} />
         </div>
-        {streamError && (
-          <p className="mx-auto w-full max-w-3xl px-4 text-sm text-destructive">
-            {streamError}
-          </p>
-        )}
-        <ChatComposer
-          isSending={isSending}
-          isStreaming={isStreaming}
-          onSend={handleSend}
-          onStop={() => void interrupt()}
-        />
+        {/* Same gutter as the message scroller above (overflow-hidden just
+            makes it a scroll container so scrollbar-gutter applies), so the
+            composer's column lines up with the messages at every width. */}
+        <div className={cn("overflow-hidden", COLUMN_GUTTER)}>
+          {streamError && (
+            <p className={cn(CHAT_COLUMN, "px-4 text-sm text-destructive")}>
+              {streamError}
+            </p>
+          )}
+          <ChatComposer
+            isSending={isSending}
+            isStreaming={isStreaming}
+            onSend={handleSend}
+            onStop={() => void interrupt()}
+          />
+        </div>
       </div>
       <CitationPanel selection={citationSelection} onClose={() => setCitationSelection(null)} />
     </div>

@@ -17,7 +17,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { useConfig } from "@/hooks/use-config";
 import { useUpdateModel } from "@/hooks/use-update-model";
 import { MAX_QUERY_LENGTH, type KnowledgeType } from "@/lib/chat";
+import { CHAT_COLUMN } from "@/lib/chat-layout";
 import { getErrorMessage } from "@/lib/errors";
+import { cn } from "cn";
 
 interface ChatComposerProps {
   /** True while a message is in flight but there's no active stream yet
@@ -82,7 +84,7 @@ export function ChatComposer({
   };
 
   return (
-    <div className="mx-auto w-full max-w-3xl p-4">
+    <div className={cn(CHAT_COLUMN, "p-4")}>
       <div className="flex flex-col gap-2 rounded-2xl border border-border bg-card p-3">
         <Textarea
           value={query}
