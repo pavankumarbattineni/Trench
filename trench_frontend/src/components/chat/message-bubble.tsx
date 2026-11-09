@@ -9,6 +9,7 @@ import {
   OctagonX,
 } from "lucide-react";
 
+import { CopyButton } from "@/components/chat/copy-button";
 import { MarkdownContent } from "@/components/chat/markdown-content";
 import { cn } from "cn";
 import type { ChatMessage } from "@/lib/threads";
@@ -66,9 +67,18 @@ function UserMessageContent({ content }: { content: string }) {
 
 export function MessageBubble({ message, onOpenCitations }: MessageBubbleProps) {
   const isUser = message.role === "user";
+  // An answer is only copyable once it has stopped changing -- copying
+  // mid-stream would hand out half an answer.
+  const isGenerating = message.status === "pending" || message.status === "running";
+  const canCopy = message.content.trim().length > 0 && (isUser || !isGenerating);
 
   return (
-    <div className={cn("flex w-full", isUser ? "justify-end" : "justify-start")}>
+    <div
+      className={cn(
+        "group/message flex w-full flex-col",
+        isUser ? "items-end" : "items-start"
+      )}
+    >
       <div
         className={cn(
           "rounded-2xl px-4 py-2.5",
@@ -97,6 +107,7 @@ export function MessageBubble({ message, onOpenCitations }: MessageBubbleProps) 
                 new Set(message.chunks.map((chunk) => chunk.citation_number))
               }
               onCitationClick={(index) => onOpenCitations(message, index)}
+              isStreaming={message.status === "running"}
             />
             {message.status === "failed" && (
               <div className="mt-2 flex items-center gap-1.5 text-xs text-destructive">
@@ -124,6 +135,24 @@ export function MessageBubble({ message, onOpenCitations }: MessageBubbleProps) 
           </>
         )}
       </div>
+
+      {canCopy && (
+        <div
+          className={cn(
+            "mt-1 flex",
+            isUser
+              ? // Your own messages: revealed on hover/keyboard focus to keep
+                // the thread calm; always shown where hover doesn't exist.
+                "opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100"
+              : "pl-2"
+          )}
+        >
+          <CopyButton
+            text={message.content}
+            label={isUser ? "Copy message" : "Copy response"}
+          />
+        </div>
+      )}
     </div>
   );
 }
