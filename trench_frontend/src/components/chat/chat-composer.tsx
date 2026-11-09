@@ -94,7 +94,7 @@ export function ChatComposer({
           rows={1}
           disabled={isBusy}
           autoFocus
-          className="max-h-40 min-h-9 resize-none border-none bg-transparent px-1 shadow-none focus-visible:ring-0"
+          className="max-h-40 min-h-9 resize-none border-none bg-transparent px-1 text-base shadow-none focus-visible:ring-0 md:text-base"
         />
 
         {isOverLimit && (

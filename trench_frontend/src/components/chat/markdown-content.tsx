@@ -60,7 +60,7 @@ function buildComponents(
             type="button"
             onClick={() => onCitationClick?.(index)}
             aria-label={`View source ${index}`}
-            className="mx-0.5 inline-flex h-4 min-w-4 -translate-y-0.5 items-center justify-center rounded bg-emerald-100 px-1 align-middle text-[0.65rem] font-semibold text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-400/20 dark:text-emerald-300 dark:hover:bg-emerald-400/30"
+            className="mx-0.5 inline-flex h-4 min-w-4 -translate-y-0.5 items-center justify-center rounded bg-emerald-100 px-1 align-middle font-sans text-[0.65rem] font-semibold text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-400/20 dark:text-emerald-300 dark:hover:bg-emerald-400/30"
           >
             {index}
           </button>
@@ -76,9 +76,10 @@ function buildComponents(
     ul: ({ ...props }) => <ul {...props} className="mb-3 list-disc pl-5 last:mb-0" />,
     ol: ({ ...props }) => <ol {...props} className="mb-3 list-decimal pl-5 last:mb-0" />,
     li: ({ ...props }) => <li {...props} className="mb-1" />,
-    h1: ({ ...props }) => <h1 {...props} className="mb-2 text-lg font-semibold" />,
-    h2: ({ ...props }) => <h2 {...props} className="mb-2 text-base font-semibold" />,
-    h3: ({ ...props }) => <h3 {...props} className="mb-2 text-sm font-semibold" />,
+    // Sizes relative to the 17px response text so headings stay larger than it.
+    h1: ({ ...props }) => <h1 {...props} className="mb-2 text-[1.25em] font-semibold" />,
+    h2: ({ ...props }) => <h2 {...props} className="mb-2 text-[1.125em] font-semibold" />,
+    h3: ({ ...props }) => <h3 {...props} className="mb-2 text-[1em] font-semibold" />,
     strong: ({ ...props }) => <strong {...props} className="font-semibold" />,
     blockquote: ({ ...props }) => (
       <blockquote {...props} className="mb-3 border-l-2 border-border pl-3 text-muted-foreground" />
@@ -88,7 +89,10 @@ function buildComponents(
       if (isBlock) {
         return (
           <code
-            className={cn("block overflow-x-auto rounded-lg bg-muted p-3 text-xs", className)}
+            className={cn(
+              "block overflow-x-auto rounded-lg bg-muted p-3 font-mono text-[0.875em]",
+              className
+            )}
             {...props}
           >
             {children}
@@ -96,7 +100,7 @@ function buildComponents(
         );
       }
       return (
-        <code className="rounded bg-muted px-1 py-0.5 text-[0.85em]" {...props}>
+        <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.875em]" {...props}>
           {children}
         </code>
       );
@@ -110,11 +114,11 @@ function buildComponents(
     },
     table: ({ ...props }) => (
       <div className="mb-3 overflow-x-auto">
-        <table {...props} className="w-full border-collapse text-sm" />
+        <table {...props} className="w-full border-collapse" />
       </div>
     ),
     th: ({ ...props }) => (
-      <th {...props} className="border border-border px-2 py-1 text-left font-medium" />
+      <th {...props} className="border border-border px-2 py-1 text-left font-semibold" />
     ),
     td: ({ ...props }) => <td {...props} className="border border-border px-2 py-1" />,
   };
@@ -146,7 +150,9 @@ export function MarkdownContent({
     : withMath;
 
   return (
-    <div className="text-sm leading-relaxed">
+    // Assistant response typography: Source Serif 4, ~17px, line-height 1.7.
+    // Same element while streaming and after, so fonts never change mid-answer.
+    <div className="font-serif text-[17px] leading-[1.7]">
       <ReactMarkdown
         remarkPlugins={REMARK_PLUGINS}
         rehypePlugins={REHYPE_PLUGINS}

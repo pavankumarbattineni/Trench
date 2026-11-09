@@ -32,14 +32,14 @@ function UserMessageContent({ content }: { content: string }) {
   const isLong = content.length > USER_MESSAGE_COLLAPSE_THRESHOLD;
 
   if (!isLong) {
-    return <p className="text-sm whitespace-pre-wrap">{content}</p>;
+    return <p className="text-base whitespace-pre-wrap">{content}</p>;
   }
 
   return (
     <div>
       <p
         className={cn(
-          "text-sm whitespace-pre-wrap",
+          "text-base whitespace-pre-wrap",
           !isExpanded && "line-clamp-4"
         )}
       >

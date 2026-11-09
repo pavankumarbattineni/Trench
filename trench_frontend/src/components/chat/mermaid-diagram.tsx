@@ -234,7 +234,9 @@ export function MermaidDiagram({ code, isStreaming = false }: MermaidDiagramProp
   };
 
   return (
-    <div className="relative mb-3 overflow-hidden rounded-lg border border-border last:mb-0">
+    // font-sans: the card's buttons and labels are UI (Inter), even though
+    // the card sits inside the serif response text.
+    <div className="relative mb-3 overflow-hidden rounded-lg border border-border font-sans last:mb-0">
       {/* Off-screen scratch space Mermaid measures/draws in (see render()). */}
       <div
         ref={scratchRef}
@@ -312,7 +314,7 @@ export function MermaidDiagram({ code, isStreaming = false }: MermaidDiagramProp
       )}
 
       {showCode ? (
-        <pre className="overflow-x-auto bg-card p-3 text-xs">
+        <pre className="overflow-x-auto bg-card p-3 font-mono text-[0.875em]">
           <code>{shownSource}</code>
         </pre>
       ) : effective.status === "error" ? (

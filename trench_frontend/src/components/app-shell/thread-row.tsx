@@ -55,7 +55,7 @@ export function ThreadRow({
             <Link
               href={href}
               onClick={onNavigate}
-              className="min-w-0 flex-1 truncate px-2 py-1.5 text-sm text-foreground"
+              className="min-w-0 flex-1 truncate px-2 py-1.5 text-[15px] text-foreground"
             />
           }
         >
