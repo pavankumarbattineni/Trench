@@ -10,6 +10,7 @@ from app.database.models import Document, Tenant, User
 from app.database.session import async_session_factory
 from app.graph.rag_graph import MAX_RETRIEVAL_ATTEMPTS
 from app.service.retrieval_service import RetrievedChunk
+from app.utils.stream_manager import stream_manager
 
 PREFIX = "test-chat-flow"
 _EMAIL = f"owner@{PREFIX}.example.com"
@@ -441,7 +442,22 @@ async def test_continue_after_interruption_carries_partial_answer_forward(
         )
         stream_id = first.json()["stream_id"]
 
-        await asyncio.sleep(0.2)
+        # Interrupt only once "Partial answer" has actually streamed -- a
+        # fixed sleep raced the pipeline's own setup (DB writes, retrieval)
+        # and, on a slower machine, interrupted before any token existed,
+        # leaving no partial answer to carry forward.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            streamed = "".join(
+                chunk["content"]
+                for chunk in stream_manager.get_buffer(stream_id)
+                if chunk.get("type") == "token"
+            )
+            if "Partial answer" in streamed:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            pytest.fail("the first answer never started streaming")
         interrupt_response = await client.delete(f"/api/v1/chat/streams/{stream_id}")
         assert interrupt_response.status_code == 204
         await _wait_for_status(client, stream_id, "interrupted")

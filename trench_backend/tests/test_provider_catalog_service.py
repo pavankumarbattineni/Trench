@@ -28,25 +28,38 @@ async def test_list_models_with_provider_includes_all_four_providers():
 
 
 @pytest.mark.asyncio
-async def test_list_models_with_provider_excludes_hidden_backup_models():
-    """qwen/qwen3.8-27b and qwen/qwen3.6-27b remain in the catalog as
-    internal backup/fallback models (is_active stays True, so they're
-    still directly selectable by id) but are hidden from this
-    user-facing listing (is_visible=False)."""
+async def test_list_models_with_provider_lists_exactly_active_visible_models():
+    """The user-facing listing (the model selector) shows every model that
+    is both active and visible, and nothing else -- inactive models
+    (removed from the catalog) and hidden backups (is_visible=False, still
+    selectable by id) never appear. Checked against the table itself so
+    the test holds for whatever catalog is seeded."""
+    from sqlalchemy import select
+
+    from app.database.models import ProviderModel
+
     async with async_session_factory() as session:
         pairs = await ProviderCatalogService.list_models_with_provider(session)
+        result = await session.execute(
+            select(ProviderModel.model_name).where(
+                ProviderModel.is_active.is_(True),
+                ProviderModel.is_visible.is_(True),
+            )
+        )
+        expected = set(result.scalars().all())
 
-    model_names = {model.model_name for _provider, model in pairs}
-    assert "qwen/qwen3.8-27b" not in model_names
-    assert "qwen/qwen3.6-27b" not in model_names
+    listed = [model.model_name for _provider, model in pairs]
+    assert set(listed) == expected
+    assert len(listed) == len(set(listed))  # no duplicates
+    assert all(model.is_active and model.is_visible for _provider, model in pairs)
 
 
 @pytest.mark.asyncio
-async def test_only_three_groq_models_remain_in_the_catalog():
-    """Per the pruned catalog: only the platform default
-    (openai/gpt-oss-120b) and the two hidden Qwen backups remain under
-    Groq -- compound/compound-mini/gpt-oss-20b/gpt-oss-safeguard-20b/
-    allam-2-7b were removed."""
+async def test_only_the_seeded_groq_models_are_active():
+    """Per the catalog seeded by scripts/seed_provider_catalog.py: only the
+    platform default (openai/gpt-oss-120b) and qwen/qwen3.8-27b are active
+    under Groq. qwen/qwen3.6-27b was retired by Groq and is no longer in
+    the catalog."""
     from sqlalchemy import select
 
     from app.database.models import Provider, ProviderModel
@@ -59,8 +72,4 @@ async def test_only_three_groq_models_remain_in_the_catalog():
         )
         groq_model_names = {m.model_name for m in result.scalars().all()}
 
-    assert groq_model_names == {
-        "openai/gpt-oss-120b",
-        "qwen/qwen3.8-27b",
-        "qwen/qwen3.6-27b",
-    }
+    assert groq_model_names == {"openai/gpt-oss-120b", "qwen/qwen3.8-27b"}

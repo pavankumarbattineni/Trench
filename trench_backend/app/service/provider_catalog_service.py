@@ -20,11 +20,12 @@ from app.database.models import Provider, ProviderModel
 # technically text-in/text-out.
 _GROQ_NON_CHAT_MODEL_PATTERNS = ("whisper", "orpheus", "prompt-guard")
 
-# The pruned catalog keeps only these Groq-hosted models (see migration
-# 3873b7cda9af) -- a sync must never resurrect the others Groq's live
-# /models endpoint would otherwise offer.
-_GROQ_ALLOWED_MODELS = {"openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.6-27b"}
-_GROQ_HIDDEN_MODELS = {"qwen/qwen3.8-27b", "qwen/qwen3.6-27b"}
+# The Groq models the catalog keeps (matches scripts/seed_provider_catalog.py)
+# -- a sync must never resurrect the others Groq's live /models endpoint
+# would otherwise offer. qwen/qwen3.6-27b was retired by Groq; qwen3.8 is
+# now a regular, visible model rather than a hidden backup.
+_GROQ_ALLOWED_MODELS = {"openai/gpt-oss-120b", "qwen/qwen3.8-27b"}
+_GROQ_HIDDEN_MODELS: set[str] = set()
 
 
 class ProviderCatalogService:
