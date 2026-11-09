@@ -247,19 +247,31 @@ export function useChatStream(threadId: string) {
 
   const messages = threadQuery.data?.messages ?? [];
   const hasActiveMessage = messages.some((m) => m.id === activeStreamId);
-  const displayMessages =
-    isStreaming && activeStreamId && !hasActiveMessage
-      ? [
-          ...messages,
-          {
-            id: activeStreamId,
-            role: "assistant" as const,
-            content: streamingContent,
-            chunks: [],
-            status: "running" as const,
-            created_at: new Date().toISOString(),
-          },
-        ]
+  // The backend creates the assistant row (empty, "pending") as soon as a
+  // message is sent, and the thread query usually re-fetches it before the
+  // first token arrives -- so the streaming message is often ALREADY in
+  // `messages`. Overlay the live text onto that placeholder; otherwise the
+  // bubble keeps showing the empty placeholder ("Thinking…") for the whole
+  // stream and the answer only appears once `done` replaces it.
+  const displayMessages: ChatMessage[] =
+    isStreaming && activeStreamId
+      ? hasActiveMessage
+        ? messages.map((m) =>
+            m.id === activeStreamId && (m.status === "pending" || m.status === "running")
+              ? { ...m, content: streamingContent, status: "running" as const }
+              : m
+          )
+        : [
+            ...messages,
+            {
+              id: activeStreamId,
+              role: "assistant" as const,
+              content: streamingContent,
+              chunks: [],
+              status: "running" as const,
+              created_at: new Date().toISOString(),
+            },
+          ]
       : messages;
 
   return {
