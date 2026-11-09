@@ -23,13 +23,14 @@
  * range starting at 1. */
 export function linkifyCitations(content: string, validNumbers: ReadonlySet<number>): string {
   if (validNumbers.size === 0) return content;
-  // Code is left untouched: "[1]" inside a fenced block or inline code is
-  // literal source (e.g. a Mermaid node `A[1]`), and rewriting it into a
-  // markdown link would corrupt that source. split() with a capture group
-  // puts the code segments at the odd indices. A fence still open at the
-  // end (mid-stream) counts as code until it closes.
+  // Code and math are left untouched: "[1]" inside a fenced block, inline
+  // code or a $$...$$ equation (see normalizeMathDelimiters) is literal
+  // source (e.g. a Mermaid node `A[1]`), and rewriting it into a markdown
+  // link would corrupt it. split() with a capture group puts the protected
+  // segments at the odd indices. A fence still open at the end (mid-stream)
+  // counts as code until it closes.
   return content
-    .split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/)
+    .split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`|\$\$[\s\S]*?\$\$)/)
     .map((segment, i) =>
       i % 2 === 1
         ? segment

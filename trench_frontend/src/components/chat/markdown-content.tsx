@@ -1,9 +1,25 @@
-import ReactMarkdown, { type Components } from "react-markdown";
+import ReactMarkdown, { type Components, type Options } from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import "katex/dist/katex.min.css";
 
 import { MermaidDiagram } from "@/components/chat/mermaid-diagram";
 import { CITATION_HREF_PREFIX, linkifyCitations } from "@/lib/citation-links";
+import { normalizeMathDelimiters } from "@/lib/math-delimiters";
 import { cn } from "cn";
+
+// singleDollarTextMath off: only $$...$$ is math (see math-delimiters.ts),
+// so prose like "costs $5 and $10" is never rendered as an equation.
+const REMARK_PLUGINS: Options["remarkPlugins"] = [
+  remarkGfm,
+  [remarkMath, { singleDollarTextMath: false }],
+];
+// A malformed equation renders as its source in the error color instead
+// of throwing and blanking the whole message.
+const REHYPE_PLUGINS: Options["rehypePlugins"] = [
+  [rehypeKatex, { throwOnError: false, strict: "ignore", errorColor: "var(--destructive)" }],
+];
 
 interface HastLike {
   type?: string;
@@ -121,13 +137,21 @@ export function MarkdownContent({
   onCitationClick,
   isStreaming = false,
 }: MarkdownContentProps) {
+  // Math first (\( \) / \[ \] -> $$ form), then citations -- which skip
+  // the resulting $$...$$ segments so "[n]" inside an equation is never
+  // turned into a citation link.
+  const withMath = normalizeMathDelimiters(content);
   const processed = citationNumbers?.size
-    ? linkifyCitations(content, citationNumbers)
-    : content;
+    ? linkifyCitations(withMath, citationNumbers)
+    : withMath;
 
   return (
     <div className="text-sm leading-relaxed">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={buildComponents(onCitationClick, isStreaming)}>
+      <ReactMarkdown
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={REHYPE_PLUGINS}
+        components={buildComponents(onCitationClick, isStreaming)}
+      >
         {processed}
       </ReactMarkdown>
     </div>

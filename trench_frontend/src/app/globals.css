@@ -130,3 +130,11 @@
     @apply font-sans;
   }
 }
+
+/* KaTeX display equations (chat answers): a wide equation scrolls
+   sideways inside the message instead of overflowing the chat column. */
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25rem 0;
+}
