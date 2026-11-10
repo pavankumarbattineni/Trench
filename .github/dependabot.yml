@@ -1,0 +1,40 @@
+# Dependabot: weekly PRs that bump dependencies; CI tests each one.
+# Minor/patch bumps are grouped into one PR per ecosystem to keep the noise
+# down; major bumps (possible breaking changes) still get their own PR.
+version: 2
+
+updates:
+  # Python packages (uv.lock)
+  - package-ecosystem: uv
+    directory: /trench_backend
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "build(deps)" }
+    groups:
+      python-minor-patch:
+        update-types: [minor, patch]
+
+  # npm packages (package-lock.json)
+  - package-ecosystem: npm
+    directory: /trench_frontend
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "build(deps)" }
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # Base images in the Dockerfiles (python:3.13-slim, node:24-slim, uv)
+  - package-ecosystem: docker
+    directories: [/trench_backend, /trench_frontend]
+    schedule: { interval: weekly, day: monday }
+    commit-message: { prefix: "build(docker)" }
+
+  # GitHub Actions used in .github/workflows (updates the pinned SHAs)
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    commit-message: { prefix: "ci" }
+    groups:
+      actions:
+        patterns: ["*"]
