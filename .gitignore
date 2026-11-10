@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 trench_backend/.env
 trench_backend/.env.docker
+trench_backend/.env.compose
 .pytest_cache/
 trench_backend/storage/
 

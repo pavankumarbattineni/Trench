@@ -1,0 +1,13 @@
+# Development overrides -- applied automatically by `docker compose up`.
+# Production-like run without them: docker compose -f compose.yaml up
+services:
+  backend:
+    # Auto-reload on code changes (uvicorn[standard] includes watchfiles).
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000",
+              "--reload", "--reload-dir", "/app/app"]
+    volumes:
+      - ./trench_backend/app:/app/app      # your Windows code, live inside the container
+    environment:
+      # File-change events don't cross from Windows into containers;
+      # poll for changes instead.
+      WATCHFILES_FORCE_POLLING: "true"
