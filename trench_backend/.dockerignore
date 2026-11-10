@@ -1,0 +1,28 @@
+# trench_backend/.dockerignore
+# Files Docker must NOT send into the build. Keeps the image small and
+# guarantees secrets (.env files) can never end up inside it.
+
+# Local virtualenv (the image builds its own, for Linux)
+.venv/
+
+# Secrets: never in the image. Config is passed at `docker run` time.
+.env
+.env.*
+!.env.example
+
+# Python caches and tool output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Not needed to run the app
+tests/
+storage/
+.langgraph_api/
+*.log
+
+# Docker's own files
+Dockerfile
+.dockerignore
