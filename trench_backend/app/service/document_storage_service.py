@@ -184,9 +184,7 @@ class B2StorageProvider:
             return
         # delete_objects takes at most 1000 keys per call; a single
         # document's version history will never come close to that.
-        self._client.delete_objects(
-            Bucket=self._bucket, Delete={"Objects": object_ids}
-        )
+        self._client.delete_objects(Bucket=self._bucket, Delete={"Objects": object_ids})
 
     async def generate_presigned_url(
         self,

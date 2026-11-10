@@ -93,9 +93,7 @@ async def test_delete_deletes_every_version_of_the_object(provider, stubber):
 
 @pytest.mark.asyncio
 async def test_delete_is_a_noop_when_no_versions_exist(provider, stubber):
-    stubber.add_response(
-        "list_object_versions", {}, {"Bucket": BUCKET, "Prefix": KEY}
-    )
+    stubber.add_response("list_object_versions", {}, {"Bucket": BUCKET, "Prefix": KEY})
     await provider.delete(KEY)
 
 

@@ -44,9 +44,7 @@ async def cleanup():
     yield
     async with async_session_factory() as session:
         await session.execute(
-            update(User)
-            .where(User.email.like(f"%{PREFIX}%"))
-            .values(tenant_id=None)
+            update(User).where(User.email.like(f"%{PREFIX}%")).values(tenant_id=None)
         )
         await session.commit()
         tenant_result = await session.execute(
@@ -61,9 +59,7 @@ async def cleanup():
         for user in result.scalars().all():
             await session.delete(user)
         result = await session.execute(
-            select(ProviderModel).where(
-                ProviderModel.model_name.like(f"{PREFIX}%")
-            )
+            select(ProviderModel).where(ProviderModel.model_name.like(f"{PREFIX}%"))
         )
         for model in result.scalars().all():
             await session.delete(model)
@@ -137,9 +133,7 @@ async def test_get_me_reflects_personal_documents_uploaded_count(client: AsyncCl
 
     async with async_session_factory() as session:
         await session.execute(
-            update(User)
-            .where(User.email == _EMAIL)
-            .values(documents_uploaded_count=3)
+            update(User).where(User.email == _EMAIL).values(documents_uploaded_count=3)
         )
         await session.commit()
 

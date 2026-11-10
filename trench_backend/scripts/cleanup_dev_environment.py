@@ -78,9 +78,7 @@ async def wipe_postgres() -> dict[str, int]:
             .all()
         )
         counts["threads"] = len(
-            (await session.execute(delete(Thread).returning(Thread.id)))
-            .scalars()
-            .all()
+            (await session.execute(delete(Thread).returning(Thread.id))).scalars().all()
         )
         counts["documents"] = len(
             (await session.execute(delete(Document).returning(Document.id)))
@@ -105,9 +103,7 @@ async def wipe_postgres() -> dict[str, int]:
             (await session.execute(delete(User).returning(User.id))).scalars().all()
         )
         counts["tenants"] = len(
-            (await session.execute(delete(Tenant).returning(Tenant.id)))
-            .scalars()
-            .all()
+            (await session.execute(delete(Tenant).returning(Tenant.id))).scalars().all()
         )
         await session.commit()
         return counts

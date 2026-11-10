@@ -17,6 +17,7 @@ Branches independently off c1a3fa88c33a (not the still-unapplied
 70ed057f9456, see Task 13) so it can be applied without first forcing
 through that deferred, unrelated NOT NULL migration.
 """
+
 from typing import Sequence, Union
 
 from alembic import op
@@ -24,8 +25,8 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '3873b7cda9af'
-down_revision: Union[str, Sequence[str], None] = 'c1a3fa88c33a'
+revision: str = "3873b7cda9af"
+down_revision: Union[str, Sequence[str], None] = "c1a3fa88c33a"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -54,9 +55,7 @@ users_table = sa.table(
 def upgrade() -> None:
     op.add_column(
         "provider_models",
-        sa.Column(
-            "is_visible", sa.Boolean(), nullable=False, server_default=sa.true()
-        ),
+        sa.Column("is_visible", sa.Boolean(), nullable=False, server_default=sa.true()),
     )
     # Any user who had selected one of the five removed models falls back
     # to the platform default the same way an unset model_id always has

@@ -37,9 +37,7 @@ class ThreadTitleService:
         try:
             title = await ThreadTitleService._complete(db, query)
         except Exception:
-            logger.exception(
-                "Thread title generation failed | thread_id=%s", thread_id
-            )
+            logger.exception("Thread title generation failed | thread_id=%s", thread_id)
             return
 
         if not title:

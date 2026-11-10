@@ -54,9 +54,7 @@ async def test_rerank_overwrites_score_with_cohere_relevance_score():
     here starts at 0.5 (see _chunk()), which must not survive reranking."""
     chunks = [_chunk("a"), _chunk("b")]
     fake_client = AsyncMock()
-    fake_client.rerank = AsyncMock(
-        return_value=_cohere_response(result_indexes=[0, 1])
-    )
+    fake_client.rerank = AsyncMock(return_value=_cohere_response(result_indexes=[0, 1]))
 
     with patch("app.service.reranker_service._client", return_value=fake_client):
         result = await RerankerService.rerank("some query", chunks)

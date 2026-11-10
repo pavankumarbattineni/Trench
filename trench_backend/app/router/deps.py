@@ -84,9 +84,7 @@ async def require_tenant_owner(
         HTTPException: 404 if the tenant doesn't exist, 403 if the caller
             isn't the Owner of it.
     """
-    return await TenantService.require_owner(
-        db, user=current_user, tenant_id=tenant_id
-    )
+    return await TenantService.require_owner(db, user=current_user, tenant_id=tenant_id)
 
 
 async def require_tenant_member(

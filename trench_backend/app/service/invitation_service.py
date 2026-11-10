@@ -282,9 +282,7 @@ class InvitationService:
             )
             created = True
         elif user.tenant_id is not None:
-            raise cls.AlreadyInTenantError(
-                "This account already belongs to a tenant"
-            )
+            raise cls.AlreadyInTenantError("This account already belongs to a tenant")
         else:
             user.tenant_id = invitation.tenant_id
             user.role = invitation.role

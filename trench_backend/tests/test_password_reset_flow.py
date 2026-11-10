@@ -23,9 +23,7 @@ async def cleanup():
     async with async_session_factory() as session:
         await session.execute(delete(PasswordResetToken))
         await session.execute(
-            update(User)
-            .where(User.email.like(f"%{PREFIX}%"))
-            .values(tenant_id=None)
+            update(User).where(User.email.like(f"%{PREFIX}%")).values(tenant_id=None)
         )
         await session.commit()
         tenant_result = await session.execute(
@@ -57,9 +55,7 @@ async def _signup(client: AsyncClient, email: str, username: str) -> None:
 async def test_request_reset_always_returns_200_even_for_unknown_email(
     client: AsyncClient,
 ):
-    with patch(
-        "app.service.auth_service.send_email", new=AsyncMock()
-    ) as mock_send:
+    with patch("app.service.auth_service.send_email", new=AsyncMock()) as mock_send:
         response = await client.post(
             "/api/v1/auth/password-reset/request",
             json={"email": f"{PREFIX}-doesnotexist@{PREFIX}-doesnotexist.example.com"},
@@ -73,9 +69,7 @@ async def test_request_reset_emails_a_token_for_a_known_user(client: AsyncClient
     email = f"{PREFIX}-resetme@{PREFIX}-resetme.example.com"
     await _signup(client, email, f"{PREFIX}-resetme")
 
-    with patch(
-        "app.service.auth_service.send_email", new=AsyncMock()
-    ) as mock_send:
+    with patch("app.service.auth_service.send_email", new=AsyncMock()) as mock_send:
         response = await client.post(
             "/api/v1/auth/password-reset/request", json={"email": email}
         )
@@ -89,12 +83,8 @@ async def _request_reset_and_capture_url(client: AsyncClient, email: str) -> str
     async def _capture_send(*, to, subject, html_body, text_body):
         captured["html_body"] = html_body
 
-    with patch(
-        "app.service.auth_service.send_email", new=_capture_send
-    ):
-        await client.post(
-            "/api/v1/auth/password-reset/request", json={"email": email}
-        )
+    with patch("app.service.auth_service.send_email", new=_capture_send):
+        await client.post("/api/v1/auth/password-reset/request", json={"email": email})
 
     return captured["html_body"].split('href="')[1].split('"')[0]
 

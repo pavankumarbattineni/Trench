@@ -46,9 +46,7 @@ async def cleanup():
         # users.tenant_id has no ondelete -- clear it before deleting the
         # tenant.
         await session.execute(
-            update(User)
-            .where(User.email.like(f"%{PREFIX}%"))
-            .values(tenant_id=None)
+            update(User).where(User.email.like(f"%{PREFIX}%")).values(tenant_id=None)
         )
         await session.commit()
         tenant_result = await session.execute(

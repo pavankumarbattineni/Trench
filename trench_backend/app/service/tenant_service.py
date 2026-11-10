@@ -43,9 +43,7 @@ _DOMAIN_TAKEN = HTTPException(
     "add you as a member instead",
 )
 _NOT_FOUND = HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
-_NOT_ADMIN = HTTPException(
-    status.HTTP_403_FORBIDDEN, "Only a tenant admin can do that"
-)
+_NOT_ADMIN = HTTPException(status.HTTP_403_FORBIDDEN, "Only a tenant admin can do that")
 _NOT_OWNER = HTTPException(
     status.HTTP_403_FORBIDDEN, "Only the tenant owner can do that"
 )

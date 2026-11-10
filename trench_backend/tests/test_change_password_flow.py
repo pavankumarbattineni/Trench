@@ -20,14 +20,10 @@ async def cleanup():
     yield
     async with async_session_factory() as session:
         await session.execute(
-            update(User)
-            .where(User.email.like(f"%{PREFIX}%"))
-            .values(tenant_id=None)
+            update(User).where(User.email.like(f"%{PREFIX}%")).values(tenant_id=None)
         )
         await session.commit()
-        await session.execute(
-            delete(Tenant).where(Tenant.domain.like(f"%{PREFIX}%"))
-        )
+        await session.execute(delete(Tenant).where(Tenant.domain.like(f"%{PREFIX}%")))
         await session.commit()
         await session.execute(delete(User).where(User.email.like(f"%{PREFIX}%")))
         await session.commit()

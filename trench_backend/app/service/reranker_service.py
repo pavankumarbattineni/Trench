@@ -29,9 +29,7 @@ def _client() -> cohere.AsyncClientV2:
 
 class RerankerService:
     @staticmethod
-    async def rerank(
-        query: str, chunks: list[dict], *, top_k: int = 8
-    ) -> list[dict]:
+    async def rerank(query: str, chunks: list[dict], *, top_k: int = 8) -> list[dict]:
         """Returns up to `top_k` of `chunks`, reordered by Cohere's
         relevance scoring for `query`. Returns [] unchanged (no API call)
         if `chunks` is empty -- there's nothing to rerank.

@@ -169,7 +169,9 @@ async def seed() -> None:
                 .order_by(Provider.name, ProviderModel.model_name)
             )
         ).all()
-        print(f"{'provider':<10} {'model_name':<28} {'active':<7} {'visible':<8} default")
+        print(
+            f"{'provider':<10} {'model_name':<28} {'active':<7} {'visible':<8} default"
+        )
         for pname, r in rows:
             print(
                 f"{pname:<10} {r.model_name:<28} {str(r.is_active):<7} "
