@@ -1,0 +1,16 @@
+# trench_frontend/.dockerignore
+# Rebuilt inside the image -- never send the local (Windows) copies.
+node_modules/
+.next/
+
+# Env files: public build values are passed as --build-arg instead.
+.env*
+
+# Not needed for the build
+.git
+*.tsbuildinfo
+README.md
+AGENTS.md
+CLAUDE.md
+Dockerfile
+.dockerignore
