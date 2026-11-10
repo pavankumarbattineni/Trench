@@ -258,7 +258,15 @@ class ChatService:
                     },
                 }
 
-                await _get_compiled_graph().ainvoke(initial_state, config=config)
+                # durability="sync": each step's checkpoint is written before
+                # the next step runs. The default ("async") writes them in the
+                # background, so `persist` could mark the stream "completed"
+                # before the checkpoint holding this turn's assistant reply
+                # was saved -- and a quick follow-up message would then load
+                # history without it.
+                await _get_compiled_graph().ainvoke(
+                    initial_state, config=config, durability="sync"
+                )
         except asyncio.CancelledError:
             partial_content = "".join(
                 chunk["content"]
