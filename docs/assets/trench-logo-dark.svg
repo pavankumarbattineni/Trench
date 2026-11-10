@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="80" viewBox="0 0 300 80" role="img" aria-label="Trench">
+  <title>Trench</title>
+  <!-- App mark: lime tile with three flush-left, descending bars (see trench_frontend/src/components/trench-mark.tsx) -->
+  <rect x="4" y="4" width="72" height="72" rx="18" fill="#D3FB52"/>
+  <g transform="translate(4 4) scale(1.8)">
+    <rect x="6" y="7" width="28" height="6" rx="3" fill="#052326"/>
+    <rect x="6" y="17" width="20" height="6" rx="3" fill="#052326"/>
+    <rect x="6" y="27" width="12" height="6" rx="3" fill="#052326"/>
+  </g>
+  <text x="96" y="55" fill="#F5F7F2" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="700" letter-spacing="-1">Trench</text>
+</svg>
