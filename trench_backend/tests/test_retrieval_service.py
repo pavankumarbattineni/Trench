@@ -21,9 +21,7 @@ async def cleanup():
         # user's tenant_id must be cleared before the tenant itself can be
         # deleted.
         await session.execute(
-            update(User)
-            .where(User.email.like(f"{PREFIX}%"))
-            .values(tenant_id=None)
+            update(User).where(User.email.like(f"{PREFIX}%")).values(tenant_id=None)
         )
         await session.commit()
 
@@ -166,6 +164,9 @@ async def test_retrieve_maps_pinecone_matches_to_retrieved_chunks():
     async def _fake_embed_query(text: str) -> list[float]:
         return [0.0] * 8
 
+    async def _fake_encode_query(text: str) -> dict:
+        return {"indices": [1], "values": [1.0]}
+
     with (
         patch(
             "app.service.retrieval_service.get_vector_store",
@@ -174,6 +175,10 @@ async def test_retrieve_maps_pinecone_matches_to_retrieved_chunks():
         patch(
             "app.service.retrieval_service.EmbeddingService.embed_query",
             _fake_embed_query,
+        ),
+        patch(
+            "app.service.retrieval_service.SparseEncodingService.encode_query",
+            _fake_encode_query,
         ),
     ):
         results = await RetrievalService.retrieve(

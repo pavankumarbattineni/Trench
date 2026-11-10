@@ -106,6 +106,23 @@ def _fake_embeddings(monkeypatch):
     return captured_calls
 
 
+@pytest.fixture(autouse=True)
+def _fake_sparse_encoding(monkeypatch):
+    """Avoids real Pinecone Inference API calls in the automated test suite
+    -- records what was sent so tests can check the encoded text."""
+    captured_calls: list[list[str]] = []
+
+    async def _fake_encode_documents(texts: list[str]) -> list[dict]:
+        captured_calls.append(texts)
+        return [{"indices": [1], "values": [1.0]} for _ in texts]
+
+    monkeypatch.setattr(
+        "app.service.document_ingestion_service.SparseEncodingService.encode_documents",
+        _fake_encode_documents,
+    )
+    return captured_calls
+
+
 @pytest.mark.asyncio
 async def test_process_marks_document_completed_and_increments_usage(tmp_path):
     async with async_session_factory() as session:
@@ -130,7 +147,7 @@ async def test_process_marks_document_completed_and_increments_usage(tmp_path):
 
 @pytest.mark.asyncio
 async def test_process_embeds_contextualized_text_but_stores_raw_text_as_metadata(
-    tmp_path, _fake_vector_store, _fake_embeddings
+    tmp_path, _fake_vector_store, _fake_embeddings, _fake_sparse_encoding
 ):
     async with async_session_factory() as session:
         document = await _make_document(
@@ -147,12 +164,15 @@ async def test_process_embeds_contextualized_text_but_stores_raw_text_as_metadat
     assert len(_fake_vector_store.records) == 1
     record = _fake_vector_store.records[0]
     assert record.metadata["heading_path"] == "Refunds"
-    assert record.metadata["index_version"] == 2
+    assert record.metadata["index_version"] == 3
     raw_text = record.metadata["text"]
     assert not raw_text.startswith("notes.txt")
 
     [embedded_texts] = _fake_embeddings
     assert embedded_texts == [f"notes.txt\nRefunds\n\n{raw_text}"]
+    # Sparse (keyword) vectors are built from the same contextualized text.
+    [sparse_texts] = _fake_sparse_encoding
+    assert sparse_texts == embedded_texts
 
 
 @pytest.mark.asyncio

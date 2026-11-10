@@ -89,7 +89,7 @@ class DocumentIngestionService:
             ]
 
             dense_vectors = await EmbeddingService.embed_texts(embed_texts)
-            sparse_vectors = SparseEncodingService.encode_documents(embed_texts)
+            sparse_vectors = await SparseEncodingService.encode_documents(embed_texts)
 
             if pieces:
                 namespace = (
@@ -116,7 +116,9 @@ class DocumentIngestionService:
                                 "chunk_index": index,
                                 "text": piece.text,
                                 "heading_path": piece.heading_path,
-                                "index_version": 2,
+                                # 3 = sparse vectors from Pinecone's hosted
+                                # pinecone-sparse-english-v0 (2 = local BM25).
+                                "index_version": 3,
                             },
                         )
                         for index, (piece, dense_vector, sparse_vector) in enumerate(

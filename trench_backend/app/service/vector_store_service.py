@@ -31,7 +31,7 @@ def company_namespace(tenant_id: uuid.UUID) -> str:
 
 
 # How much weight the dense (semantic) vector gets relative to the sparse
-# (BM25 keyword) vector in Pinecone's combined dotproduct score -- applied
+# (keyword) vector in Pinecone's combined dotproduct score -- applied
 # identically to documents at upsert time and to queries at query time (see
 # scale_hybrid), since hybrid search only makes sense when both sides were
 # scaled the same way.
@@ -129,14 +129,16 @@ class PineconeVectorStore:
             scaled_dense, scaled_sparse = scale_hybrid(
                 record.dense_vector, record.sparse_vector
             )
-            vectors.append(
-                {
-                    "id": record.chunk_id,
-                    "values": scaled_dense,
-                    "sparse_values": scaled_sparse,
-                    "metadata": record.metadata,
-                }
-            )
+            vector = {
+                "id": record.chunk_id,
+                "values": scaled_dense,
+                "metadata": record.metadata,
+            }
+            # Pinecone rejects an empty sparse vector (e.g. a chunk with no
+            # recognizable words); such a record is stored dense-only.
+            if scaled_sparse["indices"]:
+                vector["sparse_values"] = scaled_sparse
+            vectors.append(vector)
         await asyncio.to_thread(
             self._index.upsert, vectors=vectors, namespace=namespace
         )
@@ -153,7 +155,9 @@ class PineconeVectorStore:
         response = await asyncio.to_thread(
             self._index.query,
             vector=scaled_dense,
-            sparse_vector=scaled_sparse,
+            # Empty sparse vector (query with no recognizable words) ->
+            # dense-only query; Pinecone rejects an empty sparse_vector.
+            sparse_vector=scaled_sparse if scaled_sparse["indices"] else None,
             top_k=top_k,
             namespace=namespace,
             include_metadata=True,

@@ -92,7 +92,7 @@ async def _fake_stream_generate(resolved, *, system_prompt, messages):
 
 
 async def _fake_retrieve(*, query, scope, top_k=8):
-    # Keeps these tests from making real Pinecone/BM25-encoder network
+    # Keeps these tests from making real Pinecone (vector + sparse-encoding) network
     # calls -- retrieval itself is covered separately (see
     # test_retrieval_service.py and the manual live verification). A
     # high-scoring chunk keeps assess_retrieval_sufficiency satisfied on

@@ -1,5 +1,5 @@
 """Hybrid retrieval: a single Pinecone query combining a dense (semantic)
-vector and a sparse (BM25 keyword) vector, scoped to exactly one knowledge
+vector and a sparse (keyword) vector, scoped to exactly one knowledge
 base namespace.
 
 Authorization happens before any retrieval call is made -- see
@@ -88,7 +88,7 @@ class RetrievalService:
         *, query: str, scope: KnowledgeScope, top_k: int = 8
     ) -> list[RetrievedChunk]:
         dense_vector = await EmbeddingService.embed_query(query)
-        sparse_vector = SparseEncodingService.encode_query(query)
+        sparse_vector = await SparseEncodingService.encode_query(query)
 
         vector_store = get_vector_store(dimensions=EmbeddingService.DIMENSIONS)
         matches = await vector_store.query(
