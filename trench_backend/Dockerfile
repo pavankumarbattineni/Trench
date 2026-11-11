@@ -5,7 +5,7 @@
 # ============================================================================
 # Stage 1: builder (installs dependencies into /app/.venv)
 # ============================================================================
-FROM python:3.13-slim AS builder
+FROM python:3.15-slim AS builder
 
 # Copy the uv binary from its official image (pinned to the version you use
 # locally), so we don't need pip or curl to install it.
@@ -52,7 +52,7 @@ RUN /app/.venv/bin/python -c "import nltk; [nltk.download(p, download_dir='/app/
 # ============================================================================
 # Stage 2: runtime (what actually runs; no uv, no build caches)
 # ============================================================================
-FROM python:3.13-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 # PATH                    : use the venv's python and uvicorn by default
 # PYTHONUNBUFFERED        : print logs immediately (no buffering), so
