@@ -19,7 +19,11 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", get_settings().TRENCH_CONFIG.DB.url)
+# "%" is configparser's interpolation character, so a URL-encoded password
+# (e.g. "%40" for "@") must be escaped as "%%" here.
+config.set_main_option(
+    "sqlalchemy.url", get_settings().TRENCH_CONFIG.DB.url.replace("%", "%%")
+)
 
 # add your model's MetaData object here
 # for 'autogenerate' support

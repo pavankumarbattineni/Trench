@@ -19,8 +19,7 @@ _checkpointer: AsyncPostgresSaver | None = None
 
 
 def _conninfo() -> str:
-    db = get_settings().TRENCH_CONFIG.DB
-    return f"postgresql://{db.username}:{db.password}@{db.ip_address}:{db.port}/{db.database}"
+    return get_settings().TRENCH_CONFIG.DB.conninfo
 
 
 async def init_checkpointer() -> AsyncPostgresSaver:

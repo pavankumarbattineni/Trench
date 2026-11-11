@@ -323,8 +323,9 @@ All backend settings live in one JSON environment variable, validated at startup
 | Section | Keys | Purpose |
 |---|---|---|
 | `ENVIRONMENT` | `"DEV"` / `"PROD"` | Environment name |
-| `FRONTEND_BASE_URL` | URL | Used in emailed links (invitations, password reset) |
-| `DB` | `username`, `password`, `database`, `ip_address`, `port`, `pool_size`, `max_overflow`, `pool_timeout`, `pool_recycle` | PostgreSQL connection and pool |
+| `FRONTEND_BASE_URL` | URL, no trailing slash | Used in emailed links (invitations, password reset); also the default CORS origin |
+| `CORS_ORIGINS` | list of URLs (optional) | Browser origins allowed to call the API. Defaults to `[FRONTEND_BASE_URL]` |
+| `DB` | `username`, `password`, `database`, `ip_address`, `port`, `pool_size`, `max_overflow`, `pool_timeout`, `pool_recycle`, `ssl` | PostgreSQL connection and pool. Set `ssl: true` for hosted databases such as Neon |
 | `JWT` | `secret_key`, `algorithm`, `access_token_expire_minutes` (15), `refresh_token_expire_days` (30) | Trench session tokens |
 | `ENCRYPTION` | `encryption_key` | Root secret for encrypting stored provider API keys |
 | `FIREBASE` | `credentials_json_base64`, `web_api_key` | Admin SDK service account (base64, `base64 -w0 key.json`) |
