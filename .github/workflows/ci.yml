@@ -163,8 +163,13 @@ jobs:
       - name: Lint (eslint)
         run: npm run lint
 
+      # Route/layout types (e.g. LayoutProps) are generated into .next/types,
+      # which doesn't exist on a fresh checkout -- generate them first,
+      # without a full build.
       - name: Type check (tsc)
-        run: npx tsc --noEmit
+        run: |
+          npx next typegen
+          npx tsc --noEmit
 
       - name: Build (next build)
         run: npm run build
@@ -198,8 +203,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          # Frontend only (the backend Dockerfile declares no ARGs, so it
+          # ignores these). Placeholders: src/lib/firebase.ts deliberately
+          # fails the build when the Firebase config is missing.
           build-args: |
             NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+            NEXT_PUBLIC_FIREBASE_API_KEY=ci-placeholder
+            NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=ci-placeholder.firebaseapp.com
+            NEXT_PUBLIC_FIREBASE_PROJECT_ID=ci-placeholder
+            NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=ci-placeholder.appspot.com
+            NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=000000000000
+            NEXT_PUBLIC_FIREBASE_APP_ID=1:000000000000:web:ci
 
       # 1) Full report (all severities) -> GitHub Security tab. Never fails.
       - name: Trivy scan (report)
@@ -211,7 +225,7 @@ jobs:
           exit-code: "0"
 
       - name: Upload scan to Security tab
-        if: always()
+        if: always() && hashFiles(format('trivy-{0}.sarif', matrix.service)) != ''
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: trivy-${{ matrix.service }}.sarif
