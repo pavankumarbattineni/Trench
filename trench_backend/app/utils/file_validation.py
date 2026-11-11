@@ -6,12 +6,41 @@ accepted if it actually starts with the PDF magic bytes, etc.
 """
 
 import io
+import os
+import unicodedata
 
 from fastapi import HTTPException, status
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+
+# Matches Document.document_name (String(255)). Mobile pickers and
+# "Save as" from apps routinely produce names longer than this.
+MAX_FILENAME_LENGTH = 255
+_MAX_EXTENSION_LENGTH = 16
+
+
+def sanitize_filename(filename: str | None) -> str:
+    """Returns a display-safe file name that always fits the database column.
+
+    Keeps only the base name (some clients send a path), normalizes Unicode
+    to NFC, drops control characters, and shortens anything longer than
+    MAX_FILENAME_LENGTH while preserving the extension -- which the type
+    sniffing below relies on to tell .txt/.md/.docx apart.
+    """
+    name = (filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = unicodedata.normalize("NFC", name)
+    name = "".join(ch for ch in name if unicodedata.category(ch)[0] != "C").strip()
+    if not name or name in {".", ".."}:
+        return "untitled"
+    if len(name) <= MAX_FILENAME_LENGTH:
+        return name
+    stem, ext = os.path.splitext(name)
+    if len(ext) > _MAX_EXTENSION_LENGTH:
+        stem, ext = name, ""
+    return stem[: MAX_FILENAME_LENGTH - len(ext)].rstrip() + ext
+
 
 # PDF only -- DOCX has no stored page count (pagination is a rendering-time
 # concern decided by page size/margins/fonts, not something in the file

@@ -15,6 +15,9 @@ export interface DocumentSummary {
   chunk_count: number;
   created_at: string;
   processed_at: string | null;
+  // Upload responses only: true when this exact file was already uploaded
+  // into the same scope, so the existing document came back instead.
+  duplicate?: boolean;
 }
 
 // Every function below is personal-scoped unless `tenantId` is given, in

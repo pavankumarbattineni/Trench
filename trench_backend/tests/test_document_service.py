@@ -121,11 +121,88 @@ async def test_duplicate_upload_short_circuits_without_new_row(tmp_path):
             )
 
         assert first.id == second.id
+        # (Same session -> same identity-mapped instance, so only the second
+        # call's flag is meaningful here; real requests each have a session.)
+        assert second.duplicate is True
 
         count_result = await session.execute(
             select(Document).where(Document.user_id == user.id)
         )
         assert len(count_result.scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_uploads_resolve_to_the_existing_document(
+    tmp_path, monkeypatch
+):
+    """Two identical uploads in flight at once (a double tap on mobile) both
+    pass the duplicate check before either commits; the loser then hits the
+    unique (user, content_hash) constraint. That must resolve to the
+    existing document -- not a 500 -- and leave no orphaned bytes."""
+    async with async_session_factory() as session:
+        user = await _make_user(session, "race")
+        with _local_storage(tmp_path):
+            first = await DocumentService.upload_document(
+                session, user=user, filename="race.txt", content=b"tapped twice"
+            )
+            # The losing request's rollback expires loaded instances; keep
+            # plain values for the assertions below.
+            user_id, first_id = user.id, first.id
+            first_storage_path = first.storage_path
+
+            # Replay the race window for the second request: its duplicate
+            # check runs before the first request's row exists, and the
+            # "already processing" guard hasn't seen it either.
+            real_find = DocumentService._find_duplicate
+            calls = {"n": 0}
+
+            async def _miss_first_time(*args, **kwargs):
+                calls["n"] += 1
+                return None if calls["n"] == 1 else await real_find(*args, **kwargs)
+
+            async def _not_processing(*args, **kwargs):
+                return None
+
+            monkeypatch.setattr(
+                DocumentService, "_find_duplicate", staticmethod(_miss_first_time)
+            )
+            monkeypatch.setattr(
+                DocumentService,
+                "_enforce_no_concurrent_processing",
+                staticmethod(_not_processing),
+            )
+            second = await DocumentService.upload_document(
+                session, user=user, filename="race.txt", content=b"tapped twice"
+            )
+
+        assert second.id == first_id
+        assert second.duplicate is True
+        rows = await session.execute(
+            select(Document.id).where(Document.user_id == user_id)
+        )
+        assert rows.scalars().all() == [first_id]
+        stored = [p for p in tmp_path.rglob("*") if p.is_file()]
+        assert stored == [tmp_path / first_storage_path]
+
+
+@pytest.mark.asyncio
+async def test_upload_with_very_long_filename_is_stored_with_a_shortened_name(
+    tmp_path,
+):
+    """Mobile share sheets and "Save as" often produce names longer than the
+    255-character column; that used to surface as a 500."""
+    async with async_session_factory() as session:
+        user = await _make_user(session, "longname")
+        long_name = "a" * 300 + ".txt"
+
+        with _local_storage(tmp_path):
+            document = await DocumentService.upload_document(
+                session, user=user, filename=long_name, content=b"long name body"
+            )
+
+        assert len(document.document_name) == 255
+        assert document.document_name.endswith(".txt")
+        assert document.document_type == "txt"
 
 
 @pytest.mark.asyncio
