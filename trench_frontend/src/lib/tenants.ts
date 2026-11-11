@@ -37,6 +37,25 @@ export async function getMyTenant(): Promise<MyTenant> {
   return data;
 }
 
+export interface DeleteTenantResult {
+  members_removed: number;
+  documents_deleted: number;
+}
+
+/** Permanently deletes the tenant (Owner only). Members keep their
+ * accounts but leave the tenant; company documents, invitations and the
+ * shared credential are deleted. `confirmName` must equal the tenant's
+ * name exactly -- the backend checks it too. */
+export async function deleteTenant(
+  tenantId: string,
+  confirmName: string
+): Promise<DeleteTenantResult> {
+  const { data } = await apiClient.delete<DeleteTenantResult>(`/api/v1/tenants/${tenantId}`, {
+    data: { confirm_name: confirmName },
+  });
+  return data;
+}
+
 export interface ListMembersParams {
   page?: number;
   pageSize?: number;

@@ -66,6 +66,8 @@ from app.schemas.invitation import (
     InvitationResponse,
 )
 from app.schemas.tenant import (
+    DeleteTenantRequest,
+    DeleteTenantResponse,
     KnowledgeAccessBulkGrantResponse,
     KnowledgeAccessBulkRevokeResponse,
     MemberBulkRemoveResponse,
@@ -82,6 +84,7 @@ from app.service.invitation_service import (
     TooManyRoleError,
 )
 from app.service.knowledge_access_service import KnowledgeAccessService
+from app.service.tenant_deletion_service import TenantDeletionService
 from app.service.tenant_service import OWNER, TenantService
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
@@ -122,6 +125,43 @@ async def get_my_tenant(
         created_at=tenant.created_at,
         role=current_user.role,
     )
+
+
+@router.delete("/{tenant_id}", response_model=DeleteTenantResponse)
+async def delete_tenant(
+    tenant_id: uuid.UUID,
+    body: DeleteTenantRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DeleteTenantResponse:
+    """Permanently deletes the tenant. Owner only.
+
+    Every member (the Owner included) loses their membership and company
+    knowledge access, but keeps their account, personal documents and
+    chats. Company documents (rows, stored files, vectors), invitations and
+    the tenant's shared provider credential are deleted.
+
+    Args:
+        tenant_id: The tenant to delete.
+        body: `confirm_name` -- the tenant's exact name, as confirmation.
+        current_user: The caller; must be this tenant's Owner.
+        db: An active async SQLAlchemy session.
+
+    Returns:
+        How many members were removed and documents deleted.
+
+    Raises:
+        HTTPException: 403 if the caller isn't the Owner; 404 if the tenant
+            doesn't exist; 422 if `confirm_name` doesn't match; 409 if a
+            company document is still processing.
+    """
+    counts = await TenantDeletionService.delete_tenant(
+        db,
+        tenant_id=tenant_id,
+        acting_user=current_user,
+        confirm_name=body.confirm_name,
+    )
+    return DeleteTenantResponse(**counts)
 
 
 def _member_response(member: User) -> TenantMemberResponse:

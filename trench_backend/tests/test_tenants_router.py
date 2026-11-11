@@ -7,7 +7,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select, update
 
-from app.database.models import Document, Tenant, User
+from app.database.models import Document, Invitation, Tenant, User
 from app.database.session import async_session_factory
 from app.service.document_service import DocumentService
 from app.service.document_storage_service import LocalFilesystemStorageProvider
@@ -1313,3 +1313,181 @@ async def test_bulk_invite_reports_already_pending_rows_as_failed(
     assert [row["email"] for row in body["succeeded"]] == [fresh]
     assert [row["email"] for row in body["failed"]] == [pending]
     assert "already has a pending invitation" in body["failed"][0]["reason"]
+
+
+# --- Tenant deletion -----------------------------------------------------------
+
+
+class _RecordingVectorStore(_FakeVectorStore):
+    def __init__(self) -> None:
+        self.deleted_namespaces: list[str] = []
+
+    async def delete_namespace(self, *, namespace) -> None:
+        self.deleted_namespaces.append(namespace)
+
+
+async def _mark_documents_completed(tenant_id: str) -> None:
+    async with async_session_factory() as session:
+        await session.execute(
+            update(Document)
+            .where(Document.tenant_id == uuid.UUID(tenant_id))
+            .values(status="completed")
+        )
+        await session.commit()
+
+
+async def _tenant_name(client: AsyncClient, token: str) -> str:
+    return (
+        await client.get("/api/v1/tenants/me", headers=_auth_headers(token))
+    ).json()["name"]
+
+
+@pytest.mark.asyncio
+async def test_owner_deletes_tenant_members_keep_their_accounts(
+    client: AsyncClient, tmp_path, monkeypatch
+):
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    member_token, member_id = await _invite_and_accept(
+        client, tenant_id, owner_token, return_user_id=True
+    )
+    admin_token = await _invite_and_accept(client, tenant_id, owner_token, role="admin")
+    storage = LocalFilesystemStorageProvider(tmp_path)
+    await _upload_company_document(client, tenant_id, owner_token, storage)
+    await _mark_documents_completed(tenant_id)
+    with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+        await client.post(
+            f"/api/v1/tenants/{tenant_id}/invitations",
+            data={"email": f"{PREFIX}-pending-at-delete@{PREFIX}.example.com"},
+            headers=_auth_headers(owner_token),
+        )
+    vectors = _RecordingVectorStore()
+    monkeypatch.setattr(
+        "app.service.tenant_deletion_service.get_vector_store",
+        lambda **kwargs: vectors,
+    )
+    name = await _tenant_name(client, owner_token)
+
+    with patch(
+        "app.service.tenant_deletion_service.get_storage_provider",
+        return_value=storage,
+    ):
+        response = await client.request(
+            "DELETE",
+            f"/api/v1/tenants/{tenant_id}",
+            json={"confirm_name": f"  {name} "},
+            headers=_auth_headers(owner_token),
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"members_removed": 3, "documents_deleted": 1}
+    assert vectors.deleted_namespaces == [f"company:{tenant_id}"]
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+    async with async_session_factory() as session:
+        assert await session.get(Tenant, uuid.UUID(tenant_id)) is None
+        for model in (Document, Invitation):
+            rows = await session.execute(
+                select(model).where(model.tenant_id == uuid.UUID(tenant_id))
+            )
+            assert rows.scalars().all() == []
+
+    # Every former member (owner included) still has a working account,
+    # just no tenant and no company access.
+    for token in (owner_token, member_token, admin_token):
+        me = await client.get("/api/v1/users/me", headers=_auth_headers(token))
+        assert me.status_code == 200
+        assert me.json()["has_company_access"] is False
+        mine = await client.get("/api/v1/tenants/me", headers=_auth_headers(token))
+        assert mine.status_code == 404
+    assert member_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["admin", "member"])
+async def test_only_the_owner_can_delete_the_tenant(client: AsyncClient, role):
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    token = await _invite_and_accept(client, tenant_id, owner_token, role=role)
+    name = await _tenant_name(client, owner_token)
+
+    response = await client.request(
+        "DELETE",
+        f"/api/v1/tenants/{tenant_id}",
+        json={"confirm_name": name},
+        headers=_auth_headers(token),
+    )
+
+    assert response.status_code == 403
+    assert (
+        await client.get("/api/v1/tenants/me", headers=_auth_headers(owner_token))
+    ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_another_tenants_owner_cannot_delete_it(client: AsyncClient):
+    _owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    # A second tenant needs its own email domain (one tenant per domain).
+    other_email = f"{PREFIX}-other-owner@{PREFIX}-other.example.com"
+    with patch(
+        "app.utils.firebase.verify_firebase_id_token",
+        return_value=_claims(other_email, other_email),
+    ):
+        signup = await client.post(
+            "/api/v1/auth/signup/owner",
+            json={
+                "id_token": "fake",
+                "username": f"{PREFIX}-other-{uuid.uuid4().hex[:6]}",
+                "tenant_name": f"{PREFIX}-other-org-{uuid.uuid4().hex[:8]}",
+            },
+        )
+        assert signup.status_code == 200, signup.text
+        login = await client.post("/api/v1/auth/login", json={"id_token": "fake"})
+    other_owner_token = login.json()["access_token"]
+
+    response = await client.request(
+        "DELETE",
+        f"/api/v1/tenants/{tenant_id}",
+        json={"confirm_name": "anything"},
+        headers=_auth_headers(other_owner_token),
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_tenant_deletion_requires_the_exact_name(client: AsyncClient):
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    name = await _tenant_name(client, owner_token)
+
+    response = await client.request(
+        "DELETE",
+        f"/api/v1/tenants/{tenant_id}",
+        json={"confirm_name": name.upper()},
+        headers=_auth_headers(owner_token),
+    )
+
+    assert response.status_code == 422
+    assert "exactly" in response.json()["message"]
+    assert (
+        await client.get("/api/v1/tenants/me", headers=_auth_headers(owner_token))
+    ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_tenant_deletion_waits_for_documents_still_processing(
+    client: AsyncClient, tmp_path
+):
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    await _upload_company_document(
+        client, tenant_id, owner_token, LocalFilesystemStorageProvider(tmp_path)
+    )  # stays "pending": ingestion is disabled in these tests
+    name = await _tenant_name(client, owner_token)
+
+    response = await client.request(
+        "DELETE",
+        f"/api/v1/tenants/{tenant_id}",
+        json={"confirm_name": name},
+        headers=_auth_headers(owner_token),
+    )
+
+    assert response.status_code == 409
+    assert "still processing" in response.json()["message"]

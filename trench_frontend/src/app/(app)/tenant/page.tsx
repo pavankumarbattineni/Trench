@@ -1,15 +1,18 @@
 "use client";
 
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Building2, FileText, Mail, Users } from "lucide-react";
+import { isAxiosError } from "axios";
+import { Building2, FileText, Mail, Trash2, Users } from "lucide-react";
 
 import { useAuth } from "@/components/auth-provider";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "cn";
 import { useMyTenant } from "@/hooks/use-tenant";
 import { getErrorMessage } from "@/lib/errors";
+import { DeleteTenantDialog } from "./delete-tenant-dialog";
 import { InvitationsTab } from "./invitations-tab";
 import { MembersPanel } from "./members-panel";
 import { TenantDocumentsPanel } from "./tenant-documents-panel";
@@ -31,13 +34,26 @@ export default function TenantPage() {
     );
   }
 
-  // Every authenticated user now belongs to exactly one tenant --
-  // owner-signup and invite-accept both guarantee this, so there's no
-  // more "not in a tenant yet" state to design for. A 404 here would mean
-  // a genuine data inconsistency, not an expected product state; show the
-  // same generic error path as any other failure rather than a bespoke
-  // "create your tenant" flow (that self-service path no longer exists --
-  // tenants are created only via owner-signup).
+  // 404 = the user belongs to no tenant: they were removed from one, or
+  // its Owner deleted it. Their account still works (personal knowledge,
+  // chats); joining a tenant again takes a new invitation.
+  if (isAxiosError(tenantQuery.error) && tenantQuery.error.response?.status === 404) {
+    return (
+      <main className="mx-auto flex h-full max-w-3xl items-center justify-center px-4">
+        <div className="flex max-w-md flex-col items-center gap-3 rounded-2xl border border-border bg-card p-8 text-center">
+          <span className="flex size-12 items-center justify-center rounded-xl bg-muted text-muted-foreground">
+            <Building2 className="size-6" />
+          </span>
+          <h1 className="text-lg font-semibold tracking-tight">You&apos;re not part of a tenant</h1>
+          <p className="text-sm text-muted-foreground">
+            Your account, personal documents and chats are still available. To join a tenant, ask
+            its owner or an admin to send you an invitation.
+          </p>
+        </div>
+      </main>
+    );
+  }
+
   if (tenantQuery.isError || !tenantQuery.data) {
     return (
       <main className="mx-auto flex h-full max-w-3xl items-center justify-center px-4 text-center">
@@ -125,6 +141,7 @@ function TenantDetailContent({
     params.set("tab", next);
     router.replace(`${pathname}?${params.toString()}`, { scroll: false });
   };
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
   return (
     <main className="mx-auto flex h-full max-w-3xl flex-col gap-6 overflow-y-auto px-4 py-10">
@@ -148,7 +165,28 @@ function TenantDetailContent({
             Admin
           </Badge>
         )}
+        {/* Owner-only: the backend rejects anyone else too (403). */}
+        {isOwner && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setDeleteOpen(true)}
+            aria-label="Delete tenant"
+            title="Delete tenant"
+            className="-my-1 shrink-0 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+          >
+            <Trash2 className="size-4" />
+          </Button>
+        )}
       </div>
+      {isOwner && (
+        <DeleteTenantDialog
+          tenantId={tenantId}
+          tenantName={name}
+          open={deleteOpen}
+          onOpenChange={setDeleteOpen}
+        />
+      )}
 
       <div className="flex gap-1 border-b border-border">
         <button
