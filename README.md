@@ -335,7 +335,8 @@ All backend settings live in one JSON environment variable, validated at startup
 | `LLAMAPARSE` | `api_key` | PDF/DOCX parsing |
 | `COHERE_RERANKER` | `api_key` | Reranking |
 | `GEMINI` | `api_key`, `embed_requests_per_minute` | Dense embeddings |
-| `SMTP` | `host`, `port`, `username`, `password`, `from_address`, `use_tls` | Outgoing email |
+| `SMTP` | `host`, `port`, `username`, `password`, `from_address`, `use_tls` | Outgoing email (used when `BREVO` is not set, e.g. local development) |
+| `BREVO` (optional) | `api_key`, `from_address`, `from_name` | Sends email over Brevo's HTTPS API instead of SMTP. Required on hosts that block SMTP ports, such as Render's free tier |
 | `STORAGE` | `local_root_path` | Legacy, unused |
 
 Optional plain variables for [LangSmith](https://smith.langchain.com/) tracing: `LANGSMITH_API_KEY`,

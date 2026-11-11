@@ -150,6 +150,17 @@ class SMTPConfig(BaseModel):
     use_tls: bool = True
 
 
+class BrevoConfig(BaseModel):
+    """Brevo's transactional email HTTPS API. Used instead of SMTP when set:
+    many hosts (Render's free tier included) block outbound SMTP ports
+    25/465/587, while HTTPS (443) is always open. `from_address` must be a
+    sender verified in the Brevo account."""
+
+    api_key: str
+    from_address: str
+    from_name: str = "Trench"
+
+
 class TrenchConfig(BaseModel):
     ENVIRONMENT: str = "DEV"
     # The frontend's own origin -- used to build links that must point at
@@ -175,6 +186,9 @@ class TrenchConfig(BaseModel):
     COHERE_RERANKER: CohereRerankerConfig
     GEMINI: GeminiConfig
     SMTP: SMTPConfig
+    # Optional: when present, email goes through Brevo's HTTPS API instead
+    # of SMTP (see app/utils/email.py).
+    BREVO: BrevoConfig | None = None
 
 
 class Settings(BaseSettings):
