@@ -75,6 +75,8 @@ from app.schemas.tenant import (
     UpdateMemberRoleRequest,
 )
 from app.service.invitation_service import (
+    AlreadyInvitedError,
+    AlreadyMemberError,
     DomainMismatchError,
     InvitationService,
     TooManyRoleError,
@@ -470,7 +472,10 @@ async def create_invitation(
             per-row one reported in the response body instead); 403 if
             the caller isn't an Admin/Owner of the tenant, or (Admin
             caller, single mode) tries to set role="admin"; 404 if the
-            tenant doesn't exist; 502 if the invitation was created but
+            tenant doesn't exist; 409 if the email already has a pending,
+            unexpired invitation (use the resend endpoint) or is already a
+            member (single mode; file mode reports these per-row instead);
+            502 if the invitation was created but
             the email itself couldn't be sent (single mode -- use the
             resend endpoint; file mode reports this per-row instead).
     """
@@ -517,6 +522,8 @@ async def create_invitation(
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
     except DomainMismatchError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except (AlreadyInvitedError, AlreadyMemberError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except InvitationService.EmailDeliveryError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     return _invitation_response(invitation)
@@ -731,6 +738,8 @@ async def _bulk_create_invitations(
         except (
             TooManyRoleError,
             DomainMismatchError,
+            AlreadyInvitedError,
+            AlreadyMemberError,
             InvitationService.EmailDeliveryError,
         ) as exc:
             failed.append(

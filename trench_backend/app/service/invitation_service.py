@@ -14,7 +14,7 @@ import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -36,6 +36,18 @@ class DomainMismatchError(Exception):
     """Raised when the invited email's domain doesn't match the
     tenant's own domain -- a tenant can only invite members of its own
     company."""
+
+
+class AlreadyInvitedError(Exception):
+    """Raised when the email already has a pending, unexpired invitation
+    to this tenant. Re-inviting used to silently rotate the token and
+    re-send, reported as a plain success; the caller should use Resend
+    instead, which does exactly that, explicitly."""
+
+
+class AlreadyMemberError(Exception):
+    """Raised when the email already belongs to a member of this tenant --
+    such an invitation could never be accepted."""
 
 
 def _hash_token(raw_token: str) -> str:
@@ -117,7 +129,9 @@ class InvitationService:
         email: str,
         role: str,
     ) -> tuple[Invitation, str]:
-        """Creates (or re-uses/rotates) a pending invitation and emails it.
+        """Creates a pending invitation and emails it. An *expired* pending
+        invitation for the same email is re-used (fresh token and expiry);
+        a still-valid one is refused -- use resend() for that.
 
         `inviter` must already be authorized as an Admin/Owner of `tenant`
         (the router's job) -- this only applies the role ceiling.
@@ -127,6 +141,10 @@ class InvitationService:
                 `role != "member"` -- Admins can only invite Members.
             DomainMismatchError: if `email`'s domain doesn't match the
                 tenant's own domain.
+            AlreadyMemberError: if `email` already belongs to a member of
+                this tenant.
+            AlreadyInvitedError: if `email` already has a pending,
+                unexpired invitation to this tenant.
         """
         if role not in ("admin", "member"):
             raise ValueError(f"Invalid invitation role: {role!r}")
@@ -138,17 +156,30 @@ class InvitationService:
                 f"{email} doesn't match this tenant's domain ({tenant.domain})"
             )
 
-        raw_token = secrets.token_urlsafe(32)
-        token_hash = _hash_token(raw_token)
+        member = await db.execute(
+            select(User.id).where(
+                func.lower(User.email) == email.lower(), User.tenant_id == tenant.id
+            )
+        )
+        if member.first() is not None:
+            raise AlreadyMemberError(f"{email} is already a member of {tenant.name}.")
 
         result = await db.execute(
             select(Invitation).where(
                 Invitation.tenant_id == tenant.id,
-                Invitation.email == email,
+                func.lower(Invitation.email) == email.lower(),
                 Invitation.status == "pending",
             )
         )
         invitation = result.scalar_one_or_none()
+        if invitation is not None and invitation.expires_at > datetime.now(UTC):
+            raise AlreadyInvitedError(
+                f"{email} already has a pending invitation (expires "
+                f"{invitation.expires_at:%d %b %Y}). Use Resend to send it again."
+            )
+
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = _hash_token(raw_token)
         if invitation is None:
             invitation = Invitation(
                 tenant_id=tenant.id,

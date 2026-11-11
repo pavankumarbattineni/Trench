@@ -1255,3 +1255,61 @@ async def test_owner_cannot_be_given_the_owner_role_again_or_promote_to_owner(
         headers=_auth_headers(owner_token),
     )
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_inviting_an_email_with_a_pending_invitation_returns_409(
+    client: AsyncClient,
+):
+    """The UI used to show "Invitation sent successfully" for a second invite
+    to the same person; it must now get a clear 409 telling it to Resend."""
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    form = {"email": f"{PREFIX}-pending-twice@{PREFIX}.example.com", "role": "member"}
+
+    with patch(
+        "app.service.invitation_service.send_email", new=AsyncMock()
+    ) as mock_send:
+        first = await client.post(
+            f"/api/v1/tenants/{tenant_id}/invitations",
+            data=form,
+            headers=_auth_headers(owner_token),
+        )
+        second = await client.post(
+            f"/api/v1/tenants/{tenant_id}/invitations",
+            data=form,
+            headers=_auth_headers(owner_token),
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert "already has a pending invitation" in second.json()["message"]
+    assert "Resend" in second.json()["message"]
+    assert mock_send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_invite_reports_already_pending_rows_as_failed(
+    client: AsyncClient,
+):
+    owner_token, tenant_id = await _signup_owner_and_create_tenant(client)
+    pending = f"{PREFIX}-bulk-pending@{PREFIX}.example.com"
+    fresh = f"{PREFIX}-bulk-fresh@{PREFIX}.example.com"
+
+    with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+        await client.post(
+            f"/api/v1/tenants/{tenant_id}/invitations",
+            data={"email": pending, "role": "member"},
+            headers=_auth_headers(owner_token),
+        )
+        csv_bytes = f"email,role\n{pending},member\n{fresh},member\n".encode()
+        response = await client.post(
+            f"/api/v1/tenants/{tenant_id}/invitations",
+            files={"file": ("employees.csv", csv_bytes, "text/csv")},
+            headers=_auth_headers(owner_token),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [row["email"] for row in body["succeeded"]] == [fresh]
+    assert [row["email"] for row in body["failed"]] == [pending]
+    assert "already has a pending invitation" in body["failed"][0]["reason"]
