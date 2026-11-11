@@ -15,7 +15,7 @@
     "axios": "^1.20.0",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.2.6",
-    "firebase": "^12.18.0",
+    "firebase": "^13.2.0",
     "js-cookie": "^3.0.8",
     "katex": "0.16.47",
     "lucide-react": "^1.43.0",
