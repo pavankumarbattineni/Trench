@@ -3,7 +3,7 @@
 # deps -> builder -> runner.
 
 # Shared base: Node 24 LTS on Debian slim (Next 16 needs Node >= 20.9).
-FROM node:24-slim AS base
+FROM node:26-slim AS base
 # Opt out of Next.js anonymous telemetry during build and run.
 ENV NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
