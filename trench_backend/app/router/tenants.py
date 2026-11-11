@@ -66,6 +66,8 @@ from app.schemas.invitation import (
     InvitationResponse,
 )
 from app.schemas.tenant import (
+    DeleteTenantRequest,
+    DeleteTenantResponse,
     KnowledgeAccessBulkGrantResponse,
     KnowledgeAccessBulkRevokeResponse,
     MemberBulkRemoveResponse,
@@ -75,11 +77,14 @@ from app.schemas.tenant import (
     UpdateMemberRoleRequest,
 )
 from app.service.invitation_service import (
+    AlreadyInvitedError,
+    AlreadyMemberError,
     DomainMismatchError,
     InvitationService,
     TooManyRoleError,
 )
 from app.service.knowledge_access_service import KnowledgeAccessService
+from app.service.tenant_deletion_service import TenantDeletionService
 from app.service.tenant_service import OWNER, TenantService
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
@@ -120,6 +125,43 @@ async def get_my_tenant(
         created_at=tenant.created_at,
         role=current_user.role,
     )
+
+
+@router.delete("/{tenant_id}", response_model=DeleteTenantResponse)
+async def delete_tenant(
+    tenant_id: uuid.UUID,
+    body: DeleteTenantRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DeleteTenantResponse:
+    """Permanently deletes the tenant. Owner only.
+
+    Every member (the Owner included) loses their membership and company
+    knowledge access, but keeps their account, personal documents and
+    chats. Company documents (rows, stored files, vectors), invitations and
+    the tenant's shared provider credential are deleted.
+
+    Args:
+        tenant_id: The tenant to delete.
+        body: `confirm_name` -- the tenant's exact name, as confirmation.
+        current_user: The caller; must be this tenant's Owner.
+        db: An active async SQLAlchemy session.
+
+    Returns:
+        How many members were removed and documents deleted.
+
+    Raises:
+        HTTPException: 403 if the caller isn't the Owner; 404 if the tenant
+            doesn't exist; 422 if `confirm_name` doesn't match; 409 if a
+            company document is still processing.
+    """
+    counts = await TenantDeletionService.delete_tenant(
+        db,
+        tenant_id=tenant_id,
+        acting_user=current_user,
+        confirm_name=body.confirm_name,
+    )
+    return DeleteTenantResponse(**counts)
 
 
 def _member_response(member: User) -> TenantMemberResponse:
@@ -470,7 +512,10 @@ async def create_invitation(
             per-row one reported in the response body instead); 403 if
             the caller isn't an Admin/Owner of the tenant, or (Admin
             caller, single mode) tries to set role="admin"; 404 if the
-            tenant doesn't exist; 502 if the invitation was created but
+            tenant doesn't exist; 409 if the email already has a pending,
+            unexpired invitation (use the resend endpoint) or is already a
+            member (single mode; file mode reports these per-row instead);
+            502 if the invitation was created but
             the email itself couldn't be sent (single mode -- use the
             resend endpoint; file mode reports this per-row instead).
     """
@@ -517,6 +562,8 @@ async def create_invitation(
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
     except DomainMismatchError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except (AlreadyInvitedError, AlreadyMemberError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except InvitationService.EmailDeliveryError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     return _invitation_response(invitation)
@@ -731,6 +778,8 @@ async def _bulk_create_invitations(
         except (
             TooManyRoleError,
             DomainMismatchError,
+            AlreadyInvitedError,
+            AlreadyMemberError,
             InvitationService.EmailDeliveryError,
         ) as exc:
             failed.append(

@@ -69,3 +69,16 @@ class KnowledgeAccessBulkGrantResponse(BaseModel):
 
 class MemberBulkRemoveResponse(BaseModel):
     removed_count: int
+
+
+class DeleteTenantRequest(BaseModel):
+    # The tenant's exact name, typed by the Owner to confirm a permanent,
+    # irreversible deletion.
+    confirm_name: str
+
+
+class DeleteTenantResponse(BaseModel):
+    # Members (Owner included) whose tenant membership was removed --
+    # their accounts are kept.
+    members_removed: int
+    documents_deleted: int

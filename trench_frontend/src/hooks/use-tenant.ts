@@ -5,6 +5,7 @@ import { isAxiosError } from "axios";
 
 import {
   createInvitation,
+  deleteTenant,
   grantAllKnowledgeAccess,
   listInvitations,
   listMembers,
@@ -104,6 +105,20 @@ export function useRevokeInvitation(tenantId: string) {
   return useMutation({
     mutationFn: (invitationId: string) => revokeInvitation(tenantId, invitationId),
     onSuccess: () => invalidateInvitations(queryClient, tenantId),
+  });
+}
+
+export function useDeleteTenant(tenantId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (confirmName: string) => deleteTenant(tenantId, confirmName),
+    onSuccess: () => {
+      // Everything tenant-scoped (the tenant itself, its members,
+      // invitations and company documents) is gone; drop the cached copies
+      // rather than refetching them into 404s.
+      queryClient.removeQueries({ queryKey: ["tenant"] });
+      queryClient.removeQueries({ queryKey: ["documents", tenantId] });
+    },
   });
 }
 

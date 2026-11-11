@@ -509,6 +509,7 @@ sequenceDiagram
 - **Passwords**: change from Settings (re-verifies the current password), or reset when signed out with a
   single-use emailed token.
 - **Account deletion** removes the Postgres user and wipes the personal Pinecone namespace.
+- **Tenant deletion** (Owner only, type-the-name confirmation): every member, the Owner included, leaves the tenant but keeps their account, personal documents and chats; company documents (rows, files, the `company:` vector namespace), invitations and the shared API key are deleted.
 
 ## Models and bring-your-own-key
 
@@ -536,7 +537,7 @@ All endpoints except `/health` are under `/api/v1`. Interactive docs: `/docs` (S
 | Health | `GET /health` (database connectivity + running `version`, the deployed commit) |
 | Auth | `POST /auth/signup/owner` · `POST /auth/login` · `POST /auth/logout` · `POST /auth/refresh` · `POST /auth/change-password` · `POST /auth/password-reset/request` · `POST /auth/password-reset/confirm` · `POST /auth/invitations/accept` · `DELETE /auth/account` |
 | Users | `GET /users/me` · `PATCH /users/me` |
-| Tenants | `GET /tenants/me` · `GET /tenants/{tenant_id}/members` · `PATCH /tenants/{tenant_id}/members/{user_id}` · `GET /tenants/{tenant_id}/invitations` |
+| Tenants | `GET /tenants/me` · `DELETE /tenants/{tenant_id}` (Owner) · `GET /tenants/{tenant_id}/members` · `PATCH /tenants/{tenant_id}/members/{user_id}` · `GET /tenants/{tenant_id}/invitations` |
 | Credentials (BYOK) | `POST /credentials` · `GET /credentials` · `DELETE /credentials/{provider_type}` |
 | Config | `GET /config` (provider and model catalog) |
 | Documents | `POST /documents` · `GET /documents` · `GET /documents/{id}/status` · `GET /documents/{id}/download` · `DELETE /documents/{id}` |
@@ -702,7 +703,6 @@ Run from `trench_backend/` with `uv run python scripts/<name>.py`.
   tokens already sent.
 - **LlamaParse event loop**: its SDK drives a nested event loop, which is handled with `nest_asyncio`
   and a selector loop.
-- **No tenant deletion**, so there's no company-namespace cleanup path yet.
 - **Render free tier** sleeps after 15 minutes idle; the first request afterwards is slow.
 
 ## Troubleshooting

@@ -1,6 +1,7 @@
 "use client";
 
 import { useAuth } from "@/components/auth-provider";
+import { TruncatedEmail } from "@/components/truncated-email";
 import { SettingsNav } from "./settings-nav";
 
 export default function SettingsLayout({ children }: { children: React.ReactNode }) {
@@ -9,10 +10,11 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
 
   return (
     <main className="mx-auto flex h-full max-w-4xl flex-col gap-6 overflow-y-auto px-4 py-10 sm:gap-8">
-      <div>
+      <div className="min-w-0">
         <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
-        <p className="text-sm text-muted-foreground">
-          Signed in as <span className="font-medium text-foreground">{user.email}</span>
+        <p className="flex min-w-0 gap-1 text-sm text-muted-foreground">
+          <span className="shrink-0">Signed in as</span>
+          <TruncatedEmail email={user.email} className="font-medium text-foreground" />
         </p>
       </div>
 

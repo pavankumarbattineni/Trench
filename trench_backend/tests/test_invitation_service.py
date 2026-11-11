@@ -396,3 +396,100 @@ async def test_resend_raises_email_delivery_error_on_smtp_failure():
                 await InvitationService.resend(
                     session, invitation=invitation, tenant=org
                 )
+
+
+@pytest.mark.asyncio
+async def test_create_refuses_while_a_pending_invitation_is_still_valid():
+    """Re-inviting used to silently rotate the token and re-send, reported as
+    a plain success. A still-valid pending invitation must now be refused --
+    no new token, no email -- so the inviter is told and can use Resend."""
+    from app.service.invitation_service import AlreadyInvitedError, InvitationService
+
+    async with async_session_factory() as session:
+        org, owner = await _make_tenant_and_owner(session, "pending")
+        await session.commit()
+        email = f"{PREFIX}-invitee-pending@{org.domain}"
+        with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+            first, _ = await InvitationService.create(
+                session, tenant=org, inviter=owner, email=email, role="member"
+            )
+        first_id, first_hash = first.id, first.token_hash
+
+        with patch(
+            "app.service.invitation_service.send_email", new=AsyncMock()
+        ) as mock_send:
+            with pytest.raises(AlreadyInvitedError, match="already has a pending"):
+                await InvitationService.create(
+                    session,
+                    tenant=org,
+                    inviter=owner,
+                    email=email.upper(),  # same address, different case
+                    role="member",
+                )
+        assert mock_send.await_count == 0
+
+        rows = (
+            (await session.execute(select(Invitation).where(Invitation.email == email)))
+            .scalars()
+            .all()
+        )
+        assert [(r.id, r.token_hash) for r in rows] == [(first_id, first_hash)]
+
+
+@pytest.mark.asyncio
+async def test_create_reuses_an_expired_pending_invitation_with_a_fresh_token():
+    from app.service.invitation_service import InvitationService
+
+    async with async_session_factory() as session:
+        org, owner = await _make_tenant_and_owner(session, "expired")
+        await session.commit()
+        email = f"{PREFIX}-invitee-expired@{org.domain}"
+        with patch("app.service.invitation_service.send_email", new=AsyncMock()):
+            first, _ = await InvitationService.create(
+                session, tenant=org, inviter=owner, email=email, role="member"
+            )
+        first.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        await session.commit()
+        old_hash = first.token_hash
+
+        with patch(
+            "app.service.invitation_service.send_email", new=AsyncMock()
+        ) as mock_send:
+            again, raw_token = await InvitationService.create(
+                session, tenant=org, inviter=owner, email=email, role="member"
+            )
+
+        assert again.id == first.id
+        assert mock_send.await_count == 1
+        assert again.token_hash != old_hash
+        assert again.token_hash == hashlib.sha256(raw_token.encode()).hexdigest()
+        assert again.expires_at > datetime.now(UTC)
+
+
+@pytest.mark.asyncio
+async def test_create_refuses_an_email_that_is_already_a_member():
+    from app.service.invitation_service import AlreadyMemberError, InvitationService
+
+    async with async_session_factory() as session:
+        org, owner = await _make_tenant_and_owner(session, "member")
+        member = User(
+            email=f"{PREFIX}-existing-member@{org.domain}",
+            username=f"{PREFIX}-existing-member",
+            tenant_id=org.id,
+            role="member",
+        )
+        session.add(member)
+        await session.commit()
+
+        with patch(
+            "app.service.invitation_service.send_email", new=AsyncMock()
+        ) as mock_send:
+            with pytest.raises(AlreadyMemberError, match="already a member"):
+                await InvitationService.create(
+                    session,
+                    tenant=org,
+                    inviter=owner,
+                    email=member.email,
+                    role="member",
+                )
+        assert mock_send.await_count == 0
