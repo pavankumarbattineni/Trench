@@ -1,4 +1,5 @@
 from functools import lru_cache
+from urllib.parse import quote_plus
 
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,13 +15,30 @@ class DBConfig(BaseModel):
     max_overflow: int = 5
     pool_timeout: int = 30
     pool_recycle: int = 1800
+    # Require an encrypted (TLS) connection. Off for local Postgres/Compose;
+    # on for hosted databases such as Neon, which refuse plain connections.
+    ssl: bool = False
+
+    def _base_url(self, scheme: str) -> str:
+        # quote_plus: a password containing @ : / % etc. would otherwise
+        # break the URL.
+        return (
+            f"{scheme}://{quote_plus(self.username)}:{quote_plus(self.password)}"
+            f"@{self.ip_address}:{self.port}/{self.database}"
+        )
 
     @property
     def url(self) -> str:
-        return (
-            f"postgresql+asyncpg://{self.username}:{self.password}"
-            f"@{self.ip_address}:{self.port}/{self.database}"
-        )
+        """SQLAlchemy URL (asyncpg driver) -- used by the app and Alembic."""
+        url = self._base_url("postgresql+asyncpg")
+        return f"{url}?ssl=require" if self.ssl else url
+
+    @property
+    def conninfo(self) -> str:
+        """libpq/psycopg connection string -- used by the LangGraph
+        checkpointer. psycopg spells the SSL option `sslmode`."""
+        url = self._base_url("postgresql")
+        return f"{url}?sslmode=require" if self.ssl else url
 
 
 class JWTConfig(BaseModel):
@@ -141,6 +159,10 @@ class TrenchConfig(BaseModel):
     # No trailing slash (see InvitationService.create/PasswordResetService
     # .request, which join it directly with a leading-slash path).
     FRONTEND_BASE_URL: str = "http://localhost:3000"
+    # Browser origins allowed to call the API (CORS). Unset = just
+    # FRONTEND_BASE_URL, which covers the usual one-frontend setup; list
+    # extra origins here (e.g. a custom domain alongside *.vercel.app).
+    CORS_ORIGINS: list[str] | None = None
     DB: DBConfig
     JWT: JWTConfig
     ENCRYPTION: EncryptionConfig
@@ -172,6 +194,13 @@ class Settings(BaseSettings):
     @property
     def is_dev(self) -> bool:
         return self.TRENCH_CONFIG.ENVIRONMENT.upper() == "DEV"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        cfg = self.TRENCH_CONFIG
+        origins = cfg.CORS_ORIGINS or [cfg.FRONTEND_BASE_URL]
+        # Browsers send the Origin header without a trailing slash.
+        return [origin.rstrip("/") for origin in origins]
 
 
 @lru_cache
