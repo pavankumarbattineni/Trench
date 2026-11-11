@@ -718,7 +718,18 @@ Run from `trench_backend/` with `uv run python scripts/<name>.py`.
 
 ## Contributing
 
-1. Branch from `development`: `git switch -c feat/short-description`
+**Branches.** Only two branches are permanent:
+
+| Branch | Role |
+|---|---|
+| `development` | Integration branch. Protected: changes arrive only through pull requests with all 4 CI checks green, and every merge feeds the deployment pipeline |
+| `main` | Stable reference branch, kept for releases |
+
+All other work happens on short-lived branches named **sequentially**: `Trench-<N>`, optionally followed by a
+descriptive title, e.g. `Trench-1-Enhancement`, `Trench-2-CI-CD-Pipeline`. Delete a branch once it's merged.
+(Dependabot creates its own `dependabot/...` branches.)
+
+1. Branch from the latest `development`: `git switch development && git pull && git switch -c Trench-<N>-<Title>`
 2. Keep commits focused, using [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `ci:`, `build:`, `style:`, `test:`)
 3. Run the checks from [Testing and code quality](#testing-and-code-quality) locally
 4. Open a pull request into `development`; CI must be green before merging
