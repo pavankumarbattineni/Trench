@@ -69,8 +69,17 @@ ENV PATH="/app/.venv/bin:$PATH" \
     NLTK_DATA=/app/nltk_data \
     PORT=8000
 
-# Create an unprivileged system user "app" (no password, no home folder).
-RUN groupadd --system app && useradd --system --gid app --no-create-home app
+# Security hardening (the CI Trivy scan gates on fixable CRITICAL/HIGH CVEs):
+# - apply Debian security updates published since the base image was built
+# - remove pip: the app never installs anything at runtime (the venv is
+#   complete), and pip bundles its own old copies of urllib3/msgpack/
+#   setuptools that would otherwise ship in the image
+# Then create an unprivileged system user "app" (no password, no home folder).
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/* \
+ && python -m pip uninstall -y pip \
+ && groupadd --system app && useradd --system --gid app --no-create-home app
 
 WORKDIR /app
 
