@@ -23,9 +23,7 @@ from app.service.credential_service import (
 from app.service.knowledge_access_service import KnowledgeAccessService
 from app.service.provider_catalog_service import ProviderCatalogService
 
-_MODEL_NOT_FOUND = HTTPException(
-    status.HTTP_404_NOT_FOUND, "Model not found"
-)
+_MODEL_NOT_FOUND = HTTPException(status.HTTP_404_NOT_FOUND, "Model not found")
 _MODEL_INACTIVE = HTTPException(
     status.HTTP_422_UNPROCESSABLE_CONTENT, "This model is no longer available"
 )

@@ -9,6 +9,9 @@ trench_backend/.env
 trench_backend/.env.docker
 trench_backend/.env.compose
 .pytest_cache/
+.coverage
+coverage.xml
+pytest-results.xml
 trench_backend/storage/
 
 # Node / Next.js

@@ -63,8 +63,7 @@ def _enforce_pdf_page_limit(content: bytes) -> None:
     if page_count > MAX_PDF_PAGES:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
-            f"This PDF has {page_count} pages -- the limit is "
-            f"{MAX_PDF_PAGES} pages.",
+            f"This PDF has {page_count} pages -- the limit is {MAX_PDF_PAGES} pages.",
         )
 
 

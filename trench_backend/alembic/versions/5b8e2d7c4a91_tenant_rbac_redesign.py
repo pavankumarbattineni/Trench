@@ -41,6 +41,7 @@ downgrade() restores the previous schema shape on a best-effort basis; it
 needs every user to still belong to a tenant (the old NOT NULL), so wipe
 first if any tenantless users exist.
 """
+
 from typing import Sequence, Union
 
 from alembic import op
@@ -59,8 +60,18 @@ def _base_columns() -> list[sa.Column]:
     return [
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
     ]
 
 
@@ -123,20 +134,34 @@ def upgrade() -> None:
     op.drop_table("organization_members")
 
     # --- organizations -> tenants ------------------------------------------
-    op.drop_constraint("fk_organizations_owner_user_id", "organizations", type_="foreignkey")
+    op.drop_constraint(
+        "fk_organizations_owner_user_id", "organizations", type_="foreignkey"
+    )
     op.drop_column("organizations", "owner_user_id")
     op.rename_table("organizations", "tenants")
-    op.execute("ALTER TABLE tenants RENAME CONSTRAINT organizations_pkey TO tenants_pkey")
-    op.execute("ALTER TABLE tenants RENAME CONSTRAINT organizations_name_key TO tenants_name_key")
-    op.execute("ALTER TABLE tenants RENAME CONSTRAINT uq_organizations_domain TO uq_tenants_domain")
+    op.execute(
+        "ALTER TABLE tenants RENAME CONSTRAINT organizations_pkey TO tenants_pkey"
+    )
+    op.execute(
+        "ALTER TABLE tenants RENAME CONSTRAINT organizations_name_key TO tenants_name_key"
+    )
+    op.execute(
+        "ALTER TABLE tenants RENAME CONSTRAINT uq_organizations_domain TO uq_tenants_domain"
+    )
 
     # --- organization_id -> tenant_id (users, documents, invitations) -----
-    op.alter_column("users", "organization_id", new_column_name="tenant_id", nullable=True)
+    op.alter_column(
+        "users", "organization_id", new_column_name="tenant_id", nullable=True
+    )
     op.execute("ALTER INDEX ix_users_organization_id RENAME TO ix_users_tenant_id")
-    op.execute("ALTER TABLE users RENAME CONSTRAINT fk_users_organization_id TO fk_users_tenant_id")
+    op.execute(
+        "ALTER TABLE users RENAME CONSTRAINT fk_users_organization_id TO fk_users_tenant_id"
+    )
 
     op.alter_column("documents", "organization_id", new_column_name="tenant_id")
-    op.execute("ALTER INDEX ix_documents_organization_id RENAME TO ix_documents_tenant_id")
+    op.execute(
+        "ALTER INDEX ix_documents_organization_id RENAME TO ix_documents_tenant_id"
+    )
     op.execute(
         "ALTER TABLE documents RENAME CONSTRAINT documents_organization_id_fkey "
         "TO documents_tenant_id_fkey"
@@ -147,7 +172,9 @@ def upgrade() -> None:
     )
 
     op.alter_column("invitations", "organization_id", new_column_name="tenant_id")
-    op.execute("ALTER INDEX ix_invitations_organization_id RENAME TO ix_invitations_tenant_id")
+    op.execute(
+        "ALTER INDEX ix_invitations_organization_id RENAME TO ix_invitations_tenant_id"
+    )
     op.execute(
         "ALTER TABLE invitations RENAME CONSTRAINT invitations_organization_id_fkey "
         "TO invitations_tenant_id_fkey"
@@ -157,11 +184,26 @@ def upgrade() -> None:
     op.create_table(
         "credentials",
         *_base_columns(),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=True),
-        sa.Column("tenant_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True),
+        sa.Column(
+            "user_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=True,
+        ),
+        sa.Column(
+            "tenant_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("tenants.id", ondelete="CASCADE"),
+            nullable=True,
+        ),
         sa.Column("provider_type", sa.String(length=32), nullable=False),
         sa.Column("encrypted_credential", sa.Text(), nullable=False),
-        sa.Column("set_by_user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
+        sa.Column(
+            "set_by_user_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
         sa.Column("validated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(
             "(user_id IS NULL) <> (tenant_id IS NULL)",
@@ -213,11 +255,18 @@ def downgrade() -> None:
     op.create_table(
         "user_credentials",
         *_base_columns(),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+        sa.Column(
+            "user_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
         sa.Column("provider_type", sa.String(length=32), nullable=False),
         sa.Column("encrypted_credential", sa.Text(), nullable=False),
         sa.Column("validated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.UniqueConstraint("user_id", "provider_type", name="uq_user_credentials_user_provider"),
+        sa.UniqueConstraint(
+            "user_id", "provider_type", name="uq_user_credentials_user_provider"
+        ),
     )
     op.create_index("ix_user_credentials_user_id", "user_credentials", ["user_id"])
     op.execute(
@@ -235,7 +284,9 @@ def downgrade() -> None:
         "ALTER TABLE invitations RENAME CONSTRAINT invitations_tenant_id_fkey "
         "TO invitations_organization_id_fkey"
     )
-    op.execute("ALTER INDEX ix_invitations_tenant_id RENAME TO ix_invitations_organization_id")
+    op.execute(
+        "ALTER INDEX ix_invitations_tenant_id RENAME TO ix_invitations_organization_id"
+    )
     op.alter_column("invitations", "tenant_id", new_column_name="organization_id")
 
     op.execute(
@@ -246,17 +297,29 @@ def downgrade() -> None:
         "ALTER TABLE documents RENAME CONSTRAINT documents_tenant_id_fkey "
         "TO documents_organization_id_fkey"
     )
-    op.execute("ALTER INDEX ix_documents_tenant_id RENAME TO ix_documents_organization_id")
+    op.execute(
+        "ALTER INDEX ix_documents_tenant_id RENAME TO ix_documents_organization_id"
+    )
     op.alter_column("documents", "tenant_id", new_column_name="organization_id")
 
-    op.execute("ALTER TABLE users RENAME CONSTRAINT fk_users_tenant_id TO fk_users_organization_id")
+    op.execute(
+        "ALTER TABLE users RENAME CONSTRAINT fk_users_tenant_id TO fk_users_organization_id"
+    )
     op.execute("ALTER INDEX ix_users_tenant_id RENAME TO ix_users_organization_id")
-    op.alter_column("users", "tenant_id", new_column_name="organization_id", nullable=False)
+    op.alter_column(
+        "users", "tenant_id", new_column_name="organization_id", nullable=False
+    )
 
     # --- tenants -> organizations (owner_user_id restored from role) ------
-    op.execute("ALTER TABLE tenants RENAME CONSTRAINT uq_tenants_domain TO uq_organizations_domain")
-    op.execute("ALTER TABLE tenants RENAME CONSTRAINT tenants_name_key TO organizations_name_key")
-    op.execute("ALTER TABLE tenants RENAME CONSTRAINT tenants_pkey TO organizations_pkey")
+    op.execute(
+        "ALTER TABLE tenants RENAME CONSTRAINT uq_tenants_domain TO uq_organizations_domain"
+    )
+    op.execute(
+        "ALTER TABLE tenants RENAME CONSTRAINT tenants_name_key TO organizations_name_key"
+    )
+    op.execute(
+        "ALTER TABLE tenants RENAME CONSTRAINT tenants_pkey TO organizations_pkey"
+    )
     op.rename_table("tenants", "organizations")
     op.add_column("organizations", sa.Column("owner_user_id", sa.UUID(), nullable=True))
     op.execute(
@@ -270,21 +333,40 @@ def downgrade() -> None:
     )
     op.alter_column("organizations", "owner_user_id", nullable=False)
     op.create_foreign_key(
-        "fk_organizations_owner_user_id", "organizations", "users", ["owner_user_id"], ["id"]
+        "fk_organizations_owner_user_id",
+        "organizations",
+        "users",
+        ["owner_user_id"],
+        ["id"],
     )
 
     op.create_table(
         "organization_credentials",
         *_base_columns(),
-        sa.Column("organization_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False),
+        sa.Column(
+            "organization_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("organizations.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
         sa.Column("provider_type", sa.String(length=32), nullable=False),
         sa.Column("encrypted_credential", sa.Text(), nullable=False),
-        sa.Column("set_by_user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column(
+            "set_by_user_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id"),
+            nullable=False,
+        ),
         sa.Column("validated_at", sa.DateTime(timezone=True), nullable=False),
     )
-    op.create_index("ix_organization_credentials_organization_id", "organization_credentials", ["organization_id"])
+    op.create_index(
+        "ix_organization_credentials_organization_id",
+        "organization_credentials",
+        ["organization_id"],
+    )
     op.create_unique_constraint(
-        "uq_organization_credentials_org_provider", "organization_credentials",
+        "uq_organization_credentials_org_provider",
+        "organization_credentials",
         ["organization_id", "provider_type"],
     )
     op.execute(
@@ -305,16 +387,34 @@ def downgrade() -> None:
     op.create_table(
         "organization_members",
         *_base_columns(),
-        sa.Column("organization_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("role", sa.String(length=16), nullable=False, server_default="member"),
+        sa.Column(
+            "organization_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("organizations.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "user_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "role", sa.String(length=16), nullable=False, server_default="member"
+        ),
         sa.UniqueConstraint("user_id", name="uq_organization_members_user"),
         sa.CheckConstraint(
             "role IN ('owner', 'admin', 'member')", name="ck_organization_members_role"
         ),
     )
-    op.create_index("ix_organization_members_organization_id", "organization_members", ["organization_id"])
-    op.create_index("ix_organization_members_user_id", "organization_members", ["user_id"])
+    op.create_index(
+        "ix_organization_members_organization_id",
+        "organization_members",
+        ["organization_id"],
+    )
+    op.create_index(
+        "ix_organization_members_user_id", "organization_members", ["user_id"]
+    )
     op.execute(
         """
         INSERT INTO organization_members (id, organization_id, user_id, role)
@@ -325,15 +425,34 @@ def downgrade() -> None:
     op.create_table(
         "knowledge_access",
         *_base_columns(),
-        sa.Column("organization_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("knowledge_type", sa.String(length=16), nullable=False, server_default="company"),
+        sa.Column(
+            "organization_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("organizations.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "user_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "knowledge_type",
+            sa.String(length=16),
+            nullable=False,
+            server_default="company",
+        ),
         sa.UniqueConstraint(
-            "organization_id", "user_id", "knowledge_type",
+            "organization_id",
+            "user_id",
+            "knowledge_type",
             name="uq_knowledge_access_org_user_type",
         ),
     )
-    op.create_index("ix_knowledge_access_organization_id", "knowledge_access", ["organization_id"])
+    op.create_index(
+        "ix_knowledge_access_organization_id", "knowledge_access", ["organization_id"]
+    )
     op.create_index("ix_knowledge_access_user_id", "knowledge_access", ["user_id"])
     op.execute(
         """
@@ -345,7 +464,12 @@ def downgrade() -> None:
 
     op.create_table(
         "usage_counters",
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+        sa.Column(
+            "user_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
         sa.Column("documents_uploaded_count", sa.Integer(), nullable=False),
     )
     op.execute(

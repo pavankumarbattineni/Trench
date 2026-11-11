@@ -132,9 +132,7 @@ async def test_credential_must_have_exactly_one_owner(owner_kind: str):
     async with async_session_factory() as session:
         tenant, user = await _tenant_and_user(session, f"xor-{owner_kind}")
         owner = (
-            {"user_id": user.id, "tenant_id": tenant.id}
-            if owner_kind == "both"
-            else {}
+            {"user_id": user.id, "tenant_id": tenant.id} if owner_kind == "both" else {}
         )
         session.add(_credential(**owner))
         with pytest.raises(IntegrityError):

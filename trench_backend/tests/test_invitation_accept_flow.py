@@ -26,9 +26,7 @@ async def cleanup():
         )
         await session.commit()
         await session.execute(
-            update(User)
-            .where(User.email.like(f"{PREFIX}%"))
-            .values(tenant_id=None)
+            update(User).where(User.email.like(f"{PREFIX}%")).values(tenant_id=None)
         )
         await session.commit()
         tenant_result = await session.execute(
@@ -89,7 +87,9 @@ async def test_accept_invitation_returns_a_token_pair(client: AsyncClient):
 
     with patch(
         "app.utils.firebase.verify_firebase_id_token",
-        return_value=_fake_claims(f"{PREFIX}-newhire@{PREFIX}-returns-pair.example.com"),
+        return_value=_fake_claims(
+            f"{PREFIX}-newhire@{PREFIX}-returns-pair.example.com"
+        ),
     ):
         response = await client.post(
             "/api/v1/auth/invitations/accept",

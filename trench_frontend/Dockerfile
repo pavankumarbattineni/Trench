@@ -47,6 +47,16 @@ ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0
 
+# Security hardening (the CI Trivy scan gates on fixable CRITICAL/HIGH CVEs):
+# apply Debian security updates, and remove npm/npx/corepack -- the server
+# runs with plain `node`, and npm bundles its own copies of packages
+# (undici, brace-expansion, ...) that would otherwise ship in the image.
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/* \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+
 # Standalone server + traced node_modules, plus the two folders it doesn't
 # include by itself (public assets and hashed JS/CSS chunks). Owned by the
 # non-root "node" user so Next can write its runtime cache (.next/cache).

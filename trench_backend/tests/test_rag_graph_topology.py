@@ -1,6 +1,6 @@
 """Asserts the compiled graph's actual shape -- catches drift between the
 code and the module docstring/README diagram (see rag_graph.py's own
-ASCII diagram and app/graph/README.md's Mermaid version), and specifically
+ASCII diagram and the root README.md's Mermaid version), and specifically
 guards against the input guardrail node/edges ever being reintroduced."""
 
 from app.graph.rag_graph import build_graph
