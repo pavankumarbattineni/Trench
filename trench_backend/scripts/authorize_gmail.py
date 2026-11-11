@@ -7,7 +7,7 @@ exchanges it for a long-lived refresh token, and writes the values
 TRENCH_CONFIG.GMAIL_API needs to a git-ignored file. Secrets are never
 printed.
 
-    uv run python scripts/authorize_gmail.py path/to/client_secret_XXXX.json
+    uv run python scripts/authorize_gmail.py path/to/client_secret.json you@gmail.com
 
 The JSON is the "Desktop app" OAuth client downloaded from Google Cloud
 Console > APIs & Services > Credentials (the project must have the Gmail API
@@ -35,8 +35,11 @@ OUTPUT = Path(__file__).resolve().parent.parent / ".env.gmail"
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        sys.exit("usage: authorize_gmail.py path/to/client_secret.json")
+    if len(sys.argv) != 3:
+        sys.exit(
+            "usage: authorize_gmail.py path/to/client_secret.json sender@gmail.com"
+        )
+    sender = sys.argv[2].strip()
     client = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     client = client.get("installed") or client.get("web") or client
     client_id, client_secret = client["client_id"], client["client_secret"]
@@ -83,7 +86,8 @@ def main() -> None:
         "code_challenge_method": "S256",
     }
     url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
-    print("Opening Google's consent page. If it doesn't open, visit:\n" + url)
+    print(f"Authorize as {sender}. Opening Google's consent page.")
+    print("If it doesn't open, visit:\n" + url)
     webbrowser.open(url)
     thread = threading.Thread(target=server.handle_request)
     thread.start()
@@ -109,17 +113,12 @@ def main() -> None:
     if response.status_code >= 400 or "refresh_token" not in body:
         sys.exit(f"Token exchange failed: {body.get('error', response.status_code)}")
 
-    email = (
-        input("Gmail address you just authorized (sender address): ").strip()
-        if sys.stdin.isatty()
-        else ""
-    )
     OUTPUT.write_text(
         "# Gmail API credentials for TRENCH_CONFIG.GMAIL_API (git-ignored).\n"
         f"GMAIL_CLIENT_ID={client_id}\n"
         f"GMAIL_CLIENT_SECRET={client_secret}\n"
         f"GMAIL_REFRESH_TOKEN={body['refresh_token']}\n"
-        f"GMAIL_FROM_ADDRESS={email}\n",
+        f"GMAIL_FROM_ADDRESS={sender}\n",
         encoding="utf-8",
     )
     print(f"Saved to {OUTPUT} (git-ignored). Scope: {body.get('scope')}")
