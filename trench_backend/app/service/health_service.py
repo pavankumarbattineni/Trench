@@ -1,5 +1,7 @@
 """Business logic for the health-check endpoint."""
 
+import os
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,3 +21,12 @@ class HealthService:
         """
         await db.execute(text("SELECT 1"))
         return "connected"
+
+    @staticmethod
+    def running_version() -> str:
+        """The git commit SHA this instance was deployed from.
+
+        Render injects RENDER_GIT_COMMIT into every deploy (Docker services
+        included); anywhere else -- local, Compose, tests -- it's "dev".
+        """
+        return os.environ.get("RENDER_GIT_COMMIT") or "dev"
