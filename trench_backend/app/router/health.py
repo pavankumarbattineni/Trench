@@ -18,7 +18,10 @@ async def health_check(db: AsyncSession = Depends(get_db)) -> HealthResponse:
         db: An active async SQLAlchemy session.
 
     Returns:
-        HealthResponse with status "ok" and the database connectivity state.
+        HealthResponse with status "ok", the database connectivity state and
+        the running version (git commit).
     """
     db_status = await HealthService.check_database(db)
-    return HealthResponse(status="ok", db=db_status)
+    return HealthResponse(
+        status="ok", db=db_status, version=HealthService.running_version()
+    )

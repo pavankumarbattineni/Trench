@@ -532,7 +532,7 @@ All endpoints except `/health` are under `/api/v1`. Interactive docs: `/docs` (S
 
 | Area | Endpoints |
 |---|---|
-| Health | `GET /health` (checks database connectivity) |
+| Health | `GET /health` (database connectivity + running `version`, the deployed commit) |
 | Auth | `POST /auth/signup/owner` · `POST /auth/login` · `POST /auth/logout` · `POST /auth/refresh` · `POST /auth/change-password` · `POST /auth/password-reset/request` · `POST /auth/password-reset/confirm` · `POST /auth/invitations/accept` · `DELETE /auth/account` |
 | Users | `GET /users/me` · `PATCH /users/me` |
 | Tenants | `GET /tenants/me` · `GET /tenants/{tenant_id}/members` · `PATCH /tenants/{tenant_id}/members/{user_id}` · `GET /tenants/{tenant_id}/invitations` |
@@ -607,6 +607,38 @@ GitHub Actions, each validated by CI.
 **Branch protection** on `development` requires these checks to pass before merging, so work happens on
 feature branches merged through pull requests.
 
+### Continuous deployment
+
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs after CI succeeds on a push (merge) to
+`development`:
+
+```mermaid
+flowchart LR
+    CI["CI green on<br/>development"] --> S["Migrate Neon<br/>staging (rehearsal)"]
+    S --> A{{"Approval<br/>(environment: production)"}}
+    A --> M[Migrate Neon<br/>production]
+    M --> R["Render deploy hook<br/>(exact commit)"]
+    R --> H["Wait for /health<br/>version = commit"]
+    H --> V[Vercel deploy hook]
+```
+
+- **Schema before code**: migrations run against production before the backend that needs them is deployed;
+  migrations are written to be additive (expand → contract) so the previous release keeps working.
+- **Exact versions**: Render deploys the commit CI tested (`&ref=<sha>`), and `/health` reports
+  `RENDER_GIT_COMMIT` as `version`, so the pipeline only continues once that commit is serving traffic.
+- **Frontend last**: `trench_frontend/vercel.json` turns off Vercel's automatic deploys for `development`;
+  the pipeline triggers the Vercel deploy hook after the backend is live. Other branches still get preview deployments.
+- **Secrets** live in GitHub environments: `staging` (`TRENCH_CONFIG` → Neon staging) and `production`
+  (`TRENCH_CONFIG`, `RENDER_DEPLOY_HOOK_URL`, `VERCEL_DEPLOY_HOOK_URL`, required reviewer).
+
+**Rollback**
+
+| What broke | How to roll back |
+|---|---|
+| Backend release | Render → Deploys → **Rollback**, or Actions → Deploy → **Run workflow** with an earlier commit SHA |
+| Frontend release | Vercel → Deployments → previous deployment → **Instant Rollback** |
+| Data / migration | Neon → branch → **Restore** to a point in time before the deploy |
+
 ## Docker images
 
 | Image | Base | Notes |
@@ -629,25 +661,26 @@ public `NEXT_PUBLIC_*` values are build arguments.
 
 ## Deployment
 
-Target platform (free tiers):
+Live: **https://trenchai.vercel.app** (API: https://trench-backend.onrender.com). All on free tiers:
 
-| Component | Platform | Notes |
+| Component | Platform | Configuration |
 |---|---|---|
-| Frontend | **Vercel** | Root directory `trench_frontend`; `NEXT_PUBLIC_*` per environment; preview deployments per PR |
-| Backend | **Render** (Docker web service) | Built from `trench_backend/Dockerfile`; health check `/health`; 512 MB RAM |
-| Database | **Neon** PostgreSQL | Separate production and staging branches; SSL required |
+| Frontend | **Vercel** | Root directory `trench_frontend`; `NEXT_PUBLIC_API_BASE_URL` = backend origin + Firebase web config (Production and Preview); production deploys via the CD pipeline, previews per branch/PR |
+| Backend | **Render** (Docker web service, Singapore) | Root directory `trench_backend`; health check `/health`; env `TRENCH_CONFIG` (`ENVIRONMENT: "PROD"`, Neon DB with `ssl: true`, `FRONTEND_BASE_URL` = Vercel URL) + optional LangSmith vars; auto-deploy off (deployed by the pipeline); 512 MB RAM, sleeps after 15 min idle |
+| Database | **Neon** PostgreSQL 18 (Singapore) | `production` and `staging` branches; **direct** (non-pooled) endpoint; SSL required |
 
-Remember to add each deployed frontend domain to **Firebase → Authentication → Authorized domains**.
+Production uses its own JWT and encryption secrets (never the development ones). Each deployed frontend domain
+must be listed in **Firebase → Authentication → Settings → Authorized domains**.
 
 Roadmap:
 
 - [x] Containerise backend and frontend
 - [x] Docker Compose for local development
 - [x] Continuous integration (tests, lint, builds, image scanning, Dependabot)
-- [ ] Neon database (production + staging)
-- [ ] Render backend deployment
-- [ ] Vercel frontend deployment
-- [ ] Continuous deployment with environments, approvals, migrations and rollback
+- [x] Neon database (production + staging)
+- [x] Render backend deployment
+- [x] Vercel frontend deployment
+- [x] Continuous deployment with environments, approvals, migrations and rollback
 - [ ] Observability (error tracking, uptime monitoring)
 
 ## Maintenance scripts
