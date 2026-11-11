@@ -150,6 +150,22 @@ class SMTPConfig(BaseModel):
     use_tls: bool = True
 
 
+class GmailApiConfig(BaseModel):
+    """Sends as a Gmail account through Google's Gmail API over HTTPS. Used
+    instead of SMTP when set: many hosts (Render's free tier included) block
+    outbound SMTP ports 25/465/587, while HTTPS (443) is always open.
+
+    The OAuth client (client_id/secret) belongs to a Google Cloud project
+    with the Gmail API enabled; `refresh_token` comes from authorizing that
+    client once, as `from_address`, with the gmail.send scope."""
+
+    client_id: str
+    client_secret: str
+    refresh_token: str
+    from_address: str
+    from_name: str = "Trench"
+
+
 class TrenchConfig(BaseModel):
     ENVIRONMENT: str = "DEV"
     # The frontend's own origin -- used to build links that must point at
@@ -175,6 +191,9 @@ class TrenchConfig(BaseModel):
     COHERE_RERANKER: CohereRerankerConfig
     GEMINI: GeminiConfig
     SMTP: SMTPConfig
+    # Optional: when present, email goes through the Gmail API over HTTPS
+    # instead of SMTP (see app/utils/email.py).
+    GMAIL_API: GmailApiConfig | None = None
 
 
 class Settings(BaseSettings):

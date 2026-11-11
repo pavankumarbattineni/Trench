@@ -9,6 +9,7 @@ decrypted back.
 """
 
 import hashlib
+import logging
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,8 @@ from app.config import get_settings
 from app.database.models import Invitation, Tenant, User
 from app.service.user_service import UserService
 from app.utils.email import send_email
+
+logger = logging.getLogger(__name__)
 
 INVITATION_EXPIRY = timedelta(days=7)
 
@@ -100,6 +103,9 @@ class InvitationService:
                 to=email, subject=subject, html_body=html_body, text_body=text_body
             )
         except Exception as exc:
+            # The client only sees a generic 502; keep the real cause (SMTP
+            # timeout, provider rejection, ...) in the server logs.
+            logger.exception("Invitation email delivery failed | to=%s", email)
             raise InvitationService.EmailDeliveryError(failure_message) from exc
 
     @staticmethod

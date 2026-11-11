@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Download, Eye, FileText, RotateCcw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -51,17 +51,31 @@ export default function DocumentsPage() {
     });
   };
 
+  // Synchronous in-flight lock. `upload.isPending` only disables the
+  // dropzone after the next render, so a double tap / repeated change event
+  // (common on mobile) could start two identical uploads at once.
+  const uploadInFlight = useRef(false);
+
   const handleUpload = (file: File) => {
+    if (uploadInFlight.current) return;
+    uploadInFlight.current = true;
     setUploadError(null);
     upload.mutate(file, {
-      onSuccess: () => {
-        toast.success(`"${file.name}" uploaded -- processing started.`);
+      onSuccess: (doc) => {
+        if (doc.duplicate) {
+          toast.info(`This file is already in your documents as "${doc.document_name}".`);
+          return;
+        }
+        toast.success(`"${doc.document_name}" uploaded -- processing started.`);
         // Keeps the free-tier count (used for the blur/limit UI below) in
         // sync -- the list refetch alone wouldn't update it, since it's
         // part of the user profile, not the documents response.
         void refreshUser();
       },
       onError: (err) => setUploadError(getErrorMessage(err)),
+      onSettled: () => {
+        uploadInFlight.current = false;
+      },
     });
   };
 

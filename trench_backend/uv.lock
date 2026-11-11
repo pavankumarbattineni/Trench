@@ -3603,6 +3603,7 @@ dependencies = [
     { name = "firebase-admin" },
     { name = "google-genai" },
     { name = "groq" },
+    { name = "httpx" },
     { name = "langchain-text-splitters" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-postgres" },
@@ -3623,7 +3624,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "langgraph-cli", extra = ["inmem"] },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -3645,6 +3645,7 @@ requires-dist = [
     { name = "firebase-admin", specifier = ">=7.5.0" },
     { name = "google-genai", specifier = ">=2.22.0" },
     { name = "groq", specifier = ">=0.13.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "langchain-text-splitters", specifier = ">=0.3.5" },
     { name = "langgraph", specifier = ">=0.2.60" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=2.0.13" },
@@ -3665,7 +3666,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.28.1" },
     { name = "langgraph-cli", extras = ["inmem"], specifier = ">=0.2.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },

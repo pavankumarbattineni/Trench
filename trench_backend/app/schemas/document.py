@@ -18,6 +18,10 @@ class DocumentResponse(BaseModel):
     chunk_count: int
     created_at: datetime
     processed_at: datetime | None
+    # Upload responses only: True when this exact file (same content) was
+    # already in the scope and the existing document was returned instead
+    # of a new one being created. Always False in listings.
+    duplicate: bool = False
 
 
 class DocumentListResponse(BaseModel):

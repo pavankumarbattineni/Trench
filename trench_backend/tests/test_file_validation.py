@@ -6,7 +6,9 @@ from pypdf import PdfWriter
 
 from app.utils.file_validation import (
     MAX_FILE_SIZE_BYTES,
+    MAX_FILENAME_LENGTH,
     MAX_PDF_PAGES,
+    sanitize_filename,
     validate_upload,
 )
 
@@ -87,3 +89,32 @@ def test_rejects_non_utf8_text_file():
     with pytest.raises(HTTPException) as exc_info:
         validate_upload("notes.txt", b"\xff\xfe\x00\x01invalid utf-8")
     assert exc_info.value.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("notes.txt", "notes.txt"),
+        ("C:\\fakepath\\report.pdf", "report.pdf"),
+        ("/storage/emulated/0/Download/report.pdf", "report.pdf"),
+        ("  spaced name.md  ", "spaced name.md"),
+        ("tab\tand\nnewline.txt", "tabandnewline.txt"),
+        ("", "untitled"),
+        (None, "untitled"),
+        ("..", "untitled"),
+        ("నోట్స్ 📱.txt", "నోట్స్ 📱.txt"),
+    ],
+)
+def test_sanitize_filename(raw, expected):
+    assert sanitize_filename(raw) == expected
+
+
+def test_sanitize_filename_shortens_long_names_keeping_the_extension():
+    name = sanitize_filename("x" * 400 + ".docx")
+    assert len(name) == MAX_FILENAME_LENGTH
+    assert name.endswith(".docx")
+
+
+def test_sanitize_filename_never_exceeds_the_limit_with_a_huge_extension():
+    name = sanitize_filename("report." + "y" * 400)
+    assert len(name) == MAX_FILENAME_LENGTH

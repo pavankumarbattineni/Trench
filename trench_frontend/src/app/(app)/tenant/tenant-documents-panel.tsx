@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Download, Eye, FileText, RotateCcw, ShieldAlert, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -67,11 +67,22 @@ export function TenantDocumentsPanel({
     });
   };
 
+  // Synchronous in-flight lock: see the personal Documents page.
+  const uploadInFlight = useRef(false);
+
   const handleUpload = (file: File) => {
+    if (uploadInFlight.current) return;
+    uploadInFlight.current = true;
     setUploadError(null);
     upload.mutate(file, {
-      onSuccess: () => toast.success(`"${file.name}" uploaded -- processing started.`),
+      onSuccess: (doc) =>
+        doc.duplicate
+          ? toast.info(`This file is already in company knowledge as "${doc.document_name}".`)
+          : toast.success(`"${doc.document_name}" uploaded -- processing started.`),
       onError: (err) => setUploadError(getErrorMessage(err)),
+      onSettled: () => {
+        uploadInFlight.current = false;
+      },
     });
   };
 

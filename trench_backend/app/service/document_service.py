@@ -15,6 +15,7 @@ import uuid
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -33,7 +34,11 @@ from app.service.vector_store_service import (
     get_vector_store,
     personal_namespace,
 )
-from app.utils.file_validation import document_type_for, validate_upload
+from app.utils.file_validation import (
+    document_type_for,
+    sanitize_filename,
+    validate_upload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +107,7 @@ class DocumentService:
                 already has a document pending/processing; 502 if the
                 storage backend rejects the write.
         """
+        filename = sanitize_filename(filename)
         mime_type = validate_upload(filename, content)
         content_hash = hashlib.sha256(content).hexdigest()
 
@@ -113,7 +119,7 @@ class DocumentService:
             content_hash=content_hash,
         )
         if existing_document is not None:
-            return existing_document
+            return cls._mark_duplicate(existing_document)
 
         await cls._enforce_no_concurrent_processing(db, user_id=user.id)
         if knowledge_type == "personal":
@@ -148,8 +154,40 @@ class DocumentService:
             knowledge_type=knowledge_type,
             knowledge_base="default" if knowledge_type == "company" else "own",
         )
+        # Plain values, captured before commit: a failed commit's rollback
+        # expires every loaded instance (`user` included), and touching an
+        # expired attribute would reload it -- autoflushing the rejected
+        # insert again.
+        user_id = user.id
         db.add(document)
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # Lost a race: an identical upload into the same scope (a double
+            # tap, or the same file sent twice at once) committed between our
+            # duplicate check above and this insert, so the unique
+            # (scope, content_hash) constraint rejected ours. That's a
+            # duplicate, not an error -- answer exactly as the check would
+            # have, and remove the bytes we stored for the losing copy.
+            await db.rollback()
+            if document in db:
+                db.expunge(document)
+            with db.no_autoflush:
+                existing_document = await cls._find_duplicate(
+                    db,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    knowledge_type=knowledge_type,
+                    content_hash=content_hash,
+                )
+            if existing_document is None:
+                raise
+            await cls._delete_stored_bytes_quietly(storage_path)
+            logger.info(
+                "Concurrent duplicate upload resolved | document_id=%s",
+                existing_document.id,
+            )
+            return cls._mark_duplicate(existing_document)
         await db.refresh(document)
         logger.info(
             "Document uploaded | document_id=%s name=%s knowledge_type=%s",
@@ -160,6 +198,23 @@ class DocumentService:
 
         asyncio.create_task(DocumentService._run_ingestion(document.id))
         return document
+
+    @staticmethod
+    def _mark_duplicate(document: Document) -> Document:
+        """Flags (on the instance only, never persisted) that an upload
+        resolved to this already-existing document, so the response can say
+        "already uploaded" instead of implying a new file is processing."""
+        document.duplicate = True
+        return document
+
+    @staticmethod
+    async def _delete_stored_bytes_quietly(storage_path: str) -> None:
+        try:
+            await get_storage_provider().delete(storage_path)
+        except Exception:
+            logger.warning(
+                "Could not delete orphaned upload bytes | path=%s", storage_path
+            )
 
     @staticmethod
     async def _run_ingestion(document_id: uuid.UUID) -> None:
