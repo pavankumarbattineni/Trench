@@ -11,6 +11,7 @@ import {
 
 import { CopyButton } from "@/components/chat/copy-button";
 import { MarkdownContent } from "@/components/chat/markdown-content";
+import { contentForCopy } from "@/lib/interactive";
 import { RelativeTime } from "@/components/relative-time";
 import { cn } from "cn";
 import type { ChatMessage } from "@/lib/threads";
@@ -151,7 +152,7 @@ export function MessageBubble({ message, onOpenCitations }: MessageBubbleProps) 
           {/* Query: time before the copy icon. Response: time after it. */}
           {isUser && <RelativeTime value={message.created_at} />}
           <CopyButton
-            text={message.content}
+            text={isUser ? message.content : contentForCopy(message.content)}
             label={isUser ? "Copy message" : "Copy response"}
           />
           {!isUser && <RelativeTime value={message.created_at} />}
