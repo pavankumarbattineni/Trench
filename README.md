@@ -70,10 +70,13 @@ flowchart LR
     C -->|weak results| D[Reformulate] --> C
     C -->|good enough| E["Generate<br/>(streamed)"]
     E --> F[Redact secrets] --> G[Build citations] --> H[Save]
+    H -.->|every 5 exchanges| I[Update chat summary]
 ```
 
 The model sees only the retrieved passages and the last 10 messages, and must cite every claim as
-`[n]`. Answers stream over Server-Sent Events, can be stopped, and continue after an interruption.
+`[n]`. Every 5 exchanges, older turns are folded into a short conversation summary that stands in
+for messages outside that window. Answers stream over Server-Sent Events, can be stopped, and
+continue after an interruption.
 
 ## Getting started
 

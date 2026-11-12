@@ -2,7 +2,7 @@
 
     START
       -> load_thread_state
-      -> validate_knowledge_access --(denied)--> access_denied --> persist --> END
+      -> validate_knowledge_access --(denied)--> access_denied --> persist --> ...
                                     --(scope has zero documents)--> generate
                                     --(authorized)--> condense_query
       -> hybrid_retrieve (Pinecone hybrid dense+sparse search, then
@@ -13,6 +13,7 @@
       -> check_output_guardrail
       -> build_citations
       -> persist
+      -> summarize_history (every SUMMARY_EVERY_TURNS exchanges; else a no-op)
       -> END
 
 There is no input guardrail -- removed; see GuardrailService's own
@@ -92,6 +93,54 @@ MAX_HISTORY_MESSAGES = 10
 CONDENSE_QUESTION_COUNT = 3
 CONDENSE_QUESTION_CHARS = 600
 CONDENSE_ANSWER_CHARS = 300
+
+# Conversation memory: after every SUMMARY_EVERY_TURNS question/answer
+# exchanges (the 5th, 10th, 15th...), summarize_history folds the turns
+# since the last summary into a rolling summary, which generate() sends
+# ahead of the history window once older messages have dropped out of it.
+# Each update sees only the previous summary plus the new turns -- capped
+# per message -- so its request stays ~3-4k tokens however long the chat.
+SUMMARY_EVERY_TURNS = 5
+SUMMARY_QUESTION_CHARS = 1000
+SUMMARY_ANSWER_CHARS = 1200
+
+_SUMMARY_SYSTEM_PROMPT = (
+    "You maintain the running memory of a conversation between a user and "
+    "Trench, an assistant that answers questions from the user's documents. "
+    "Your memory is the ONLY record the assistant keeps of these older "
+    "turns, so it must let the assistant continue the conversation as if it "
+    "remembered them -- without the noise."
+)
+
+_SUMMARY_INSTRUCTIONS = (
+    "Update the conversation memory with the new turns.\n\n"
+    "Previous memory:\n<memory>\n{previous}\n</memory>\n\n"
+    "New turns, oldest first:\n<turns>\n{turns}\n</turns>\n\n"
+    "Write the updated memory under these headings, leaving out any heading "
+    "that would be empty:\n"
+    "User profile & situation: facts the user stated about themselves, "
+    "their circumstances, preferences and constraints.\n"
+    "Goals & open questions: what the user is trying to achieve, and "
+    "anything asked but not yet resolved.\n"
+    "Key facts & results: conclusions, figures and results from the "
+    "answers, naming the source document when an answer relied on one.\n"
+    "Decisions: choices the user made, accepted or rejected.\n"
+    "Shown to the user: interactive views, tables, diagrams or plans "
+    "provided, by title and what they cover.\n\n"
+    "Rules:\n"
+    "- Keep every specific value exactly as stated -- numbers with units, "
+    "amounts, rates, dates, names, document titles. Never round, estimate "
+    "or invent.\n"
+    "- When a newer turn corrects or replaces something, keep only the "
+    "newest value.\n"
+    "- Keep everything still relevant from the previous memory; drop only "
+    "what was superseded.\n"
+    "- Leave out greetings, thanks, repetition, generic explanations, "
+    "formatting and citation markers like [1].\n"
+    '- Terse bullet points in the third person ("The user ..."), in the '
+    "language of the conversation.\n"
+    "- At most 250 words. Reply with the memory only, no preamble."
+)
 
 # The top chunk's Cohere rerank relevance score (see RerankerService.rerank
 # -- "score" on a retrieved chunk is that relevance score, not Pinecone's
@@ -760,6 +809,103 @@ def _shorten(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _completed_turns(messages: list) -> int:
+    """Question/answer exchanges so far (user messages in the history)."""
+    return sum(1 for m in messages if _role_and_content(m)[0] == "user")
+
+
+def _summary_turns_text(messages: list) -> str:
+    """The new turns as the summarizer sees them: interactive blocks reduced
+    to hints and each message capped, so 5 turns stay a few thousand
+    tokens even when the answers were long."""
+    lines = []
+    for message in messages:
+        role, content = _role_and_content(message)
+        if not content.strip():
+            continue
+        if role == "assistant":
+            text = _shorten(strip_interactive_blocks(content), SUMMARY_ANSWER_CHARS)
+            lines.append(f"Assistant: {text}")
+        else:
+            lines.append(f"User: {_shorten(content, SUMMARY_QUESTION_CHARS)}")
+    return "\n".join(lines)
+
+
+def _with_summary(history: list[dict[str, str]], summary: str) -> list[dict[str, str]]:
+    """Puts the conversation memory ahead of the history window. It's
+    merged into the first user message rather than added as its own
+    message, so roles still alternate for providers that require it."""
+    note = (
+        "Summary of the earlier conversation (older messages are not shown "
+        f"below):\n{summary}"
+    )
+    if history and history[0]["role"] == "user":
+        first = history[0]
+        return [
+            {"role": "user", "content": f"{note}\n\n---\n\n{first['content']}"},
+            *history[1:],
+        ]
+    return [{"role": "user", "content": note}, *history]
+
+
+async def summarize_history(state: AgentState, config: RunnableConfig) -> dict:
+    """Refreshes the rolling conversation summary after every
+    SUMMARY_EVERY_TURNS exchanges. Runs after persist, so the user already
+    has their answer; best-effort -- any failure leaves the previous
+    summary in place and never affects the turn.
+
+    "Due" means at least SUMMARY_EVERY_TURNS exchanges since the last
+    summary (normally exactly the 5th, 10th, 15th...), so a missed update
+    -- e.g. the next question arrived before this one finished -- is
+    simply made on the following turn."""
+    if state.get("access_denied"):
+        return {}
+    messages = state.get("messages", [])
+    covered = state.get("summary_message_count") or 0
+    if covered > len(messages):
+        covered = 0  # history shorter than recorded (shouldn't happen): rebuild
+    turns = _completed_turns(messages)
+    if turns < SUMMARY_EVERY_TURNS or (
+        turns - _completed_turns(messages[:covered]) < SUMMARY_EVERY_TURNS
+    ):
+        return {}
+
+    new_turns = _summary_turns_text(messages[covered:])
+    if not new_turns:
+        return {}
+    previous = (state.get("conversation_summary") or "").strip() or "(none yet)"
+    prompt = _SUMMARY_INSTRUCTIONS.format(previous=previous, turns=new_turns)
+    try:
+        resolved = await LLMClientService.resolve_platform_default(
+            _config_get(config, "db")
+        )
+        summary = ""
+        with usage_step("summary"):
+            async for delta in LLMClientService.stream_generate(
+                resolved,
+                system_prompt=_SUMMARY_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            ):
+                summary += delta
+    except Exception:
+        logger.warning(
+            "Conversation summary failed; keeping the previous one | thread_id=%s",
+            state.get("thread_id"),
+            exc_info=True,
+        )
+        return {}
+    summary = summary.removesuffix(TRUNCATION_NOTE).strip()
+    if not summary:
+        return {}
+    logger.info(
+        "Conversation summary updated | thread_id=%s turns=%d chars=%d",
+        state.get("thread_id"),
+        turns,
+        len(summary),
+    )
+    return {"conversation_summary": summary, "summary_message_count": len(messages)}
+
+
 def _condense_context(prior_messages: list) -> str:
     """The rewrite step's view of the conversation: the user's last few
     questions and the start of the last answer (interactive blocks reduced
@@ -852,9 +998,13 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     # growing this turn's token cost/latency without bound; the full
     # history is still what's persisted (see ChatHistory/Thread), only
     # what's sent to the model here is capped.
-    history = [
-        _to_provider_message(m) for m in state["messages"][:-1][-MAX_HISTORY_MESSAGES:]
-    ]
+    prior = state["messages"][:-1]
+    history = [_to_provider_message(m) for m in prior[-MAX_HISTORY_MESSAGES:]]
+    # Once older messages have dropped out of the window, the rolling
+    # summary (see summarize_history) stands in for them.
+    summary = (state.get("conversation_summary") or "").strip()
+    if summary and len(prior) > MAX_HISTORY_MESSAGES:
+        history = _with_summary(history, summary)
     conversation = [*history, {"role": "user", "content": current_message}]
 
     try:
@@ -1072,6 +1222,7 @@ def build_graph():
     graph.add_node("check_output_guardrail", check_output_guardrail)
     graph.add_node("build_citations", build_citations)
     graph.add_node("persist", persist)
+    graph.add_node("summarize_history", summarize_history)
 
     graph.add_edge(START, "load_thread_state")
     graph.add_edge("load_thread_state", "validate_knowledge_access")
@@ -1096,7 +1247,10 @@ def build_graph():
     graph.add_edge("generate", "check_output_guardrail")
     graph.add_edge("check_output_guardrail", "build_citations")
     graph.add_edge("build_citations", "persist")
-    graph.add_edge("persist", END)
+    # After persist: the user already has the answer, so refreshing the
+    # conversation memory never delays a reply.
+    graph.add_edge("persist", "summarize_history")
+    graph.add_edge("summarize_history", END)
     return graph
 
 
