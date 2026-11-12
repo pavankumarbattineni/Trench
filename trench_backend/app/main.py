@@ -14,6 +14,7 @@ from app.router.documents import router as documents_router
 from app.router.health import router as health_router
 from app.router.tenants import router as tenants_router
 from app.router.threads import router as threads_router
+from app.router.usage import router as usage_router
 from app.router.users import router as users_router
 from app.utils.logging import configure_logging
 from app.utils.tracing import configure_tracing
@@ -58,3 +59,4 @@ app.include_router(tenants_router, prefix=_API_V1_PREFIX)
 app.include_router(config_router, prefix=_API_V1_PREFIX)
 app.include_router(threads_router, prefix=_API_V1_PREFIX)
 app.include_router(chat_router, prefix=_API_V1_PREFIX)
+app.include_router(usage_router, prefix=_API_V1_PREFIX)

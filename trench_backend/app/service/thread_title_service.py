@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database.models import Thread
 from app.service.provider_catalog_service import ProviderCatalogService
+from app.utils import usage_tracking
 
 logger = logging.getLogger(__name__)
 
@@ -80,5 +81,19 @@ class ThreadTitleService:
             max_tokens=64,
             reasoning_effort="low",
         )
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            details = getattr(usage, "prompt_tokens_details", None)
+            usage_tracking.record(
+                usage_tracking.LLMCallUsage(
+                    step=usage_tracking.current_step(),
+                    provider_name="groq",
+                    model_name=default_model.model_name,
+                    key_owner="platform",
+                    input_tokens=usage.prompt_tokens or 0,
+                    cached_input_tokens=getattr(details, "cached_tokens", 0) or 0,
+                    output_tokens=usage.completion_tokens or 0,
+                )
+            )
         content = response.choices[0].message.content or ""
         return content.strip().strip('"').strip()[:_MAX_TITLE_LENGTH]

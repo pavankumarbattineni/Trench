@@ -58,6 +58,7 @@ from app.service.llm_client_service import TRUNCATION_NOTE, LLMClientService
 from app.service.reranker_service import RerankerService
 from app.service.retrieval_service import KnowledgeScope, RetrievalService
 from app.utils.stream_manager import stream_manager
+from app.utils.usage_tracking import usage_step
 
 logger = logging.getLogger(__name__)
 
@@ -439,12 +440,13 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
         f"{history_text}\n\nFollow-up: {state['query']}"
     )
     condensed = ""
-    async for delta in LLMClientService.stream_generate(
-        resolved,
-        system_prompt="You rewrite follow-up questions to be standalone.",
-        messages=[{"role": "user", "content": rewrite_prompt}],
-    ):
-        condensed += delta
+    with usage_step("condense"):
+        async for delta in LLMClientService.stream_generate(
+            resolved,
+            system_prompt="You rewrite follow-up questions to be standalone.",
+            messages=[{"role": "user", "content": rewrite_prompt}],
+        ):
+            condensed += delta
     # The truncation note is for answers shown to people, never a query.
     final_query = condensed.removesuffix(TRUNCATION_NOTE).strip() or state["query"]
     return {
@@ -578,12 +580,13 @@ async def reformulate_query(state: AgentState, config: RunnableConfig) -> dict:
         f"Original query: {state['original_condensed_query']}"
     )
     reformulated = ""
-    async for delta in LLMClientService.stream_generate(
-        resolved,
-        system_prompt="You rewrite search queries to improve retrieval.",
-        messages=[{"role": "user", "content": reformulate_prompt}],
-    ):
-        reformulated += delta
+    with usage_step("reformulate"):
+        async for delta in LLMClientService.stream_generate(
+            resolved,
+            system_prompt="You rewrite search queries to improve retrieval.",
+            messages=[{"role": "user", "content": reformulate_prompt}],
+        ):
+            reformulated += delta
     reformulated = reformulated.removesuffix(TRUNCATION_NOTE)
     return {
         "condensed_query": reformulated.strip() or state["original_condensed_query"]
@@ -703,13 +706,14 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
             "messages": [{"role": "assistant", "content": reason}],
         }
     full_text = ""
-    async for delta in LLMClientService.stream_generate(
-        resolved,
-        system_prompt=system_prompt,
-        messages=conversation,
-    ):
-        full_text += delta
-        stream_manager.append_chunk(stream_id, {"type": "token", "content": delta})
+    with usage_step("generate"):
+        async for delta in LLMClientService.stream_generate(
+            resolved,
+            system_prompt=system_prompt,
+            messages=conversation,
+        ):
+            full_text += delta
+            stream_manager.append_chunk(stream_id, {"type": "token", "content": delta})
 
     return {
         "response": full_text,
