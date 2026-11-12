@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { KeyRound, Palette, ShieldCheck, UserCog } from "lucide-react";
+import { ChartColumn, KeyRound, Palette, ShieldCheck, UserCog } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "cn";
@@ -11,6 +11,7 @@ const NAV_ITEMS = [
   { href: "/settings/appearance", label: "Appearance", icon: Palette },
   { href: "/settings/reset-password", label: "Reset Password", icon: ShieldCheck },
   { href: "/settings/providers", label: "Providers", icon: KeyRound },
+  { href: "/settings/usage", label: "Usage & cost", icon: ChartColumn },
   { href: "/settings/account", label: "Account", icon: UserCog },
 ] as const;
 
