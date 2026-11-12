@@ -260,7 +260,11 @@ _BASE_SYSTEM_PROMPT = (
     "slider. Always write a short "
     "explanation with [n] "
     "citations before the block, and keep [n] markers out of the JSON "
-    'except in "cite".'
+    'except in "cite".\n'
+    "9. If the user's latest message is only thanks, a greeting, a farewell "
+    "or a short reaction, reply briefly and naturally -- don't use the "
+    "passages, don't cite, and don't restart or continue earlier requests "
+    "unless the user asks."
 )
 # The system prompt above is identical on every turn (only the scope
 # sentence differs between personal and company), so providers can cache
@@ -454,9 +458,59 @@ async def validate_knowledge_access(state: AgentState, config: RunnableConfig) -
     }
 
 
+# Pure conversational messages ("thanks", "hi", "great, got it!") need no
+# document search: searching them returns unrelated passages, and the model
+# then tries to "answer" them -- e.g. treating "Thanks" as a request to
+# restart the previous task. Deliberately excludes "ok", "yes", "sure" and
+# the like: those usually *confirm* something the assistant offered
+# ("Shall I build it?" -> "yes") and must go through the normal flow.
+_SMALL_TALK_ANCHORS = frozenset(
+    {
+        "thanks", "thank", "thx", "ty", "tysm", "cheers", "appreciate",
+        "appreciated", "hi", "hello", "hey", "hiya", "bye", "goodbye",
+        "morning", "evening", "afternoon", "night", "great", "awesome",
+        "perfect", "nice", "cool", "excellent", "amazing", "wonderful",
+        "brilliant", "helpful", "noted", "understood", "wow",
+    }
+)  # fmt: skip
+_SMALL_TALK_FILLER = frozenset(
+    {
+        "you", "so", "much", "a", "lot", "very", "again", "for", "the",
+        "help", "that", "this", "was", "is", "it", "really", "good",
+        "got", "there", "all", "everyone", "trench", "see", "later", "ya",
+        "too", "just", "and", "have", "day", "oh", "super",
+    }
+)  # fmt: skip
+_MAX_SMALL_TALK_WORDS = 6
+
+_SMALL_TALK_SYSTEM_PROMPT = (
+    "You are Trench, a knowledge assistant that answers questions from the "
+    "user's documents. The user's latest message is conversational -- "
+    "thanks, a greeting, a farewell or a short reaction. Reply briefly and "
+    "naturally in one or two sentences, in the user's language. Don't "
+    "restart, continue or repeat earlier requests, don't add citations, and "
+    "don't state any facts. You may offer to help with anything else."
+)
+
+
+def is_small_talk(query: str) -> bool:
+    """True for a short message made only of thanks/greeting/praise words,
+    e.g. "Thanks!", "thank you so much", "hi there", "great, got it"."""
+    words = re.findall(r"[a-z]+", query.lower().replace("’", "'"))
+    if not words or len(words) > _MAX_SMALL_TALK_WORDS:
+        return False
+    if not any(w in _SMALL_TALK_ANCHORS for w in words):
+        return False
+    return all(w in _SMALL_TALK_ANCHORS or w in _SMALL_TALK_FILLER for w in words)
+
+
 def _route_after_access_check(state: AgentState) -> str:
     if state["access_denied"]:
         return "access_denied"
+    # Conversational messages skip the rewrite and search entirely --
+    # generate() answers them with the small-talk prompt.
+    if is_small_talk(state.get("query") or ""):
+        return "generate"
     # Nothing to retrieve -- skip straight to generate rather than running
     # condense/hybrid_retrieve/the sufficiency-retry loop against a scope
     # that structurally has zero documents (and zero Pinecone/Cohere calls
@@ -519,7 +573,8 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
     rewrite_prompt = (
         "Given the user's previous questions and the start of the last "
         "answer, rewrite the follow-up as a standalone question that names "
-        "what it refers to. If it is already standalone, return it "
+        "what it refers to. If it is already standalone -- or it is small "
+        "talk, thanks or feedback rather than a question -- return it "
         "unchanged. Reply with ONLY the rewritten question.\n\n"
         f"{conversation}\n\nFollow-up: {state['query']}"
     )
@@ -974,7 +1029,12 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     # that providers can cache. Only this request sees the wrapped form --
     # the stored history keeps the raw query.
     current_message = state["query"]
-    if state["knowledge_base_empty"]:
+    if is_small_talk(state["query"]):
+        # Routed here without a search (see _route_after_access_check).
+        prompt_case = "small_talk"
+        system_prompt = _SMALL_TALK_SYSTEM_PROMPT
+        context_chunks = []
+    elif state["knowledge_base_empty"]:
         prompt_case = "empty_kb"
         system_prompt = _EMPTY_KNOWLEDGE_BASE_SYSTEM_PROMPT.format(
             knowledge_scope_label=scope_label,
