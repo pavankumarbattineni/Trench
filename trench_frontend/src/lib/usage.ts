@@ -43,7 +43,7 @@ export interface UsageSummary {
 export type KeyOwner = "platform" | "personal" | "tenant";
 
 export interface UsageStep {
-  step: "generate" | "condense" | "reformulate" | "title" | string;
+  step: "generate" | "condense" | "reformulate" | "title" | "summary" | string;
   provider: string;
   model: string;
   key_owner: KeyOwner;
@@ -144,6 +144,7 @@ export const STEP_LABELS: Record<string, string> = {
   condense: "Follow-up rewrite",
   reformulate: "Search retry",
   title: "Chat title",
+  summary: "Chat summary",
 };
 
 export const KEY_OWNER_LABELS: Record<KeyOwner, string> = {

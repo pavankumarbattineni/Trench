@@ -38,4 +38,5 @@ def test_graph_has_exactly_the_expected_nodes():
         "check_output_guardrail",
         "build_citations",
         "persist",
+        "summarize_history",
     }

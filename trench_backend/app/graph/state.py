@@ -64,3 +64,9 @@ class AgentState(TypedDict):
     response: str
     citations: list[dict[str, Any]]
     messages: Annotated[list, add_messages]
+    # Rolling memory of the conversation, refreshed by summarize_history
+    # every SUMMARY_EVERY_TURNS exchanges, and how many leading `messages`
+    # it covers. Never part of a turn's input, so the checkpointer carries
+    # both forward from turn to turn (see app/graph/rag_graph.py).
+    conversation_summary: str
+    summary_message_count: int

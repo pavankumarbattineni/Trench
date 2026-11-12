@@ -2,7 +2,7 @@
 
     START
       -> load_thread_state
-      -> validate_knowledge_access --(denied)--> access_denied --> persist --> END
+      -> validate_knowledge_access --(denied)--> access_denied --> persist --> ...
                                     --(scope has zero documents)--> generate
                                     --(authorized)--> condense_query
       -> hybrid_retrieve (Pinecone hybrid dense+sparse search, then
@@ -13,6 +13,7 @@
       -> check_output_guardrail
       -> build_citations
       -> persist
+      -> summarize_history (every SUMMARY_EVERY_TURNS exchanges; else a no-op)
       -> END
 
 There is no input guardrail -- removed; see GuardrailService's own
@@ -78,11 +79,68 @@ MAX_RETRIEVAL_ATTEMPTS = 2
 RETRIEVAL_SKIP_RETRY_BELOW = 0.05
 
 # How many of the most recent prior messages (user+assistant turns,
-# excluding the current query) are sent as conversation history to both
-# condense_query and generate() -- an unbounded history would eventually
-# make every turn resend the whole conversation, growing token cost and
-# latency without bound as a thread gets long.
+# excluding the current query) are sent as conversation history to
+# generate() -- an unbounded history would eventually make every turn
+# resend the whole conversation, growing token cost and latency without
+# bound as a thread gets long.
 MAX_HISTORY_MESSAGES = 10
+
+# condense_query only needs the gist of the conversation to make a
+# follow-up searchable: the user's last few questions plus the start of
+# the last answer (for "the second one" / "that" references). Sending
+# whole answers made this request ~10k tokens -- over the platform Groq
+# model's 8k tokens-per-minute limit -- and failed every follow-up.
+CONDENSE_QUESTION_COUNT = 3
+CONDENSE_QUESTION_CHARS = 600
+CONDENSE_ANSWER_CHARS = 300
+
+# Conversation memory: after every SUMMARY_EVERY_TURNS question/answer
+# exchanges (the 5th, 10th, 15th...), summarize_history folds the turns
+# since the last summary into a rolling summary, which generate() sends
+# ahead of the history window once older messages have dropped out of it.
+# Each update sees only the previous summary plus the new turns -- capped
+# per message -- so its request stays ~3-4k tokens however long the chat.
+SUMMARY_EVERY_TURNS = 5
+SUMMARY_QUESTION_CHARS = 1000
+SUMMARY_ANSWER_CHARS = 1200
+
+_SUMMARY_SYSTEM_PROMPT = (
+    "You maintain the running memory of a conversation between a user and "
+    "Trench, an assistant that answers questions from the user's documents. "
+    "Your memory is the ONLY record the assistant keeps of these older "
+    "turns, so it must let the assistant continue the conversation as if it "
+    "remembered them -- without the noise."
+)
+
+_SUMMARY_INSTRUCTIONS = (
+    "Update the conversation memory with the new turns.\n\n"
+    "Previous memory:\n<memory>\n{previous}\n</memory>\n\n"
+    "New turns, oldest first:\n<turns>\n{turns}\n</turns>\n\n"
+    "Write the updated memory under these headings, leaving out any heading "
+    "that would be empty:\n"
+    "User profile & situation: facts the user stated about themselves, "
+    "their circumstances, preferences and constraints.\n"
+    "Goals & open questions: what the user is trying to achieve, and "
+    "anything asked but not yet resolved.\n"
+    "Key facts & results: conclusions, figures and results from the "
+    "answers, naming the source document when an answer relied on one.\n"
+    "Decisions: choices the user made, accepted or rejected.\n"
+    "Shown to the user: interactive views, tables, diagrams or plans "
+    "provided, by title and what they cover.\n\n"
+    "Rules:\n"
+    "- Keep every specific value exactly as stated -- numbers with units, "
+    "amounts, rates, dates, names, document titles. Never round, estimate "
+    "or invent.\n"
+    "- When a newer turn corrects or replaces something, keep only the "
+    "newest value.\n"
+    "- Keep everything still relevant from the previous memory; drop only "
+    "what was superseded.\n"
+    "- Leave out greetings, thanks, repetition, generic explanations, "
+    "formatting and citation markers like [1].\n"
+    '- Terse bullet points in the third person ("The user ..."), in the '
+    "language of the conversation.\n"
+    "- At most 250 words. Reply with the memory only, no preamble."
+)
 
 # The top chunk's Cohere rerank relevance score (see RerankerService.rerank
 # -- "score" on a retrieved chunk is that relevance score, not Pinecone's
@@ -441,10 +499,7 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
             "original_condensed_query": state["query"],
         }
 
-    history_text = "\n".join(
-        f"{getattr(m, 'type', 'user')}: {getattr(m, 'content', '')}"
-        for m in prior_messages[:-1][-MAX_HISTORY_MESSAGES:]
-    )
+    conversation = _condense_context(prior_messages[:-1])
     try:
         # The platform default Groq model/key, never the user's selected
         # model or BYOK credential -- condensing is a cheap, internal
@@ -462,19 +517,31 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
             "original_condensed_query": state["query"],
         }
     rewrite_prompt = (
-        "Given this conversation history and a follow-up question, rewrite "
-        "the follow-up as a standalone question. Reply with ONLY the "
-        "rewritten question.\n\nHistory:\n"
-        f"{history_text}\n\nFollow-up: {state['query']}"
+        "Given the user's previous questions and the start of the last "
+        "answer, rewrite the follow-up as a standalone question that names "
+        "what it refers to. If it is already standalone, return it "
+        "unchanged. Reply with ONLY the rewritten question.\n\n"
+        f"{conversation}\n\nFollow-up: {state['query']}"
     )
     condensed = ""
-    with usage_step("condense"):
-        async for delta in LLMClientService.stream_generate(
-            resolved,
-            system_prompt="You rewrite follow-up questions to be standalone.",
-            messages=[{"role": "user", "content": rewrite_prompt}],
-        ):
-            condensed += delta
+    try:
+        with usage_step("condense"):
+            async for delta in LLMClientService.stream_generate(
+                resolved,
+                system_prompt="You rewrite follow-up questions to be standalone.",
+                messages=[{"role": "user", "content": rewrite_prompt}],
+            ):
+                condensed += delta
+    except Exception:
+        # Rewriting only sharpens the search; a failure here (rate limit,
+        # outage) must never fail the turn -- search with the raw query and
+        # let the user's own model answer with the full history.
+        logger.warning(
+            "Condense failed; searching with the raw query | thread_id=%s",
+            state.get("thread_id"),
+            exc_info=True,
+        )
+        condensed = ""
     # The truncation note is for answers shown to people, never a query.
     final_query = condensed.removesuffix(TRUNCATION_NOTE).strip() or state["query"]
     return {
@@ -640,12 +707,244 @@ def _context_chunks(state: AgentState) -> list[dict]:
     ]
 
 
+def _role_and_content(message: object) -> tuple[str, str]:
+    """("user" | "assistant", text) for a LangChain message (as restored
+    from the checkpointer) or a plain {"role", "content"} dict."""
+    if isinstance(message, dict):
+        role = message.get("role", "user")
+        content = message.get("content", "")
+    else:
+        role = getattr(message, "type", "human")
+        content = getattr(message, "content", "")
+    if not isinstance(content, str):
+        content = str(content or "")
+    return ("assistant" if role in ("ai", "assistant") else "user"), content
+
+
+def _component_hint(component: object) -> str:
+    """One component as a short phrase, e.g. 'calculator "BMR" (inputs:
+    Weight, Height; results: BMR, TDEE)'."""
+    if not isinstance(component, dict):
+        return "component"
+
+    def labels(items: object, key: str = "label", limit: int = 5) -> str:
+        names = [
+            str(item.get(key))
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, dict) and item.get(key)
+        ]
+        more = "…" if len(names) > limit else ""
+        return ", ".join(names[:limit]) + more
+
+    kind = str(component.get("type") or "view").replace("_", " ")
+    title = component.get("title")
+    phrase = f'{kind} "{title}"' if title else kind
+    details: list[str] = []
+    if component.get("inputs") is not None:
+        details.append(f"inputs: {labels(component.get('inputs'))}")
+    if component.get("outputs") is not None:
+        details.append(f"results: {labels(component.get('outputs'))}")
+    if isinstance(component.get("series"), list):
+        details.append(f"series: {labels(component.get('series'), 'name')}")
+    if isinstance(component.get("columns"), list):
+        details.append(
+            "columns: " + ", ".join(str(c) for c in component["columns"][:5])
+        )
+    details = [d for d in details if not d.endswith(": ")]
+    return phrase + (f" ({'; '.join(details)})" if details else "")
+
+
+def _interactive_hint(block: str) -> str:
+    """The short note an interactive block is replaced with in history."""
+    try:
+        data = _load_lenient_json(block)
+    except ValueError:
+        return "[Interactive view shown to the user]"
+    components = data.get("components") if isinstance(data, dict) else data
+    if isinstance(data, dict) and components is None:
+        components = [data]
+    if not isinstance(components, list) or not components:
+        return "[Interactive view shown to the user]"
+    return (
+        "[Interactive view shown to the user: "
+        + "; ".join(_component_hint(c) for c in components[:6])
+        + "]"
+    )
+
+
+def strip_interactive_blocks(text: str) -> str:
+    """Replaces each interactive (```trench-ui, or interactive-shaped
+    ```json) block with a one-line hint of what it showed. The model still
+    knows e.g. a BMR calculator was given -- so "change my weight to 65"
+    works -- without resending thousands of tokens of JSON every turn."""
+
+    def replace(match: re.Match) -> str:
+        tag, block = match.group(1), match.group(2)
+        if tag == "json":
+            try:
+                data = _load_lenient_json(block)
+            except ValueError:
+                return match.group(0)
+            if not (
+                isinstance(data, dict) and isinstance(data.get("components"), list)
+            ):
+                return match.group(0)  # an ordinary JSON code block
+        return _interactive_hint(block)
+
+    return _HISTORY_BLOCK_RE.sub(replace, text)
+
+
 def _to_provider_message(message: object) -> dict[str, str]:
-    """Converts a LangChain BaseMessage (as restored from the checkpointer)
-    into the plain {"role", "content"} shape LLMClientService.stream_generate
-    expects, provider-agnostically."""
-    role = "assistant" if getattr(message, "type", "human") == "ai" else "user"
-    return {"role": role, "content": getattr(message, "content", "")}
+    """Converts a history message into the plain {"role", "content"} shape
+    LLMClientService.stream_generate expects, provider-agnostically, with
+    interactive blocks in past answers reduced to a short hint."""
+    role, content = _role_and_content(message)
+    if role == "assistant":
+        content = strip_interactive_blocks(content)
+    return {"role": role, "content": content}
+
+
+def _shorten(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _completed_turns(messages: list) -> int:
+    """Question/answer exchanges so far (user messages in the history)."""
+    return sum(1 for m in messages if _role_and_content(m)[0] == "user")
+
+
+def _summary_turns_text(messages: list) -> str:
+    """The new turns as the summarizer sees them: interactive blocks reduced
+    to hints and each message capped, so 5 turns stay a few thousand
+    tokens even when the answers were long."""
+    lines = []
+    for message in messages:
+        role, content = _role_and_content(message)
+        if not content.strip():
+            continue
+        if role == "assistant":
+            text = _shorten(strip_interactive_blocks(content), SUMMARY_ANSWER_CHARS)
+            lines.append(f"Assistant: {text}")
+        else:
+            lines.append(f"User: {_shorten(content, SUMMARY_QUESTION_CHARS)}")
+    return "\n".join(lines)
+
+
+def _history_window(state: AgentState, prior: list) -> list:
+    """The past messages generate() sends in full.
+
+    Without a summary: the last MAX_HISTORY_MESSAGES. With one: only what
+    the summary doesn't cover yet -- summarized exchanges aren't resent --
+    but always at least the most recent exchange, so right after a summary
+    update a follow-up like "the second one" still has the exact previous
+    answer. Capped at MAX_HISTORY_MESSAGES either way, so a failed summary
+    update can't make the request grow without bound."""
+    covered = state.get("summary_message_count") or 0
+    if not (state.get("conversation_summary") or "").strip() or covered <= 0:
+        return prior[-MAX_HISTORY_MESSAGES:]
+    start = min(covered, len(prior))
+    last_question = max(
+        (i for i, m in enumerate(prior) if _role_and_content(m)[0] == "user"),
+        default=start,
+    )
+    return prior[min(start, last_question) :][-MAX_HISTORY_MESSAGES:]
+
+
+def _with_summary(history: list[dict[str, str]], summary: str) -> list[dict[str, str]]:
+    """Puts the conversation memory ahead of the history window. It's
+    merged into the first user message rather than added as its own
+    message, so roles still alternate for providers that require it."""
+    note = (
+        "Summary of the earlier conversation (older messages are not shown "
+        f"below):\n{summary}"
+    )
+    if history and history[0]["role"] == "user":
+        first = history[0]
+        return [
+            {"role": "user", "content": f"{note}\n\n---\n\n{first['content']}"},
+            *history[1:],
+        ]
+    return [{"role": "user", "content": note}, *history]
+
+
+async def summarize_history(state: AgentState, config: RunnableConfig) -> dict:
+    """Refreshes the rolling conversation summary after every
+    SUMMARY_EVERY_TURNS exchanges. Runs after persist, so the user already
+    has their answer; best-effort -- any failure leaves the previous
+    summary in place and never affects the turn.
+
+    "Due" means at least SUMMARY_EVERY_TURNS exchanges since the last
+    summary (normally exactly the 5th, 10th, 15th...), so a missed update
+    -- e.g. the next question arrived before this one finished -- is
+    simply made on the following turn."""
+    if state.get("access_denied"):
+        return {}
+    messages = state.get("messages", [])
+    covered = state.get("summary_message_count") or 0
+    if covered > len(messages):
+        covered = 0  # history shorter than recorded (shouldn't happen): rebuild
+    turns = _completed_turns(messages)
+    if turns < SUMMARY_EVERY_TURNS or (
+        turns - _completed_turns(messages[:covered]) < SUMMARY_EVERY_TURNS
+    ):
+        return {}
+
+    new_turns = _summary_turns_text(messages[covered:])
+    if not new_turns:
+        return {}
+    previous = (state.get("conversation_summary") or "").strip() or "(none yet)"
+    prompt = _SUMMARY_INSTRUCTIONS.format(previous=previous, turns=new_turns)
+    try:
+        resolved = await LLMClientService.resolve_platform_default(
+            _config_get(config, "db")
+        )
+        summary = ""
+        with usage_step("summary"):
+            async for delta in LLMClientService.stream_generate(
+                resolved,
+                system_prompt=_SUMMARY_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            ):
+                summary += delta
+    except Exception:
+        logger.warning(
+            "Conversation summary failed; keeping the previous one | thread_id=%s",
+            state.get("thread_id"),
+            exc_info=True,
+        )
+        return {}
+    summary = summary.removesuffix(TRUNCATION_NOTE).strip()
+    if not summary:
+        return {}
+    logger.info(
+        "Conversation summary updated | thread_id=%s turns=%d chars=%d",
+        state.get("thread_id"),
+        turns,
+        len(summary),
+    )
+    return {"conversation_summary": summary, "summary_message_count": len(messages)}
+
+
+def _condense_context(prior_messages: list) -> str:
+    """The rewrite step's view of the conversation: the user's last few
+    questions and the start of the last answer (interactive blocks reduced
+    to hints) -- a few hundred tokens however long the thread is."""
+    pairs = [_role_and_content(m) for m in prior_messages]
+    questions = [c for role, c in pairs if role == "user" and c.strip()]
+    questions = questions[-CONDENSE_QUESTION_COUNT:]
+    last_answer = next(
+        (c for role, c in reversed(pairs) if role == "assistant" and c.strip()), ""
+    )
+    lines = ["Previous questions:"]
+    lines += [
+        f"{i}. {_shorten(q, CONDENSE_QUESTION_CHARS)}"
+        for i, q in enumerate(questions, start=1)
+    ]
+    if last_answer:
+        answer = _shorten(strip_interactive_blocks(last_answer), CONDENSE_ANSWER_CHARS)
+        lines.append(f"Last answer (start): {answer}")
+    return "\n".join(lines)
 
 
 async def generate(state: AgentState, config: RunnableConfig) -> dict:
@@ -719,9 +1018,11 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     # growing this turn's token cost/latency without bound; the full
     # history is still what's persisted (see ChatHistory/Thread), only
     # what's sent to the model here is capped.
-    history = [
-        _to_provider_message(m) for m in state["messages"][:-1][-MAX_HISTORY_MESSAGES:]
-    ]
+    prior = state["messages"][:-1]
+    history = [_to_provider_message(m) for m in _history_window(state, prior)]
+    summary = (state.get("conversation_summary") or "").strip()
+    if summary:
+        history = _with_summary(history, summary)
     conversation = [*history, {"role": "user", "content": current_message}]
 
     try:
@@ -821,6 +1122,11 @@ def _repair_json(source: str) -> str:
             out.append(ch)
         i += 1
     return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+# Like _INTERACTIVE_BLOCK_RE, but also matches a block left unclosed at the
+# end of an answer that was interrupted mid-stream.
+_HISTORY_BLOCK_RE = re.compile(r"```(trench-ui|json)[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
 
 
 def _load_lenient_json(source: str):
@@ -934,6 +1240,7 @@ def build_graph():
     graph.add_node("check_output_guardrail", check_output_guardrail)
     graph.add_node("build_citations", build_citations)
     graph.add_node("persist", persist)
+    graph.add_node("summarize_history", summarize_history)
 
     graph.add_edge(START, "load_thread_state")
     graph.add_edge("load_thread_state", "validate_knowledge_access")
@@ -958,7 +1265,10 @@ def build_graph():
     graph.add_edge("generate", "check_output_guardrail")
     graph.add_edge("check_output_guardrail", "build_citations")
     graph.add_edge("build_citations", "persist")
-    graph.add_edge("persist", END)
+    # After persist: the user already has the answer, so refreshing the
+    # conversation memory never delays a reply.
+    graph.add_edge("persist", "summarize_history")
+    graph.add_edge("summarize_history", END)
     return graph
 
 
