@@ -24,6 +24,7 @@ from app.config import get_settings
 from app.database.models import Provider, ProviderModel, User
 from app.service.credential_service import CredentialService
 from app.service.provider_catalog_service import ProviderCatalogService
+from app.utils import usage_tracking
 
 # Appended to an answer the model stopped because it hit its output limit,
 # so a cut-off answer is never presented as if it were complete.
@@ -36,6 +37,31 @@ TRUNCATION_NOTE = (
 # Sentinel the provider streams yield (never shown to users) when the model
 # stopped at its output limit; stream_generate turns it into TRUNCATION_NOTE.
 _TRUNCATED = "\x00__truncated__\x00"
+
+
+class _ProviderUsage:
+    """Yielded once, last, by a provider stream: the token usage the
+    provider reported. stream_generate consumes it (never passes it on)."""
+
+    def __init__(
+        self, *, input_tokens: int, cached_input_tokens: int, output_tokens: int
+    ) -> None:
+        self.input_tokens = input_tokens
+        self.cached_input_tokens = cached_input_tokens
+        self.output_tokens = output_tokens
+
+
+def _openai_style_usage(usage) -> _ProviderUsage:
+    """OpenAI/Groq chat-completions usage: prompt_tokens already includes
+    cached tokens (prompt_tokens_details.cached_tokens)."""
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", 0) or 0
+    return _ProviderUsage(
+        input_tokens=usage.prompt_tokens or 0,
+        cached_input_tokens=cached,
+        output_tokens=usage.completion_tokens or 0,
+    )
+
 
 # Groq output-limit sizing (see _groq_max_completion_tokens).
 _GROQ_MIN_OUTPUT_TOKENS = 1024
@@ -66,10 +92,20 @@ def _groq_max_completion_tokens(
 
 
 class ResolvedModel:
-    def __init__(self, *, provider_name: str, model_name: str, api_key: str) -> None:
+    def __init__(
+        self,
+        *,
+        provider_name: str,
+        model_name: str,
+        api_key: str,
+        key_owner: str = "platform",
+    ) -> None:
         self.provider_name = provider_name
         self.model_name = model_name
         self.api_key = api_key
+        # Whose key pays for calls: "platform" (Trench's own Groq key),
+        # "personal" (the user's BYOK key) or "tenant" (the shared key).
+        self.key_owner = key_owner
 
 
 class LLMClientService:
@@ -144,6 +180,7 @@ class LLMClientService:
                 provider_name=provider.name,
                 model_name=model.model_name,
                 api_key=personal_key,
+                key_owner="personal",
             )
 
         raise LLMClientService.MissingCredentialError(provider.display_name)
@@ -190,6 +227,7 @@ class LLMClientService:
                 provider_name=provider.name,
                 model_name=model.model_name,
                 api_key=tenant_key,
+                key_owner="tenant",
             )
 
         return LLMClientService._groq_resolved(default_model)
@@ -217,15 +255,60 @@ class LLMClientService:
             raise ValueError(f"Unsupported LLM provider: {resolved.provider_name!r}")
 
         truncated = False
-        async for delta in stream_fn(
-            resolved, system_prompt=system_prompt, messages=messages
-        ):
-            if delta == _TRUNCATED:
-                truncated = True
-                continue
-            yield delta
-        if truncated:
-            yield TRUNCATION_NOTE
+        usage: _ProviderUsage | None = None
+        output: list[str] = []
+        try:
+            async for delta in stream_fn(
+                resolved, system_prompt=system_prompt, messages=messages
+            ):
+                if isinstance(delta, _ProviderUsage):
+                    usage = delta
+                    continue
+                if delta == _TRUNCATED:
+                    truncated = True
+                    continue
+                output.append(delta)
+                yield delta
+            if truncated:
+                yield TRUNCATION_NOTE
+        finally:
+            # Runs on completion, error and cancellation alike (a stopped
+            # answer still used tokens). No-op unless a turn is collecting.
+            LLMClientService._record_usage(
+                resolved, usage, system_prompt, messages, "".join(output)
+            )
+
+    @staticmethod
+    def _record_usage(
+        resolved: ResolvedModel,
+        usage: _ProviderUsage | None,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        output_text: str,
+    ) -> None:
+        estimated = usage is None
+        if usage is None:
+            # The provider never reported usage (stream stopped early, or it
+            # doesn't report on interruption): estimate with the tokenizer.
+            encoding = _encoding()
+            usage = _ProviderUsage(
+                input_tokens=len(encoding.encode(system_prompt))
+                + sum(len(encoding.encode(m["content"])) + 4 for m in messages),
+                cached_input_tokens=0,
+                output_tokens=len(encoding.encode(output_text)),
+            )
+        usage_tracking.record(
+            usage_tracking.LLMCallUsage(
+                step=usage_tracking.current_step(),
+                provider_name=resolved.provider_name,
+                model_name=resolved.model_name,
+                key_owner=getattr(resolved, "key_owner", "platform"),
+                input_tokens=usage.input_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                output_tokens=usage.output_tokens,
+                estimated=estimated,
+            )
+        )
 
     @staticmethod
     async def _stream_groq(
@@ -241,6 +324,13 @@ class LLMClientService:
             stream=True,
         )
         async for chunk in stream:
+            # Groq always reports usage on the final chunk under x_groq
+            # (newer API versions also mirror it at the top level). The
+            # Groq SDK has no stream_options parameter, so none is sent.
+            x_groq = getattr(chunk, "x_groq", None)
+            usage = getattr(chunk, "usage", None) or getattr(x_groq, "usage", None)
+            if usage is not None:
+                yield _openai_style_usage(usage)
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -260,8 +350,12 @@ class LLMClientService:
             model=resolved.model_name,
             messages=[{"role": "system", "content": system_prompt}, *messages],
             stream=True,
+            stream_options={"include_usage": True},
         )
         async for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                # The final chunk carries usage (and no choices).
+                yield _openai_style_usage(chunk.usage)
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -288,6 +382,16 @@ class LLMClientService:
             final = await stream.get_final_message()
             if final.stop_reason == "max_tokens":
                 yield _TRUNCATED
+            if final.usage is not None:
+                cache_read = final.usage.cache_read_input_tokens or 0
+                cache_write = final.usage.cache_creation_input_tokens or 0
+                yield _ProviderUsage(
+                    # Anthropic reports cache reads/writes apart from
+                    # input_tokens; Trench's input count includes them.
+                    input_tokens=final.usage.input_tokens + cache_read + cache_write,
+                    cached_input_tokens=cache_read,
+                    output_tokens=final.usage.output_tokens,
+                )
 
     @staticmethod
     async def _stream_gemini(
@@ -302,7 +406,10 @@ class LLMClientService:
         stream = await client.aio.models.generate_content_stream(
             model=resolved.model_name, contents=prompt
         )
+        last_usage = None
         async for chunk in stream:
+            if getattr(chunk, "usage_metadata", None) is not None:
+                last_usage = chunk.usage_metadata
             if chunk.text:
                 yield chunk.text
             candidates = chunk.candidates or []
@@ -311,3 +418,12 @@ class LLMClientService:
                 and candidates[0].finish_reason == types.FinishReason.MAX_TOKENS
             ):
                 yield _TRUNCATED
+        if last_usage is not None:
+            # prompt_token_count already includes cached_content_token_count;
+            # thinking tokens are billed as output.
+            yield _ProviderUsage(
+                input_tokens=last_usage.prompt_token_count or 0,
+                cached_input_tokens=last_usage.cached_content_token_count or 0,
+                output_tokens=(last_usage.candidates_token_count or 0)
+                + (getattr(last_usage, "thoughts_token_count", 0) or 0),
+            )

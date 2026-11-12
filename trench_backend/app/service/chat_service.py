@@ -23,6 +23,8 @@ from app.database.session import async_session_factory
 from app.graph.rag_graph import build_graph
 from app.service.thread_service import ThreadService
 from app.service.thread_title_service import ThreadTitleService
+from app.service.usage_service import UsageService
+from app.utils import usage_tracking
 from app.utils.stream_manager import stream_manager
 
 logger = logging.getLogger(__name__)
@@ -151,18 +153,72 @@ class ChatService:
             # the title has no bearing on the chat turn itself, so it must
             # never block or fail it (see ThreadTitleService.generate).
             asyncio.create_task(
-                ChatService._run_title_generation(thread_id=thread.id, query=query)
+                ChatService._run_title_generation(
+                    thread_id=thread.id,
+                    query=query,
+                    user_id=user.id,
+                    assistant_message_id=assistant_message.id,
+                )
             )
 
         return assistant_message
 
     @staticmethod
-    async def _run_title_generation(*, thread_id: uuid.UUID, query: str) -> None:
-        async with async_session_factory() as db:
-            await ThreadTitleService.generate(db, thread_id=thread_id, query=query)
+    async def _run_title_generation(
+        *,
+        thread_id: uuid.UUID,
+        query: str,
+        user_id: uuid.UUID | None = None,
+        assistant_message_id: uuid.UUID | None = None,
+    ) -> None:
+        with (
+            usage_tracking.collect_usage() as llm_calls,
+            usage_tracking.usage_step("title"),
+        ):
+            async with async_session_factory() as db:
+                await ThreadTitleService.generate(db, thread_id=thread_id, query=query)
+        if user_id is not None:
+            await UsageService.record_calls(
+                user_id=user_id,
+                thread_id=thread_id,
+                assistant_message_id=assistant_message_id,
+                query=query,
+                calls=llm_calls,
+            )
 
     @staticmethod
     async def _run_generation(
+        *,
+        assistant_message_id: uuid.UUID,
+        thread_id: uuid.UUID,
+        user: User,
+        query: str,
+        knowledge_type: str,
+        stream_id: str,
+    ) -> None:
+        """Runs one chat turn and records the token usage of every LLM call
+        it made -- whether the turn completed, was stopped or failed (all of
+        them consumed tokens). Recording is best-effort and happens after
+        the turn, so it can never affect the answer."""
+        with usage_tracking.collect_usage() as llm_calls:
+            await ChatService._run_generation_turn(
+                assistant_message_id=assistant_message_id,
+                thread_id=thread_id,
+                user=user,
+                query=query,
+                knowledge_type=knowledge_type,
+                stream_id=stream_id,
+            )
+        await UsageService.record_calls(
+            user_id=user.id,
+            thread_id=thread_id,
+            assistant_message_id=assistant_message_id,
+            query=query,
+            calls=llm_calls,
+        )
+
+    @staticmethod
+    async def _run_generation_turn(
         *,
         assistant_message_id: uuid.UUID,
         thread_id: uuid.UUID,

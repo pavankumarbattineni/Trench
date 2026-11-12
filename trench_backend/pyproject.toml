@@ -32,6 +32,7 @@ dependencies = [
     "python-multipart>=0.0.32",
     "sqlalchemy[asyncio]>=2.0",
     "tiktoken>=0.8.0",
+    "tzdata>=2026.3",
     "uvicorn[standard]>=0.52.4",
 ]
 

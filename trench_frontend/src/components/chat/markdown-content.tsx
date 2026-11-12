@@ -4,8 +4,11 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
 
+import { CodeBlock, CopyableTable } from "@/components/chat/code-block";
+import { InteractiveBlock } from "@/components/chat/interactive-block";
 import { MermaidDiagram } from "@/components/chat/mermaid-diagram";
 import { CITATION_HREF_PREFIX, linkifyCitations } from "@/lib/citation-links";
+import { INTERACTIVE_LANGUAGE } from "@/lib/interactive";
 import { normalizeMathDelimiters } from "@/lib/math-delimiters";
 import { cn } from "cn";
 
@@ -29,27 +32,26 @@ interface HastLike {
   children?: HastLike[];
 }
 
-/** If a <pre>'s hast node wraps a ```mermaid code block, returns its raw
- * source; otherwise null. Handled at the <pre> level (not <code>) so the
- * diagram isn't nested inside a <pre> element. */
-function mermaidSource(node: unknown): string | null {
+/** If a <pre>'s hast node wraps a fenced code block, returns its language
+ * ("" when none) and raw source; otherwise null. Handled at the <pre>
+ * level (not <code>) so diagrams and interactive views aren't nested
+ * inside a <pre> element. */
+function fencedCode(node: unknown): { language: string; code: string } | null {
   const code = (node as HastLike | undefined)?.children?.[0];
-  const classes = code?.properties?.className;
-  if (
-    code?.tagName !== "code" ||
-    !Array.isArray(classes) ||
-    !classes.includes("language-mermaid")
-  ) {
-    return null;
-  }
+  if (code?.tagName !== "code") return null;
+  const classes = code.properties?.className;
+  const languageClass = Array.isArray(classes)
+    ? classes.find((c): c is string => typeof c === "string" && c.startsWith("language-"))
+    : undefined;
   const text = (n: HastLike): string =>
     n.type === "text" ? (n.value ?? "") : (n.children ?? []).map(text).join("");
-  return text(code);
+  return { language: languageClass?.slice("language-".length) ?? "", code: text(code) };
 }
 
 function buildComponents(
   onCitationClick?: (index: number) => void,
-  isStreaming = false
+  isStreaming = false,
+  citationNumbers?: ReadonlySet<number>
 ): Components {
   return {
     a: ({ href, children, ...props }) => {
@@ -106,17 +108,24 @@ function buildComponents(
       );
     },
     pre: ({ node, ...props }) => {
-      const mermaid = mermaidSource(node);
-      if (mermaid !== null) {
-        return <MermaidDiagram code={mermaid} isStreaming={isStreaming} />;
+      const block = fencedCode(node);
+      if (block?.language === "mermaid") {
+        return <MermaidDiagram code={block.code} isStreaming={isStreaming} />;
       }
+      if (block?.language === INTERACTIVE_LANGUAGE) {
+        return (
+          <InteractiveBlock
+            source={block.code}
+            isStreaming={isStreaming}
+            citationNumbers={citationNumbers}
+            onCitationClick={onCitationClick}
+          />
+        );
+      }
+      if (block) return <CodeBlock language={block.language} code={block.code} />;
       return <pre {...props} className="mb-3 last:mb-0" />;
     },
-    table: ({ ...props }) => (
-      <div className="mb-3 overflow-x-auto">
-        <table {...props} className="w-full border-collapse" />
-      </div>
-    ),
+    table: ({ children }) => <CopyableTable>{children}</CopyableTable>,
     th: ({ ...props }) => (
       <th {...props} className="border border-border px-2 py-1 text-left font-semibold" />
     ),
@@ -156,7 +165,7 @@ export function MarkdownContent({
       <ReactMarkdown
         remarkPlugins={REMARK_PLUGINS}
         rehypePlugins={REHYPE_PLUGINS}
-        components={buildComponents(onCitationClick, isStreaming)}
+        components={buildComponents(onCitationClick, isStreaming, citationNumbers)}
       >
         {processed}
       </ReactMarkdown>

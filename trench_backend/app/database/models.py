@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
@@ -8,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -422,4 +424,53 @@ class PasswordResetToken(BaseModel):
     )
     used_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+
+class LLMUsage(Base):
+    """One LLM call's token usage and cost -- one row per call, grouped into
+    a user question by `assistant_message_id` (the answer it belongs to).
+
+    Kept even if the thread or message is later deleted (foreign keys set
+    to NULL), so cost history stays accurate; `query_preview` keeps the
+    question readable after that.
+    """
+
+    __tablename__ = "llm_usage"
+    __table_args__ = (Index("ix_llm_usage_user_created", "user_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True
+    )
+    thread_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("threads.id", ondelete="SET NULL"), nullable=True
+    )
+    assistant_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chat_history.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    query_preview: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    # "generate" | "condense" | "reformulate" | "title"
+    step: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Whose key paid: "platform" | "personal" | "tenant"
+    key_owner: Mapped[str] = mapped_column(String(16), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cached_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # USD; NULL when the model isn't in LiteLLM's price map ("unpriced").
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 10), nullable=True)
+    # True when the provider reported no usage and counts were estimated.
+    estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )

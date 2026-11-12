@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { cn } from "cn";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 const FEEDBACK_MS = 2000;
@@ -11,7 +12,7 @@ const FEEDBACK_MS = 2000;
 /** Writes `text` to the clipboard. Falls back to a hidden textarea +
  * execCommand where the async Clipboard API is unavailable (e.g. the app
  * opened over a LAN IP, which isn't a secure context). */
-async function writeClipboard(text: string): Promise<boolean> {
+export async function writeClipboard(text: string): Promise<boolean> {
   try {
     if (navigator.clipboard && window.isSecureContext) {
       await navigator.clipboard.writeText(text);
@@ -37,12 +38,16 @@ async function writeClipboard(text: string): Promise<boolean> {
 }
 
 interface CopyButtonProps {
-  text: string;
+  /** The text to copy -- or `getText`, read lazily at click time (e.g. a
+   * table's cells from the DOM). One of the two is required. */
+  text?: string;
+  getText?: () => string;
   /** What's being copied, for the tooltip and screen readers, e.g. "Copy message". */
   label: string;
+  className?: string;
 }
 
-export function CopyButton({ text, label }: CopyButtonProps) {
+export function CopyButton({ text, getText, label, className }: CopyButtonProps) {
   const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
   const [hovered, setHovered] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -52,7 +57,7 @@ export function CopyButton({ text, label }: CopyButtonProps) {
   }, []);
 
   const handleCopy = async () => {
-    const ok = await writeClipboard(text);
+    const ok = await writeClipboard(getText ? getText() : (text ?? ""));
     setStatus(ok ? "copied" : "failed");
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => setStatus("idle"), FEEDBACK_MS);
@@ -66,7 +71,7 @@ export function CopyButton({ text, label }: CopyButtonProps) {
     // inside this box -- without it, its containing block is the page root,
     // so it lands at its far-down spot in the message list and stretches
     // the whole document (an empty scrollable area below the app).
-    <span className="relative inline-flex">
+    <span className={cn("relative inline-flex", className)}>
       {/* The tooltip stays open while "Copied!" shows, even if the pointer
           has already moved away -- the confirmation shouldn't be missable. */}
       <Tooltip open={hovered || status !== "idle"} onOpenChange={setHovered}>

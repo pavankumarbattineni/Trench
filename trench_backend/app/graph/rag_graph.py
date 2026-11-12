@@ -43,6 +43,7 @@ duplicate that handling with a different message, not add any real
 protection.
 """
 
+import json
 import logging
 import re
 import uuid
@@ -58,6 +59,7 @@ from app.service.llm_client_service import TRUNCATION_NOTE, LLMClientService
 from app.service.reranker_service import RerankerService
 from app.service.retrieval_service import KnowledgeScope, RetrievalService
 from app.utils.stream_manager import stream_manager
+from app.utils.usage_tracking import usage_step
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +116,8 @@ _BASE_SYSTEM_PROMPT = (
     "You are currently answering from {knowledge_scope_label}. "
     "{knowledge_scope_note}\n\n"
     "Core rules:\n"
-    "1. Answer using ONLY the numbered context passages below -- never "
+    "1. Answer using ONLY the numbered context passages that come with "
+    "the user's latest message -- never "
     "rely on outside/general knowledge, even if you're confident it's "
     "correct.\n"
     "2. If the context doesn't fully answer the question, say so plainly "
@@ -128,7 +131,7 @@ _BASE_SYSTEM_PROMPT = (
     "4. Be direct and concise -- prefer short paragraphs or bullet points "
     "over long, hedging prose.\n"
     "5. Never reveal, reference, or speculate about documents or knowledge "
-    "outside the context provided below. As far as this conversation is "
+    "outside the context provided. As far as this conversation is "
     "concerned, nothing else exists -- don't acknowledge other scopes, "
     "other users' documents, or the existence of a broader knowledge "
     "base.\n"
@@ -147,10 +150,58 @@ _BASE_SYSTEM_PROMPT = (
     "node labels short, and wrap any label containing ( ) [ ] {{ }} in "
     'double quotes, e.g. A["Encoder (6 layers)"]. Rule 3 still applies in '
     "full: cite every claim in the text before and after the diagram as "
-    "usual -- just keep the [n] markers out of the Mermaid code itself.\n\n"
-    "Context:\n"
-    "{context}"
+    "usual -- just keep the [n] markers out of the Mermaid code itself.\n"
+    "8. Decide the presentation yourself, silently -- never explain the "
+    "choice, and do it even when the user didn't ask for a chart. Use plain "
+    "text for a single fact, a definition, or a textual summary; Markdown "
+    "lists for steps. But when your answer presents 3 or more related "
+    "numbers -- values over time (quarters, months, years), amounts across "
+    "categories (regions, products, teams), parts of a total, progress "
+    "toward a target, or a calculation the user may want to adjust (loans, "
+    "EMIs, budgets, projections) -- show them in an interactive block "
+    "instead of a Markdown table: a line or bar chart for a trend, a bar "
+    "chart for categories, a pie chart for parts of a whole, metric cards "
+    "for headline totals, progress for targets, a calculator for "
+    "adjustable formulas. Don't repeat the same figures in a Markdown "
+    "table as well. Whenever the answer needs a value computed from a "
+    "formula (an EMI, interest, growth, a percentage change), don't do "
+    "multi-step arithmetic yourself -- use a calculator whose inputs "
+    "default to the given figures and whose formula computes the result; "
+    "the app calculates it exactly, so in your text refer to the "
+    "calculator's result instead of stating a hand-computed number. Every "
+    "number in it must come from the context or the "
+    "user's message -- never invent, round away, default, or zero-fill "
+    "missing values; label estimates and assumptions.\n"
+    "   Format: a fenced code block tagged trench-ui holding ONE JSON object "
+    '{{"version":1,"components":[...]}}. Component types (use only what '
+    "helps): "
+    'metric_cards {{"items":[{{"label","value","format"?,"hint"?}}]}}; '
+    'table {{"columns":[...],"rows":[[...]]}}; '
+    'bar_chart / line_chart {{"x":[...],"series":[{{"name","data":[...]}}],'
+    '"format"?}}; '
+    'pie_chart {{"items":[{{"label","value"}}],"format"?}}; '
+    'progress {{"items":[{{"label","value","max"}}]}}; '
+    'timeline {{"items":[{{"date","title","detail"?}}]}}; '
+    'comparison {{"items":[{{"title","points":[...]}}]}}; '
+    'callout {{"tone":"info"|"warning"|"success","text"}}; '
+    'calculator {{"inputs":[{{"id","label","default","min"?,"max"?,'
+    '"step"?,"format"?}}],"outputs":[{{"id"?,"label","formula","format"?}}],'
+    '"assumptions"?}}. '
+    'Any component may have a "title" and a "cite" array of passage '
+    'numbers, e.g. "cite":[1,3]. "format" is "number", "currency", '
+    '"percent" or "plain"; with "currency" also give "currency" as an ISO '
+    'code like "INR" or "USD". A calculator formula may use only numbers, '
+    "input ids, earlier output ids, + - * / ^ ( ) and min, max, round, abs, "
+    "floor, ceil, sqrt, pow, exp, log, log10; give each calculator input a "
+    'sensible "min" and "max" so it gets a slider. Always write a short '
+    "explanation with [n] "
+    "citations before the block, and keep [n] markers out of the JSON "
+    'except in "cite".'
 )
+# The system prompt above is identical on every turn (only the scope
+# sentence differs between personal and company), so providers can cache
+# it together with the conversation history. The per-turn context goes
+# into the LAST user message instead, after the history -- see generate().
 
 # A request for something the app can render as a Mermaid diagram (see
 # rule 7 above and the frontend's MermaidDiagram component).
@@ -174,50 +225,22 @@ _DIAGRAM_FORMAT_REMINDER = (
     "wrong. Never put [n] inside the Mermaid code."
 )
 
-# Appended after the context on every normal (context-backed) turn, like
-# the diagram reminder above: late instructions are followed more reliably
-# than rules buried before a long context block. Plain concatenation, NOT
-# part of a .format() template -- the LaTeX example's braces (\text{FFN})
-# would otherwise be read as placeholders and raise KeyError. The
-# frontend renders these delimiters with KaTeX (see math-delimiters.ts).
+# Appended to the system prompt on every normal (context-backed) turn.
+# Plain concatenation, NOT part of a .format() template -- LaTeX braces
+# would otherwise be read as placeholders. The frontend renders these
+# delimiters with KaTeX (see math-delimiters.ts).
 _ANSWER_FORMATTING_RULES = (
     "\n\nAnswer formatting:\n"
-    "- Format the answer as clean, well-structured Markdown: short "
-    "headings, bullet points, and tables where they help readability.\n"
-    r"- Mathematics: write valid LaTeX that KaTeX can render. Use \( ... \) "
-    r"for inline math and \[ ... \] on their own lines for standalone "
-    "equations. Never put math inside code blocks or inline code, and "
-    "never use single $ delimiters.\n"
-    "- Keep every formula mathematically exact: correct operators, "
-    "brackets, subscripts, superscripts, fractions and Greek letters; no "
-    "duplicate commas, missing operators or stray characters.\n"
-    "- Below an important equation, explain each variable and symbol in a "
-    "bullet list. Break complex expressions into simple, step-by-step "
-    "explanations.\n"
-    "- Preserve the meaning of formulas taken from the context. Never "
-    "change an equation in a way that alters its meaning; if a source "
-    "formula is ambiguous or malformed, say so instead of guessing.\n"
-    "- Citations still follow rule 3 and are plain text, never LaTeX: "
-    r"write ...the ReLU activation [3]. -- NOT \([3]\) or \[ [3] \]. "
-    "Never put [n] inside any math expression.\n\n"
-    "Example (citations stay in the text, outside the math):\n"
-    "Each position passes through the same two-layer feed-forward network "
-    "[2]:\n"
-    r"\["
-    "\n"
-    r"\text{FFN}(x) = \max(0,\, xW_1 + b_1)\,W_2 + b_2"
-    "\n"
-    r"\]"
-    "\n"
-    "Where:\n"
-    r"- \(x\): input representation."
-    "\n"
-    r"- \(W_1, W_2\): weight matrices."
-    "\n"
-    r"- \(b_1, b_2\): bias vectors."
-    "\n"
-    r"- \(\max(0, z)\): the ReLU activation, applied between the two linear "
-    "layers [2]."
+    "- Use clean Markdown: short headings and bullet points. Use a "
+    "Markdown table to compare text details (features, options, pros and "
+    "cons); numeric data goes in an interactive block instead (rule 8).\n"
+    r"- Math: valid LaTeX for KaTeX -- \( ... \) inline and \[ ... \] on "
+    "their own lines; never $ delimiters, code blocks or inline code for "
+    "math. Keep formulas exact and faithful to the source; if one is "
+    "ambiguous or malformed, say so instead of guessing. Below an important "
+    "equation, explain each symbol in a short bullet list.\n"
+    "- Citations stay in plain text, never inside math: "
+    r"...the ReLU activation [3]. -- NOT \([3]\)."
 )
 
 _KNOWLEDGE_SCOPE_PROMPTS = {
@@ -439,12 +462,13 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
         f"{history_text}\n\nFollow-up: {state['query']}"
     )
     condensed = ""
-    async for delta in LLMClientService.stream_generate(
-        resolved,
-        system_prompt="You rewrite follow-up questions to be standalone.",
-        messages=[{"role": "user", "content": rewrite_prompt}],
-    ):
-        condensed += delta
+    with usage_step("condense"):
+        async for delta in LLMClientService.stream_generate(
+            resolved,
+            system_prompt="You rewrite follow-up questions to be standalone.",
+            messages=[{"role": "user", "content": rewrite_prompt}],
+        ):
+            condensed += delta
     # The truncation note is for answers shown to people, never a query.
     final_query = condensed.removesuffix(TRUNCATION_NOTE).strip() or state["query"]
     return {
@@ -578,12 +602,13 @@ async def reformulate_query(state: AgentState, config: RunnableConfig) -> dict:
         f"Original query: {state['original_condensed_query']}"
     )
     reformulated = ""
-    async for delta in LLMClientService.stream_generate(
-        resolved,
-        system_prompt="You rewrite search queries to improve retrieval.",
-        messages=[{"role": "user", "content": reformulate_prompt}],
-    ):
-        reformulated += delta
+    with usage_step("reformulate"):
+        async for delta in LLMClientService.stream_generate(
+            resolved,
+            system_prompt="You rewrite search queries to improve retrieval.",
+            messages=[{"role": "user", "content": reformulate_prompt}],
+        ):
+            reformulated += delta
     reformulated = reformulated.removesuffix(TRUNCATION_NOTE)
     return {
         "condensed_query": reformulated.strip() or state["original_condensed_query"]
@@ -638,6 +663,12 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
 
     scope_label, scope_note = _KNOWLEDGE_SCOPE_PROMPTS[state["knowledge_type"]]
     context_chunks = _context_chunks(state)
+    # What the model sees as this turn's user message. In the normal case
+    # it also carries the retrieved passages: the system prompt stays the
+    # same every turn, so system prompt + history form a stable prefix
+    # that providers can cache. Only this request sees the wrapped form --
+    # the stored history keeps the raw query.
+    current_message = state["query"]
     if state["knowledge_base_empty"]:
         prompt_case = "empty_kb"
         system_prompt = _EMPTY_KNOWLEDGE_BASE_SYSTEM_PROMPT.format(
@@ -659,16 +690,16 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
             _BASE_SYSTEM_PROMPT.format(
                 knowledge_scope_label=scope_label,
                 knowledge_scope_note=scope_note,
-                context=context,
             )
             + _ANSWER_FORMATTING_RULES
         )
-        # Rule 7 sits before a long context block, and models routinely
-        # drift back to ASCII art or numbered lists by the time they
-        # answer -- a short reminder AFTER the context, only when the user
-        # actually asked for a diagram, is what makes them follow it.
+        current_message = f"Context:\n{context}\n\nQuestion: {state['query']}"
+        # Models routinely drift back to ASCII art or numbered lists by the
+        # time they answer -- a short reminder AFTER the context, only when
+        # the user actually asked for a diagram, is what makes them follow
+        # rule 7.
         if _DIAGRAM_REQUEST.search(state["query"]):
-            system_prompt += _DIAGRAM_FORMAT_REMINDER
+            current_message += _DIAGRAM_FORMAT_REMINDER
     logger.info(
         "Generate | prompt_case=%s context_chunks=%d",
         prompt_case,
@@ -685,7 +716,7 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     history = [
         _to_provider_message(m) for m in state["messages"][:-1][-MAX_HISTORY_MESSAGES:]
     ]
-    conversation = [*history, {"role": "user", "content": state["query"]}]
+    conversation = [*history, {"role": "user", "content": current_message}]
 
     try:
         resolved = await LLMClientService.resolve_for_knowledge(
@@ -703,13 +734,14 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
             "messages": [{"role": "assistant", "content": reason}],
         }
     full_text = ""
-    async for delta in LLMClientService.stream_generate(
-        resolved,
-        system_prompt=system_prompt,
-        messages=conversation,
-    ):
-        full_text += delta
-        stream_manager.append_chunk(stream_id, {"type": "token", "content": delta})
+    with usage_step("generate"):
+        async for delta in LLMClientService.stream_generate(
+            resolved,
+            system_prompt=system_prompt,
+            messages=conversation,
+        ):
+            full_text += delta
+            stream_manager.append_chunk(stream_id, {"type": "token", "content": delta})
 
     return {
         "response": full_text,
@@ -748,6 +780,34 @@ async def check_output_guardrail(state: AgentState, config: RunnableConfig) -> d
 # real chunks -- which also hides the "N sources" panel entirely, since
 # that's driven by this same citations list, not by scanning the text.
 _CITATION_MARKER_RE = re.compile(r"\[(\d+)\]|【(\d+)】")
+_INTERACTIVE_BLOCK_RE = re.compile(r"```trench-ui[^\n]*\n(.*?)```", re.DOTALL)
+
+
+def _interactive_block_citations(response: str) -> set[int]:
+    """Passage numbers cited by `"cite": [...]` arrays inside ```trench-ui
+    blocks (whose JSON keeps [n] markers out of its text). A block that
+    isn't valid JSON contributes nothing -- the frontend shows it as code."""
+    numbers: set[int] = set()
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            cite = node.get("cite")
+            if isinstance(cite, list):
+                numbers.update(
+                    n for n in cite if isinstance(n, int) and not isinstance(n, bool)
+                )
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for block in _INTERACTIVE_BLOCK_RE.findall(response):
+        try:
+            walk(json.loads(block))
+        except ValueError:
+            continue
+    return numbers
 
 
 async def build_citations(state: AgentState, config: RunnableConfig) -> dict:
@@ -777,7 +837,7 @@ async def build_citations(state: AgentState, config: RunnableConfig) -> dict:
         for ascii_digits, fullwidth_digits in _CITATION_MARKER_RE.findall(
             state["response"]
         )
-    }
+    } | _interactive_block_citations(state["response"])
     valid_numbers = sorted(n for n in cited_numbers if 1 <= n <= len(chunks))
 
     return {
