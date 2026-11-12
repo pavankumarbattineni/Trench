@@ -831,6 +831,26 @@ def _summary_turns_text(messages: list) -> str:
     return "\n".join(lines)
 
 
+def _history_window(state: AgentState, prior: list) -> list:
+    """The past messages generate() sends in full.
+
+    Without a summary: the last MAX_HISTORY_MESSAGES. With one: only what
+    the summary doesn't cover yet -- summarized exchanges aren't resent --
+    but always at least the most recent exchange, so right after a summary
+    update a follow-up like "the second one" still has the exact previous
+    answer. Capped at MAX_HISTORY_MESSAGES either way, so a failed summary
+    update can't make the request grow without bound."""
+    covered = state.get("summary_message_count") or 0
+    if not (state.get("conversation_summary") or "").strip() or covered <= 0:
+        return prior[-MAX_HISTORY_MESSAGES:]
+    start = min(covered, len(prior))
+    last_question = max(
+        (i for i, m in enumerate(prior) if _role_and_content(m)[0] == "user"),
+        default=start,
+    )
+    return prior[min(start, last_question) :][-MAX_HISTORY_MESSAGES:]
+
+
 def _with_summary(history: list[dict[str, str]], summary: str) -> list[dict[str, str]]:
     """Puts the conversation memory ahead of the history window. It's
     merged into the first user message rather than added as its own
@@ -999,11 +1019,9 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     # history is still what's persisted (see ChatHistory/Thread), only
     # what's sent to the model here is capped.
     prior = state["messages"][:-1]
-    history = [_to_provider_message(m) for m in prior[-MAX_HISTORY_MESSAGES:]]
-    # Once older messages have dropped out of the window, the rolling
-    # summary (see summarize_history) stands in for them.
+    history = [_to_provider_message(m) for m in _history_window(state, prior)]
     summary = (state.get("conversation_summary") or "").strip()
-    if summary and len(prior) > MAX_HISTORY_MESSAGES:
+    if summary:
         history = _with_summary(history, summary)
     conversation = [*history, {"role": "user", "content": current_message}]
 

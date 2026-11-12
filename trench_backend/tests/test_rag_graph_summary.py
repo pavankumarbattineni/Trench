@@ -171,10 +171,10 @@ def test_summarize_history_runs_after_persist():
     assert ("persist", "summarize_history") in edges
 
 
-# --- generate() --------------------------------------------------------------
+# --- generate(): summary + only the exchanges it doesn't cover ----------------
 
 
-async def _generate_messages(prior: list, summary: str = "- The user weighs 60 kg."):
+async def _sent(prior: list, *, covered: int, summary: str = "- MEMORY") -> list:
     captured = {}
 
     async def _capturing(_resolved, *, system_prompt, messages):
@@ -185,13 +185,14 @@ async def _generate_messages(prior: list, summary: str = "- The user weighs 60 k
         "user_id": "u1",
         "thread_id": "t1",
         "stream_id": "s1",
-        "query": "and now?",
+        "query": "next?",
         "knowledge_type": "personal",
         "tenant_id": None,
         "knowledge_base_empty": False,
         "best_retrieved_chunks": [],
-        "messages": [*prior, HumanMessage(content="and now?")],
+        "messages": [*prior, HumanMessage(content="next?")],
         "conversation_summary": summary,
+        "summary_message_count": covered,
     }
     with (
         patch(
@@ -201,33 +202,66 @@ async def _generate_messages(prior: list, summary: str = "- The user weighs 60 k
         patch("app.graph.rag_graph.LLMClientService.stream_generate", _capturing),
     ):
         await generate(state, _config())
-    return captured["messages"]
+    return captured["messages"][:-1]  # history only, without the current question
+
+
+def _contents(history: list) -> str:
+    return "\n".join(m["content"] for m in history)
 
 
 @pytest.mark.asyncio
-async def test_generate_skips_the_summary_while_the_whole_chat_fits_the_window():
-    sent = await _generate_messages(_turns(MAX_HISTORY_MESSAGES // 2))
-    assert not any("Summary of the earlier conversation" in m["content"] for m in sent)
+async def test_without_a_summary_the_last_ten_messages_are_sent():
+    history = await _sent(_turns(7), covered=0, summary="")
+    assert len(history) == MAX_HISTORY_MESSAGES
+    assert "Summary of the earlier conversation" not in _contents(history)
+    assert history[0]["content"] == "question-3"
 
 
 @pytest.mark.asyncio
-async def test_generate_puts_the_summary_ahead_of_the_window_once_messages_drop():
-    sent = await _generate_messages(_turns(MAX_HISTORY_MESSAGES // 2 + 3))
-    first = sent[0]
-    assert first["role"] == "user"
-    assert first["content"].startswith("Summary of the earlier conversation")
-    assert "- The user weighs 60 kg." in first["content"]
-    # Merged into the first windowed question, so roles still alternate.
-    assert first["content"].endswith("question-4")
-    roles = [m["role"] for m in sent]
+async def test_sixth_question_gets_the_summary_plus_only_the_fifth_exchange():
+    """Exchanges 1-5 are summarized; only the latest one is resent in full,
+    so "the second one" style follow-ups still have the exact last answer."""
+    history = await _sent(_turns(5), covered=10)
+    text = _contents(history)
+    assert history[0]["content"].startswith("Summary of the earlier conversation")
+    assert "- MEMORY" in text
+    assert "question-5" in text and "answer-5" in text
+    assert "question-4" not in text and "answer-1" not in text
+    assert [m["role"] for m in history] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_seventh_question_gets_the_summary_plus_the_sixth_exchange():
+    history = await _sent(_turns(6), covered=10)
+    text = _contents(history)
+    assert "question-6" in text and "answer-6" in text
+    assert "question-5" not in text and "answer-5" not in text
+
+
+@pytest.mark.asyncio
+async def test_tenth_question_gets_the_summary_plus_exchanges_six_to_nine():
+    history = await _sent(_turns(9), covered=10)
+    text = _contents(history)
+    assert all(f"question-{i}" in text for i in range(6, 10))
+    assert "question-5" not in text
+    assert len(history) == 8
+    roles = [m["role"] for m in history]
     assert all(a != b for a, b in zip(roles, roles[1:], strict=False))
-    assert len(sent) == MAX_HISTORY_MESSAGES + 1
 
 
 @pytest.mark.asyncio
-async def test_summary_becomes_its_own_message_when_the_window_starts_with_an_answer():
-    prior = [AIMessage(content="answer-0"), *_turns(MAX_HISTORY_MESSAGES // 2)]
-    sent = await _generate_messages([HumanMessage(content="question-0"), *prior])
-    assert sent[0]["role"] == "user"
-    assert sent[0]["content"].startswith("Summary of the earlier conversation")
-    assert sent[1]["role"] == "assistant"
+async def test_eleventh_question_after_the_update_gets_only_the_tenth_exchange():
+    history = await _sent(_turns(10), covered=20)
+    text = _contents(history)
+    assert "question-10" in text and "answer-10" in text
+    assert "question-9" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_stale_summary_still_caps_the_history_at_ten_messages():
+    """If summary updates keep failing, the uncovered messages are still
+    capped, so the request can't grow without bound."""
+    history = await _sent(_turns(12), covered=10)
+    assert len(history) == MAX_HISTORY_MESSAGES
+    assert history[0]["content"].startswith("Summary of the earlier conversation")
+    assert "question-12" in _contents(history)
