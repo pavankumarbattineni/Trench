@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useConfig } from "@/hooks/use-config";
+import { useKnowledgeType } from "@/hooks/use-knowledge-type";
 import { useUpdateModel } from "@/hooks/use-update-model";
 import { MAX_QUERY_LENGTH, type KnowledgeType } from "@/lib/chat";
 import { CHAT_COLUMN } from "@/lib/chat-layout";
@@ -42,7 +43,8 @@ export function ChatComposer({
   const isBusy = isSending || isStreaming;
   const { user } = useAuth();
   const [query, setQuery] = useState("");
-  const [knowledgeType, setKnowledgeType] = useState<KnowledgeType>("personal");
+  // Remembered across screens -- see useKnowledgeType.
+  const [knowledgeType, setKnowledgeType] = useKnowledgeType();
   const { data: config } = useConfig(knowledgeType);
   const updateModel = useUpdateModel();
 
