@@ -204,3 +204,27 @@ def test_normal_answer_prompt_describes_interactive_blocks():
     # The existing rules are untouched.
     assert "Cite every factual claim" in prompt
     assert "```mermaid" in prompt
+
+
+@pytest.mark.asyncio
+async def test_cites_survive_smaller_models_json_slips():
+    """Trailing commas, // comments and a ```json tag (instead of
+    trench-ui) are repaired, matching what the frontend renders."""
+    response = (
+        "Overview [1].\n"
+        "```json\n"
+        '{"version": 1, "components": [ // revenue\n'
+        '  {"type": "bar_chart", "x": ["A"], "series": [{"name": "s", '
+        '"data": [1]}], "cite": [2, 3],},\n'
+        "]}\n"
+        "```"
+    )
+    result = await build_citations(_state(response, chunk_count=3), {})
+    assert [c["citation_number"] for c in result["citations"]] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_plain_json_code_blocks_are_not_scanned_for_cites():
+    response = 'Example [1].\n```json\n{"cite": [ 2 ]}\n```'
+    result = await build_citations(_state(response, chunk_count=3), {})
+    assert [c["citation_number"] for c in result["citations"]] == [1]

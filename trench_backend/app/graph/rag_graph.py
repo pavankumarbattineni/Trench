@@ -169,12 +169,14 @@ _BASE_SYSTEM_PROMPT = (
     "default to the given figures and whose formula computes the result; "
     "the app calculates it exactly, so in your text refer to the "
     "calculator's result instead of stating a hand-computed number. Every "
-    "number in it must come from the context or the "
+    "number in it, including every constant inside a formula (rates, "
+    "per-gram values, factors), must come from the context or the "
     "user's message -- never invent, round away, default, or zero-fill "
-    "missing values; label estimates and assumptions.\n"
+    'missing values; any you must assume go in "assumptions", labelled as '
+    "estimates.\n"
     "   Format: a fenced code block tagged trench-ui holding ONE JSON object "
-    '{{"version":1,"components":[...]}}. Component types (use only what '
-    "helps): "
+    '{{"version":1,"components":[...]}}. Every component MUST have a "type". '
+    "Component types (use only what helps): "
     'metric_cards {{"items":[{{"label","value","format"?,"hint"?}}]}}; '
     'table {{"columns":[...],"rows":[[...]]}}; '
     'bar_chart / line_chart {{"x":[...],"series":[{{"name","data":[...]}}],'
@@ -185,15 +187,19 @@ _BASE_SYSTEM_PROMPT = (
     'comparison {{"items":[{{"title","points":[...]}}]}}; '
     'callout {{"tone":"info"|"warning"|"success","text"}}; '
     'calculator {{"inputs":[{{"id","label","default","min"?,"max"?,'
-    '"step"?,"format"?}}],"outputs":[{{"id"?,"label","formula","format"?}}],'
-    '"assumptions"?}}. '
+    '"step"?,"format"?,"options"?}}],"outputs":[{{"id"?,"label","formula",'
+    '"format"?}}],"assumptions"?}}. For a choice (sex, activity level, a '
+    'plan) give the input "options":[{{"label":"Female","value":-161}},...] '
+    "instead of a min/max, and it shows as a dropdown. "
     'Any component may have a "title" and a "cite" array of passage '
     'numbers, e.g. "cite":[1,3]. "format" is "number", "currency", '
     '"percent" or "plain"; with "currency" also give "currency" as an ISO '
     'code like "INR" or "USD". A calculator formula may use only numbers, '
-    "input ids, earlier output ids, + - * / ^ ( ) and min, max, round, abs, "
-    "floor, ceil, sqrt, pow, exp, log, log10; give each calculator input a "
-    'sensible "min" and "max" so it gets a slider. Always write a short '
+    "input ids, earlier output ids, + - * / ^ ( ), comparisons == != < <= > "
+    ">= (1 for true, 0 for false) and min, max, round, abs, floor, ceil, "
+    "sqrt, pow, exp, log, log10, if(condition, then, else), and, or, not; "
+    'give each numeric input a sensible "min" and "max" so it gets a '
+    "slider. Always write a short "
     "explanation with [n] "
     "citations before the block, and keep [n] markers out of the JSON "
     'except in "cite".'
@@ -780,13 +786,55 @@ async def check_output_guardrail(state: AgentState, config: RunnableConfig) -> d
 # real chunks -- which also hides the "N sources" panel entirely, since
 # that's driven by this same citations list, not by scanning the text.
 _CITATION_MARKER_RE = re.compile(r"\[(\d+)\]|【(\d+)】")
-_INTERACTIVE_BLOCK_RE = re.compile(r"```trench-ui[^\n]*\n(.*?)```", re.DOTALL)
+# ```json too: smaller models sometimes use the wrong tag, and the frontend
+# still renders those as interactive views (see looksLikeInteractiveJson).
+_INTERACTIVE_BLOCK_RE = re.compile(r"```(trench-ui|json)[^\n]*\n(.*?)```", re.DOTALL)
+
+
+def _repair_json(source: str) -> str:
+    """Drops // and /* */ comments and trailing commas outside strings --
+    common slips in smaller models' JSON. Mirrors the frontend's
+    repairJson so citations match what's rendered."""
+    out: list[str] = []
+    i, in_string = 0, False
+    while i < len(source):
+        ch = source[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < len(source):
+                out.append(source[i + 1])
+                i += 1
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+            out.append(ch)
+        elif source.startswith("//", i):
+            end = source.find("\n", i)
+            i = len(source) if end == -1 else end
+            continue
+        elif source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            i = len(source) if end == -1 else end + 2
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def _load_lenient_json(source: str):
+    try:
+        return json.loads(source)
+    except ValueError:
+        return json.loads(_repair_json(source))
 
 
 def _interactive_block_citations(response: str) -> set[int]:
     """Passage numbers cited by `"cite": [...]` arrays inside ```trench-ui
     blocks (whose JSON keeps [n] markers out of its text). A block that
-    isn't valid JSON contributes nothing -- the frontend shows it as code."""
+    isn't valid JSON even after repair contributes nothing -- the frontend
+    shows it as code."""
     numbers: set[int] = set()
 
     def walk(node) -> None:
@@ -802,11 +850,17 @@ def _interactive_block_citations(response: str) -> set[int]:
             for value in node:
                 walk(value)
 
-    for block in _INTERACTIVE_BLOCK_RE.findall(response):
+    for tag, block in _INTERACTIVE_BLOCK_RE.findall(response):
         try:
-            walk(json.loads(block))
+            data = _load_lenient_json(block)
         except ValueError:
             continue
+        # A plain ```json block only counts if it has the interactive shape.
+        if tag == "json" and not (
+            isinstance(data, dict) and isinstance(data.get("components"), list)
+        ):
+            continue
+        walk(data)
     return numbers
 
 

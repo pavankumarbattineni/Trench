@@ -8,7 +8,7 @@ import { CodeBlock, CopyableTable } from "@/components/chat/code-block";
 import { InteractiveBlock } from "@/components/chat/interactive-block";
 import { MermaidDiagram } from "@/components/chat/mermaid-diagram";
 import { CITATION_HREF_PREFIX, linkifyCitations } from "@/lib/citation-links";
-import { INTERACTIVE_LANGUAGE } from "@/lib/interactive";
+import { INTERACTIVE_LANGUAGE, looksLikeInteractiveJson } from "@/lib/interactive";
 import { normalizeMathDelimiters } from "@/lib/math-delimiters";
 import { cn } from "cn";
 
@@ -112,7 +112,10 @@ function buildComponents(
       if (block?.language === "mermaid") {
         return <MermaidDiagram code={block.code} isStreaming={isStreaming} />;
       }
-      if (block?.language === INTERACTIVE_LANGUAGE) {
+      if (
+        block?.language === INTERACTIVE_LANGUAGE ||
+        (block?.language === "json" && !isStreaming && looksLikeInteractiveJson(block.code))
+      ) {
         return (
           <InteractiveBlock
             source={block.code}
