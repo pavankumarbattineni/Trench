@@ -1,12 +1,22 @@
 import asyncio
+import os
 import sys
 from collections.abc import AsyncGenerator
 
-import pytest
-from httpx import ASGITransport, AsyncClient
+# Tests must never send traces to LangSmith: importing the app runs
+# configure_tracing(), which loads .env -- and a developer's .env may turn
+# tracing on. load_dotenv() doesn't override variables that are already
+# set, so switching every name the SDK reads off here, before the app is
+# imported, keeps test runs out of the real LangSmith project.
+for _prefix in ("LANGSMITH", "LANGCHAIN"):
+    os.environ[f"{_prefix}_TRACING"] = "false"
+    os.environ[f"{_prefix}_TRACING_V2"] = "false"
 
-from app.database.checkpointer import close_checkpointer, init_checkpointer
-from app.main import app
+import pytest  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+
+from app.database.checkpointer import close_checkpointer, init_checkpointer  # noqa: E402
+from app.main import app  # noqa: E402
 
 
 @pytest.fixture(scope="session")
