@@ -358,6 +358,18 @@ async def test_a_chat_turn_stores_usage_and_the_usage_api_reports_it(
     assert item["thread_id"] == thread["id"]
     assert {s["step"] for s in item["steps"]} >= {"generate"}
 
+    # Deleting the chat keeps the question in the list (its calls share a
+    # turn_id with no foreign key), so the list always adds up to the totals.
+    assert (await client.delete(f"/api/v1/threads/{thread['id']}")).status_code == 204
+    page = (await client.get("/api/v1/usage/queries?days=7")).json()
+    summary = (await client.get("/api/v1/usage/summary?days=7&tz=UTC")).json()
+    assert page["total"] == 1
+    assert page["items"][0]["thread_id"] is None
+    totals = summary["current"]
+    for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
+        assert sum(i[key] for i in page["items"]) == totals[key]
+    assert totals["questions"] == 1
+
 
 # --- Real SDK request shapes -------------------------------------------------
 # The provider fakes above replace the whole _stream_* function, so they
