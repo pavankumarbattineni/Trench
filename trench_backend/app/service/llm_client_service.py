@@ -322,12 +322,15 @@ class LLMClientService:
             messages=[{"role": "system", "content": system_prompt}, *messages],
             max_completion_tokens=_groq_max_completion_tokens(system_prompt, messages),
             stream=True,
-            stream_options={"include_usage": True},
         )
         async for chunk in stream:
-            if getattr(chunk, "usage", None) is not None:
-                # The final chunk carries usage (and no choices).
-                yield _openai_style_usage(chunk.usage)
+            # Groq always reports usage on the final chunk under x_groq
+            # (newer API versions also mirror it at the top level). The
+            # Groq SDK has no stream_options parameter, so none is sent.
+            x_groq = getattr(chunk, "x_groq", None)
+            usage = getattr(chunk, "usage", None) or getattr(x_groq, "usage", None)
+            if usage is not None:
+                yield _openai_style_usage(usage)
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]

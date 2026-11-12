@@ -340,9 +340,113 @@ async def test_a_chat_turn_stores_usage_and_the_usage_api_reports_it(
     assert len(summary["daily"]) == 7
     assert summary["by_model"][0]["model"] == row.model
 
+    # Legacy aliases browsers still report (Chrome: "Asia/Calcutta") and
+    # unknown names both work -- the day buckets are computed in Python.
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    for tz, zone in [("Asia/Calcutta", "Asia/Kolkata"), ("Not/AZone", "UTC")]:
+        summary = (await client.get(f"/api/v1/usage/summary?days=7&tz={tz}")).json()
+        today = datetime.now(ZoneInfo(zone)).date().isoformat()
+        assert summary["daily"][-1]["date"] == today
+        assert summary["daily"][-1]["questions"] == 1
+
     page = (await client.get("/api/v1/usage/queries?days=7")).json()
     assert page["total"] == 1
     item = page["items"][0]
     assert item["query_preview"] == "How is usage tracked?"
     assert item["thread_id"] == thread["id"]
     assert {s["step"] for s in item["steps"]} >= {"generate"}
+
+
+# --- Real SDK request shapes -------------------------------------------------
+# The provider fakes above replace the whole _stream_* function, so they
+# can't catch a request argument the installed SDK rejects (Groq's SDK has
+# no stream_options, unlike OpenAI's). These run the real _stream_* code
+# against a create() that validates its kwargs with the SDK's own signature.
+
+
+def _sdk_create(sdk_create, chunks):
+    import inspect
+
+    async def create(self, **kwargs):
+        inspect.signature(sdk_create).bind(self, **kwargs)  # TypeError if unknown
+
+        async def stream():
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+    return create
+
+
+def _chunk(cls, *, content=None, usage=None, **extra):
+    choices = (
+        [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
+        if content is not None
+        else []
+    )
+    return cls.model_validate(
+        {
+            "id": "c",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "m",
+            "choices": choices,
+            "usage": usage,
+            **extra,
+        }
+    )
+
+
+_USAGE = {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
+
+
+@pytest.mark.parametrize("usage_location", ["x_groq", "top_level"])
+async def test_groq_stream_matches_the_sdk_and_reads_usage(usage_location):
+    from groq.resources.chat.completions import AsyncCompletions
+    from groq.types.chat import ChatCompletionChunk
+
+    last = (
+        _chunk(ChatCompletionChunk, x_groq={"id": "x", "usage": _USAGE})
+        if usage_location == "x_groq"
+        else _chunk(ChatCompletionChunk, usage=_USAGE)
+    )
+    chunks = [_chunk(ChatCompletionChunk, content="Hi"), last]
+    resolved = ResolvedModel(provider_name="groq", model_name="m", api_key="k")
+    with patch.object(
+        AsyncCompletions, "create", _sdk_create(AsyncCompletions.create, chunks)
+    ):
+        out = [
+            item
+            async for item in LLMClientService._stream_groq(
+                resolved, system_prompt="s", messages=[{"role": "user", "content": "q"}]
+            )
+        ]
+    assert out[0] == "Hi"
+    usage = [u for u in out if isinstance(u, _ProviderUsage)]
+    assert [(u.input_tokens, u.output_tokens) for u in usage] == [(120, 30)]
+
+
+async def test_openai_stream_matches_the_sdk_and_reads_usage():
+    from openai.resources.chat.completions import AsyncCompletions
+    from openai.types.chat import ChatCompletionChunk
+
+    chunks = [
+        _chunk(ChatCompletionChunk, content="Hi"),
+        _chunk(ChatCompletionChunk, usage=_USAGE),
+    ]
+    resolved = ResolvedModel(provider_name="openai", model_name="m", api_key="k")
+    with patch.object(
+        AsyncCompletions, "create", _sdk_create(AsyncCompletions.create, chunks)
+    ):
+        out = [
+            item
+            async for item in LLMClientService._stream_openai(
+                resolved, system_prompt="s", messages=[{"role": "user", "content": "q"}]
+            )
+        ]
+    assert out[0] == "Hi"
+    usage = [u for u in out if isinstance(u, _ProviderUsage)]
+    assert [(u.input_tokens, u.output_tokens) for u in usage] == [(120, 30)]

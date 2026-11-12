@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import Date, case, cast, distinct, func, select
+from sqlalchemy import case, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import LLMUsage, User
@@ -135,51 +135,42 @@ class UsageService:
         current = await totals(start, now)
         previous = await totals(previous_start, start)
 
-        local_day = cast(func.timezone(zone.key, LLMUsage.created_at), Date)
-        daily_rows = (
+        # Bucketed by the viewer's local day in Python, not SQL: Postgres
+        # images don't all ship every zone alias browsers report (e.g.
+        # "Asia/Calcutta"), and an unknown name there is a hard error.
+        call_rows = (
             await db.execute(
                 select(
-                    local_day,
-                    func.coalesce(
-                        func.sum(LLMUsage.cost_usd).filter(
-                            LLMUsage.key_owner == "platform"
-                        ),
-                        _ZERO,
-                    ),
-                    func.coalesce(
-                        func.sum(LLMUsage.cost_usd).filter(
-                            LLMUsage.key_owner != "platform"
-                        ),
-                        _ZERO,
-                    ),
-                    func.count(
-                        distinct(
-                            case(
-                                (
-                                    LLMUsage.step == "generate",
-                                    LLMUsage.assistant_message_id,
-                                )
-                            )
-                        )
-                    ),
-                )
-                .where(LLMUsage.user_id == user_id, LLMUsage.created_at >= start)
-                .group_by(local_day)
-                .order_by(local_day)
+                    LLMUsage.created_at,
+                    LLMUsage.cost_usd,
+                    LLMUsage.key_owner,
+                    LLMUsage.step,
+                    LLMUsage.assistant_message_id,
+                ).where(LLMUsage.user_id == user_id, LLMUsage.created_at >= start)
             )
         ).all()
-        by_day = {row[0]: row for row in daily_rows}
+        platform_by_day: dict = defaultdict(lambda: _ZERO)
+        own_by_day: dict = defaultdict(lambda: _ZERO)
+        questions_by_day: dict = defaultdict(set)
+        for created_at, cost, key_owner, step, message_id in call_rows:
+            day = created_at.astimezone(zone).date()
+            if cost is not None:
+                if key_owner == "platform":
+                    platform_by_day[day] += cost
+                else:
+                    own_by_day[day] += cost
+            if step == "generate" and message_id is not None:
+                questions_by_day[day].add(message_id)
         today = now.astimezone(zone).date()
         daily = []
         for offset in range(days - 1, -1, -1):
             day = today - timedelta(days=offset)
-            row = by_day.get(day)
             daily.append(
                 {
                     "date": day.isoformat(),
-                    "platform_cost_usd": row[1] if row else _ZERO,
-                    "own_key_cost_usd": row[2] if row else _ZERO,
-                    "questions": row[3] if row else 0,
+                    "platform_cost_usd": platform_by_day.get(day, _ZERO),
+                    "own_key_cost_usd": own_by_day.get(day, _ZERO),
+                    "questions": len(questions_by_day.get(day, ())),
                 }
             )
 
