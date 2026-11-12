@@ -78,11 +78,20 @@ MAX_RETRIEVAL_ATTEMPTS = 2
 RETRIEVAL_SKIP_RETRY_BELOW = 0.05
 
 # How many of the most recent prior messages (user+assistant turns,
-# excluding the current query) are sent as conversation history to both
-# condense_query and generate() -- an unbounded history would eventually
-# make every turn resend the whole conversation, growing token cost and
-# latency without bound as a thread gets long.
+# excluding the current query) are sent as conversation history to
+# generate() -- an unbounded history would eventually make every turn
+# resend the whole conversation, growing token cost and latency without
+# bound as a thread gets long.
 MAX_HISTORY_MESSAGES = 10
+
+# condense_query only needs the gist of the conversation to make a
+# follow-up searchable: the user's last few questions plus the start of
+# the last answer (for "the second one" / "that" references). Sending
+# whole answers made this request ~10k tokens -- over the platform Groq
+# model's 8k tokens-per-minute limit -- and failed every follow-up.
+CONDENSE_QUESTION_COUNT = 3
+CONDENSE_QUESTION_CHARS = 600
+CONDENSE_ANSWER_CHARS = 300
 
 # The top chunk's Cohere rerank relevance score (see RerankerService.rerank
 # -- "score" on a retrieved chunk is that relevance score, not Pinecone's
@@ -441,10 +450,7 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
             "original_condensed_query": state["query"],
         }
 
-    history_text = "\n".join(
-        f"{getattr(m, 'type', 'user')}: {getattr(m, 'content', '')}"
-        for m in prior_messages[:-1][-MAX_HISTORY_MESSAGES:]
-    )
+    conversation = _condense_context(prior_messages[:-1])
     try:
         # The platform default Groq model/key, never the user's selected
         # model or BYOK credential -- condensing is a cheap, internal
@@ -462,19 +468,31 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
             "original_condensed_query": state["query"],
         }
     rewrite_prompt = (
-        "Given this conversation history and a follow-up question, rewrite "
-        "the follow-up as a standalone question. Reply with ONLY the "
-        "rewritten question.\n\nHistory:\n"
-        f"{history_text}\n\nFollow-up: {state['query']}"
+        "Given the user's previous questions and the start of the last "
+        "answer, rewrite the follow-up as a standalone question that names "
+        "what it refers to. If it is already standalone, return it "
+        "unchanged. Reply with ONLY the rewritten question.\n\n"
+        f"{conversation}\n\nFollow-up: {state['query']}"
     )
     condensed = ""
-    with usage_step("condense"):
-        async for delta in LLMClientService.stream_generate(
-            resolved,
-            system_prompt="You rewrite follow-up questions to be standalone.",
-            messages=[{"role": "user", "content": rewrite_prompt}],
-        ):
-            condensed += delta
+    try:
+        with usage_step("condense"):
+            async for delta in LLMClientService.stream_generate(
+                resolved,
+                system_prompt="You rewrite follow-up questions to be standalone.",
+                messages=[{"role": "user", "content": rewrite_prompt}],
+            ):
+                condensed += delta
+    except Exception:
+        # Rewriting only sharpens the search; a failure here (rate limit,
+        # outage) must never fail the turn -- search with the raw query and
+        # let the user's own model answer with the full history.
+        logger.warning(
+            "Condense failed; searching with the raw query | thread_id=%s",
+            state.get("thread_id"),
+            exc_info=True,
+        )
+        condensed = ""
     # The truncation note is for answers shown to people, never a query.
     final_query = condensed.removesuffix(TRUNCATION_NOTE).strip() or state["query"]
     return {
@@ -640,12 +658,127 @@ def _context_chunks(state: AgentState) -> list[dict]:
     ]
 
 
+def _role_and_content(message: object) -> tuple[str, str]:
+    """("user" | "assistant", text) for a LangChain message (as restored
+    from the checkpointer) or a plain {"role", "content"} dict."""
+    if isinstance(message, dict):
+        role = message.get("role", "user")
+        content = message.get("content", "")
+    else:
+        role = getattr(message, "type", "human")
+        content = getattr(message, "content", "")
+    if not isinstance(content, str):
+        content = str(content or "")
+    return ("assistant" if role in ("ai", "assistant") else "user"), content
+
+
+def _component_hint(component: object) -> str:
+    """One component as a short phrase, e.g. 'calculator "BMR" (inputs:
+    Weight, Height; results: BMR, TDEE)'."""
+    if not isinstance(component, dict):
+        return "component"
+
+    def labels(items: object, key: str = "label", limit: int = 5) -> str:
+        names = [
+            str(item.get(key))
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, dict) and item.get(key)
+        ]
+        more = "…" if len(names) > limit else ""
+        return ", ".join(names[:limit]) + more
+
+    kind = str(component.get("type") or "view").replace("_", " ")
+    title = component.get("title")
+    phrase = f'{kind} "{title}"' if title else kind
+    details: list[str] = []
+    if component.get("inputs") is not None:
+        details.append(f"inputs: {labels(component.get('inputs'))}")
+    if component.get("outputs") is not None:
+        details.append(f"results: {labels(component.get('outputs'))}")
+    if isinstance(component.get("series"), list):
+        details.append(f"series: {labels(component.get('series'), 'name')}")
+    if isinstance(component.get("columns"), list):
+        details.append(
+            "columns: " + ", ".join(str(c) for c in component["columns"][:5])
+        )
+    details = [d for d in details if not d.endswith(": ")]
+    return phrase + (f" ({'; '.join(details)})" if details else "")
+
+
+def _interactive_hint(block: str) -> str:
+    """The short note an interactive block is replaced with in history."""
+    try:
+        data = _load_lenient_json(block)
+    except ValueError:
+        return "[Interactive view shown to the user]"
+    components = data.get("components") if isinstance(data, dict) else data
+    if isinstance(data, dict) and components is None:
+        components = [data]
+    if not isinstance(components, list) or not components:
+        return "[Interactive view shown to the user]"
+    return (
+        "[Interactive view shown to the user: "
+        + "; ".join(_component_hint(c) for c in components[:6])
+        + "]"
+    )
+
+
+def strip_interactive_blocks(text: str) -> str:
+    """Replaces each interactive (```trench-ui, or interactive-shaped
+    ```json) block with a one-line hint of what it showed. The model still
+    knows e.g. a BMR calculator was given -- so "change my weight to 65"
+    works -- without resending thousands of tokens of JSON every turn."""
+
+    def replace(match: re.Match) -> str:
+        tag, block = match.group(1), match.group(2)
+        if tag == "json":
+            try:
+                data = _load_lenient_json(block)
+            except ValueError:
+                return match.group(0)
+            if not (
+                isinstance(data, dict) and isinstance(data.get("components"), list)
+            ):
+                return match.group(0)  # an ordinary JSON code block
+        return _interactive_hint(block)
+
+    return _HISTORY_BLOCK_RE.sub(replace, text)
+
+
 def _to_provider_message(message: object) -> dict[str, str]:
-    """Converts a LangChain BaseMessage (as restored from the checkpointer)
-    into the plain {"role", "content"} shape LLMClientService.stream_generate
-    expects, provider-agnostically."""
-    role = "assistant" if getattr(message, "type", "human") == "ai" else "user"
-    return {"role": role, "content": getattr(message, "content", "")}
+    """Converts a history message into the plain {"role", "content"} shape
+    LLMClientService.stream_generate expects, provider-agnostically, with
+    interactive blocks in past answers reduced to a short hint."""
+    role, content = _role_and_content(message)
+    if role == "assistant":
+        content = strip_interactive_blocks(content)
+    return {"role": role, "content": content}
+
+
+def _shorten(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _condense_context(prior_messages: list) -> str:
+    """The rewrite step's view of the conversation: the user's last few
+    questions and the start of the last answer (interactive blocks reduced
+    to hints) -- a few hundred tokens however long the thread is."""
+    pairs = [_role_and_content(m) for m in prior_messages]
+    questions = [c for role, c in pairs if role == "user" and c.strip()]
+    questions = questions[-CONDENSE_QUESTION_COUNT:]
+    last_answer = next(
+        (c for role, c in reversed(pairs) if role == "assistant" and c.strip()), ""
+    )
+    lines = ["Previous questions:"]
+    lines += [
+        f"{i}. {_shorten(q, CONDENSE_QUESTION_CHARS)}"
+        for i, q in enumerate(questions, start=1)
+    ]
+    if last_answer:
+        answer = _shorten(strip_interactive_blocks(last_answer), CONDENSE_ANSWER_CHARS)
+        lines.append(f"Last answer (start): {answer}")
+    return "\n".join(lines)
 
 
 async def generate(state: AgentState, config: RunnableConfig) -> dict:
@@ -821,6 +954,11 @@ def _repair_json(source: str) -> str:
             out.append(ch)
         i += 1
     return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+# Like _INTERACTIVE_BLOCK_RE, but also matches a block left unclosed at the
+# end of an answer that was interrupted mid-stream.
+_HISTORY_BLOCK_RE = re.compile(r"```(trench-ui|json)[^\n]*\n(.*?)(?:```|\Z)", re.DOTALL)
 
 
 def _load_lenient_json(source: str):
