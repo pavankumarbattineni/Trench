@@ -6,12 +6,13 @@
  * skipped, and only a block with nothing usable falls back to plain code. */
 import { z } from "zod";
 
-import { evaluateFormula } from "@/lib/formula";
+import { evaluateFormula, formulaIdentifiers } from "@/lib/formula";
 
 export const INTERACTIVE_LANGUAGE = "trench-ui";
 
 const MAX_COMPONENTS = 12;
 const MAX_ITEMS = 500;
+const MAX_CALCULATOR_FIELDS = 40;
 
 const text = z.union([z.string(), z.number()]).transform(String);
 // Numbers sometimes arrive as strings ("12,500") -- accept those too.
@@ -100,37 +101,73 @@ const callout = z.object({
 });
 
 const identifier = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/);
+// Long calculators are trimmed to the first fields rather than rejected.
+const capped = <T extends z.ZodType>(item: T) =>
+  z
+    .array(item)
+    .min(1)
+    .transform((a) => a.slice(0, MAX_CALCULATOR_FIELDS));
+const option = z.object({ label: text, value: num });
+
+export interface Assumptions {
+  /** Shown to the user, one per line. */
+  lines: string[];
+  /** Named numbers formulas may refer to. */
+  constants: Record<string, number>;
+}
+
+function normalizeAssumptions(
+  raw: string | string[] | Record<string, number | string> | undefined
+): Assumptions {
+  if (raw === undefined) return { lines: [], constants: {} };
+  if (typeof raw === "string") return { lines: [raw], constants: {} };
+  if (Array.isArray(raw)) return { lines: raw, constants: {} };
+  const constants: Record<string, number> = {};
+  const lines = Object.entries(raw).map(([key, value]) => {
+    if (typeof value === "number" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) constants[key] = value;
+    const name = key.replace(/_/g, " ");
+    return `${name.charAt(0).toUpperCase()}${name.slice(1)}: ${value}`;
+  });
+  return { lines, constants };
+}
 const calculator = z.object({
   ...base,
   type: z.literal("calculator"),
-  inputs: z
-    .array(
-      z.object({
+  inputs: capped(
+    z
+      .object({
         id: identifier,
         label: text,
-        default: num,
+        default: num.optional(),
         min: optionalNum,
         max: optionalNum,
         step: optionalNum,
         format,
         currency,
+        // A choice (sex, activity level, plan) shown as a dropdown.
+        options: z.array(option).min(1).max(50).optional().catch(undefined),
       })
-    )
-    .min(1)
-    .max(20),
-  outputs: z
-    .array(
-      z.object({
-        id: identifier.optional(),
-        label: text,
-        formula: z.string().max(1000),
-        format,
-        currency,
-      })
-    )
-    .min(1)
-    .max(20),
-  assumptions: z.union([text, z.array(text)]).optional(),
+      .transform((input) => ({
+        ...input,
+        default: input.default ?? input.options?.[0]?.value ?? input.min ?? 0,
+      }))
+  ),
+  outputs: capped(
+    z.object({
+      id: identifier.optional(),
+      label: text,
+      formula: z.string().max(2000),
+      format,
+      currency,
+    })
+  ),
+  // Text, a list of texts, or named constants ({"kcal_per_g_fat": 9}).
+  // Numeric constants can be used in formulas by name.
+  assumptions: z
+    .union([text, z.array(text), z.record(z.string(), z.union([z.number(), z.string()]))])
+    .optional()
+    .catch(undefined)
+    .transform(normalizeAssumptions),
 });
 
 const COMPONENT_SCHEMAS = {
@@ -171,41 +208,150 @@ export interface ParsedBlock {
   components: InteractiveComponent[];
   /** Components that were present but couldn't be shown. */
   skipped: number;
+  /** Why each skipped component couldn't be shown, in plain words. */
+  problems: string[];
 }
 
-/** Parses a block's JSON. Returns null when nothing in it can be rendered
- * (invalid JSON, wrong shape, or every component malformed). */
-export function parseInteractiveBlock(source: string): ParsedBlock | null {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(source);
-  } catch {
-    return null;
+type ComponentType = keyof typeof COMPONENT_SCHEMAS;
+
+/** Models sometimes leave out "type"; the shape of the data still says
+ * what the component is. Returns null when it's genuinely ambiguous. */
+function inferType(item: Record<string, unknown>): ComponentType | null {
+  const has = (key: string) => item[key] !== undefined;
+  if (has("inputs") && has("outputs")) return "calculator";
+  if (has("columns") && has("rows")) return "table";
+  if (has("x") && has("series")) return "bar_chart";
+  if (has("tone") || (has("text") && !has("items"))) return "callout";
+  const first = Array.isArray(item.items) ? (item.items[0] as Record<string, unknown> | undefined) : undefined;
+  if (first && typeof first === "object") {
+    if ("points" in first) return "comparison";
+    if ("date" in first) return "timeline";
+    if ("max" in first) return "progress";
+    if ("label" in first && "value" in first) return "metric_cards";
   }
+  return null;
+}
+
+function describeIssue(type: string, error: z.ZodError): string {
+  const issue = error.issues[0];
+  const where = issue?.path.length ? ` (${issue.path.join(".")})` : "";
+  return `A ${type.replace("_", " ")} has invalid data${where}`;
+}
+
+/** Removes // and /* *\/ comments and trailing commas -- common slips in
+ * smaller models' JSON -- while leaving string contents untouched. */
+export function repairJson(source: string): string {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\") out += source[++i] ?? "";
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+      out += ch;
+    } else if (ch === "/" && source[i + 1] === "/") {
+      while (i < source.length && source[i] !== "\n") i++;
+      out += "\n";
+    } else if (ch === "/" && source[i + 1] === "*") {
+      const end = source.indexOf("*/", i + 2);
+      i = end === -1 ? source.length : end + 1;
+    } else {
+      out += ch;
+    }
+  }
+  // A comma followed only by whitespace before } or ] (outside strings,
+  // since quotes were preserved above and these can't occur inside keys).
+  return out.replace(/,(\s*[}\]])/g, "$1");
+}
+
+/** JSON.parse, retried once on the repaired text; undefined if both fail. */
+function parseLenientJson(source: string): unknown {
+  try {
+    return JSON.parse(source);
+  } catch {
+    try {
+      return JSON.parse(repairJson(source));
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/** A ```json block that is really an interactive view (smaller models
+ * sometimes use the wrong fence tag): our {"version", "components"} shape. */
+export function looksLikeInteractiveJson(source: string): boolean {
+  if (!/"components"\s*:/.test(source)) return false;
+  const raw = parseLenientJson(source) as { version?: unknown; components?: unknown } | undefined;
+  return (
+    !!raw &&
+    typeof raw === "object" &&
+    raw.version !== undefined &&
+    Array.isArray(raw.components) &&
+    raw.components.length > 0
+  );
+}
+
+export interface BlockAnalysis {
+  block: ParsedBlock | null;
+  /** Why the block (or parts of it) couldn't be shown. */
+  problems: string[];
+}
+
+/** Parses a block's JSON, keeping every component that can be shown and a
+ * plain-words reason for each one that can't. */
+export function analyzeInteractiveBlock(source: string): BlockAnalysis {
+  const raw = parseLenientJson(source);
+  if (raw === undefined) return { block: null, problems: ["The data isn't valid JSON"] };
   // Accept {"components":[...]}, a bare array, or one bare component.
   const list = Array.isArray(raw)
     ? raw
     : raw && typeof raw === "object" && Array.isArray((raw as { components?: unknown }).components)
       ? (raw as { components: unknown[] }).components
-      : raw && typeof raw === "object" && "type" in raw
+      : raw && typeof raw === "object"
         ? [raw]
         : null;
-  if (!list) return null;
+  if (!list) return { block: null, problems: ["The data has no components"] };
 
   const components: InteractiveComponent[] = [];
-  let skipped = 0;
+  const problems: string[] = [];
   for (const item of list.slice(0, MAX_COMPONENTS)) {
-    const type = (item as { type?: unknown } | null)?.type;
-    const schema =
-      typeof type === "string" && Object.hasOwn(COMPONENT_SCHEMAS, type)
-        ? COMPONENT_SCHEMAS[type as keyof typeof COMPONENT_SCHEMAS]
-        : null;
-    const parsed = schema?.safeParse(item);
-    if (parsed?.success) components.push(parsed.data as InteractiveComponent);
-    else skipped++;
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      problems.push("A component isn't an object");
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const declared = typeof record.type === "string" ? record.type : null;
+    const type =
+      declared && Object.hasOwn(COMPONENT_SCHEMAS, declared)
+        ? (declared as ComponentType)
+        : inferType(record);
+    if (!type) {
+      problems.push(
+        declared ? `Unsupported component type "${declared}"` : "A component has no type"
+      );
+      continue;
+    }
+    const parsed = COMPONENT_SCHEMAS[type].safeParse({ ...record, type });
+    if (parsed.success) components.push(parsed.data as InteractiveComponent);
+    else problems.push(describeIssue(type, parsed.error));
   }
-  skipped += Math.max(0, list.length - MAX_COMPONENTS);
-  return components.length > 0 ? { components, skipped } : null;
+  if (list.length > MAX_COMPONENTS) {
+    problems.push(`Only the first ${MAX_COMPONENTS} components are shown`);
+  }
+  const skipped = problems.length;
+  return {
+    block: components.length > 0 ? { components, skipped, problems } : null,
+    problems,
+  };
+}
+
+/** Parses a block's JSON. Returns null when nothing in it can be rendered
+ * (invalid JSON, wrong shape, or every component malformed). */
+export function parseInteractiveBlock(source: string): ParsedBlock | null {
+  return analyzeInteractiveBlock(source).block;
 }
 
 // --- Number formatting -----------------------------------------------------
@@ -274,27 +420,29 @@ export function computeCalculator(
   calc: CalculatorComponent,
   values: Readonly<Record<string, number>>
 ): CalculatorResult[] {
-  const scope: Record<string, number> = { ...values };
+  const scope: Record<string, number> = { ...calc.assumptions.constants, ...values };
+  // Outputs that failed, by id -> label, so a result built on one says so
+  // instead of repeating the same generic error down the whole chain.
+  const failed = new Map<string, string>();
   return calc.outputs.map((out) => {
+    const fail = (error: string): CalculatorResult => {
+      if (out.id) {
+        scope[out.id] = Number.NaN;
+        failed.set(out.id, out.label);
+      }
+      return { label: out.label, value: null, error, format: out.format, currency: out.currency };
+    };
+    const brokenDependency = formulaIdentifiers(out.formula).find((name) => failed.has(name));
+    if (brokenDependency) {
+      return fail(`Depends on ${failed.get(brokenDependency)}, which couldn't be calculated`);
+    }
     try {
       const value = evaluateFormula(out.formula, scope);
+      if (!Number.isFinite(value)) return fail("The result isn't a finite number (division by zero?)");
       if (out.id) scope[out.id] = value;
-      return {
-        label: out.label,
-        value: Number.isFinite(value) ? value : null,
-        error: Number.isFinite(value) ? undefined : "Not a finite number",
-        format: out.format,
-        currency: out.currency,
-      };
+      return { label: out.label, value, format: out.format, currency: out.currency };
     } catch (err) {
-      if (out.id) scope[out.id] = Number.NaN;
-      return {
-        label: out.label,
-        value: null,
-        error: err instanceof Error ? err.message : "Invalid formula",
-        format: out.format,
-        currency: out.currency,
-      };
+      return fail(err instanceof Error ? err.message : "Invalid formula");
     }
   });
 }
@@ -370,8 +518,8 @@ function componentToText(c: InteractiveComponent): string {
           .map((r) => `- ${r.label}: ${formatValue(r.value, r.format, r.currency)}`)
           .join("\n")
       );
-      if (c.assumptions) {
-        parts.push(`Assumptions: ${Array.isArray(c.assumptions) ? c.assumptions.join("; ") : c.assumptions}`);
+      if (c.assumptions.lines.length > 0) {
+        parts.push(`Assumptions: ${c.assumptions.lines.join("; ")}`);
       }
       break;
     }
@@ -383,12 +531,13 @@ export function interactiveBlockToText(block: ParsedBlock): string {
   return block.components.map(componentToText).join("\n\n");
 }
 
-const BLOCK_RE = /```trench-ui[^\n]*\n([\s\S]*?)```/g;
+const BLOCK_RE = /```(?:trench-ui|json)[^\n]*\n([\s\S]*?)```/g;
 
 /** The message as the user would want it pasted: each valid trench-ui
  * block becomes readable Markdown instead of raw JSON. */
 export function contentForCopy(content: string): string {
   return content.replace(BLOCK_RE, (whole, json: string) => {
+    if (!whole.startsWith("```trench-ui") && !looksLikeInteractiveJson(json)) return whole;
     const parsed = parseInteractiveBlock(json);
     return parsed ? interactiveBlockToText(parsed) : whole;
   });

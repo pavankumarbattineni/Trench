@@ -429,11 +429,12 @@ class PasswordResetToken(BaseModel):
 
 class LLMUsage(Base):
     """One LLM call's token usage and cost -- one row per call, grouped into
-    a user question by `assistant_message_id` (the answer it belongs to).
+    a user question by `turn_id`.
 
     Kept even if the thread or message is later deleted (foreign keys set
-    to NULL), so cost history stays accurate; `query_preview` keeps the
-    question readable after that.
+    to NULL), so cost history stays accurate; `turn_id` (no foreign key)
+    keeps the question's calls grouped after that, and `query_preview`
+    keeps it readable.
     """
 
     __tablename__ = "llm_usage"
@@ -456,6 +457,12 @@ class LLMUsage(Base):
         ForeignKey("chat_history.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
+    )
+    # The question this call belongs to: the answer's message id at the
+    # time, deliberately NOT a foreign key so deleting the chat (which
+    # nulls assistant_message_id) doesn't orphan the call.
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
     )
     query_preview: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     # "generate" | "condense" | "reformulate" | "title"

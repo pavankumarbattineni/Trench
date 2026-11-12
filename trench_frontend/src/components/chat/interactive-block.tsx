@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useId, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
+  ChevronDown,
   CircleCheck,
   CodeXml,
   Info,
@@ -36,7 +37,7 @@ import {
   formatCompact,
   formatValue,
   interactiveBlockToText,
-  parseInteractiveBlock,
+  analyzeInteractiveBlock,
   type CalculatorComponent,
   type CalloutComponent,
   type CartesianChart,
@@ -50,6 +51,9 @@ import {
 } from "@/lib/interactive";
 import { cn } from "cn";
 
+// Calculators with more inputs than this show the rest behind a toggle,
+// so the results stay in view.
+const VISIBLE_INPUTS = 8;
 const SERIES = Array.from({ length: 8 }, (_, i) => `var(--viz-${i + 1})`);
 const MAX_PIE_SLICES = 7; // the rest fold into "Other"
 
@@ -469,6 +473,11 @@ function CalculatorView({ c }: { c: CalculatorComponent }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const results = useMemo(() => computeCalculator(c, values), [c, values]);
   const changed = c.inputs.some((i) => values[i.id] !== defaults[i.id]);
+  const [showAllInputs, setShowAllInputs] = useState(false);
+  const visibleInputs = showAllInputs ? c.inputs : c.inputs.slice(0, VISIBLE_INPUTS);
+  const hiddenCount = c.inputs.length - visibleInputs.length;
+  // Unique per calculator: two calculators may both have a "weight" input.
+  const idPrefix = useId();
 
   const setValue = (id: string, value: number) => {
     setValues((v) => ({ ...v, [id]: value }));
@@ -479,13 +488,36 @@ function CalculatorView({ c }: { c: CalculatorComponent }) {
     });
   };
 
-  const assumptions = c.assumptions === undefined ? [] : Array.isArray(c.assumptions) ? c.assumptions : [c.assumptions];
+  const assumptions = c.assumptions.lines;
 
   return (
     <div className="flex flex-col gap-4">
       <div className="grid gap-3 sm:grid-cols-2">
-        {c.inputs.map((input) => {
-          const id = `calc-${input.id}`;
+        {visibleInputs.map((input) => {
+          const id = `${idPrefix}-${input.id}`;
+          if (input.options) {
+            const selected = input.options.find((o) => o.value === values[input.id]);
+            return (
+              <div key={input.id} className="min-w-0">
+                <label htmlFor={id} className="mb-1 block truncate text-xs text-muted-foreground" title={input.label}>
+                  {input.label}
+                </label>
+                <select
+                  id={id}
+                  value={selected ? String(selected.value) : ""}
+                  onChange={(e) => setValue(input.id, Number(e.target.value))}
+                  className="h-8 w-full cursor-pointer rounded-md border border-input bg-background px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
+                >
+                  {!selected && <option value="">Select…</option>}
+                  {input.options.map((o) => (
+                    <option key={`${o.label}-${o.value}`} value={String(o.value)}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            );
+          }
           const hasRange = input.min != null && input.max != null && input.max > input.min;
           const step = input.step ?? (hasRange ? niceStep(input.min!, input.max!) : "any");
           return (
@@ -538,6 +570,18 @@ function CalculatorView({ c }: { c: CalculatorComponent }) {
           );
         })}
       </div>
+      {(hiddenCount > 0 || showAllInputs) && c.inputs.length > VISIBLE_INPUTS && (
+        <Button
+          variant="ghost"
+          size="xs"
+          className="-mt-2 self-start"
+          aria-expanded={showAllInputs}
+          onClick={() => setShowAllInputs((v) => !v)}
+        >
+          <ChevronDown className={cn("size-3 transition-transform", showAllInputs && "rotate-180")} />
+          {showAllInputs ? "Show fewer inputs" : `Show all ${c.inputs.length} inputs`}
+        </Button>
+      )}
 
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2" aria-live="polite">
         {results.map((r, i) => (
@@ -554,7 +598,7 @@ function CalculatorView({ c }: { c: CalculatorComponent }) {
             <p className={cn("font-semibold tabular-nums break-words", i === 0 ? "text-2xl" : "text-lg")}>
               {r.value === null ? "—" : formatValue(r.value, r.format, r.currency)}
             </p>
-            {r.error && <p className="text-xs text-destructive">Couldn&apos;t calculate this value.</p>}
+            {r.error && <p className="text-xs text-destructive">Couldn&apos;t calculate: {r.error}</p>}
           </div>
         ))}
       </div>
@@ -631,7 +675,11 @@ interface InteractiveBlockProps extends CitationProps {
 }
 
 export function InteractiveBlock({ source, isStreaming = false, citationNumbers, onCitationClick }: InteractiveBlockProps) {
-  const parsed = useMemo(() => (isStreaming ? null : parseInteractiveBlock(source)), [source, isStreaming]);
+  const analysis = useMemo(
+    () => (isStreaming ? null : analyzeInteractiveBlock(source)),
+    [source, isStreaming]
+  );
+  const parsed = analysis?.block ?? null;
   const [showData, setShowData] = useState(false);
 
   if (isStreaming) {
@@ -648,7 +696,9 @@ export function InteractiveBlock({ source, isStreaming = false, citationNumbers,
       <CodeBlock
         language="trench-ui"
         code={source}
-        note="This interactive view couldn't be displayed, so its data is shown instead."
+        note={`This interactive view couldn't be displayed (${
+          analysis?.problems[0]?.toLowerCase() ?? "unknown format"
+        }), so its data is shown instead.`}
       />
     );
   }
@@ -693,9 +743,16 @@ export function InteractiveBlock({ source, isStreaming = false, citationNumbers,
           </section>
         ))}
         {parsed.skipped > 0 && (
-          <p className="text-xs text-muted-foreground">
-            {parsed.skipped} part{parsed.skipped === 1 ? "" : "s"} of this view couldn&apos;t be displayed.
-          </p>
+          <div className="text-xs text-muted-foreground">
+            <p>
+              {parsed.skipped} part{parsed.skipped === 1 ? "" : "s"} of this view couldn&apos;t be displayed:
+            </p>
+            <ul className="list-disc pl-4">
+              {parsed.problems.map((p, i) => (
+                <li key={i}>{p}</li>
+              ))}
+            </ul>
+          </div>
         )}
       </div>
     </div>

@@ -357,10 +357,14 @@ function QueryHistory({
                       {q.model}
                       {" · "}
                       {KEY_OWNER_LABELS[q.key_owner] ?? q.key_owner}
+                      {!q.thread_id && " · chat deleted"}
                     </p>
                   </div>
                   <div className="hidden shrink-0 text-right text-xs text-muted-foreground tabular-nums sm:block">
-                    {formatTokens(q.input_tokens)} in · {formatTokens(q.output_tokens)} out
+                    {formatTokens(q.input_tokens)} in
+                    {q.cached_input_tokens > 0 && ` (${formatTokens(q.cached_input_tokens)} cached)`}
+                    {" · "}
+                    {formatTokens(q.output_tokens)} out
                   </div>
                   <div className="w-20 shrink-0 text-right text-sm font-semibold tabular-nums">
                     {formatUsd(q.cost_usd)}

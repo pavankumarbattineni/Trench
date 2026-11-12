@@ -51,6 +51,9 @@ class UsageService:
                 if user is None:
                     return
                 preview = " ".join(query.split())[:_PREVIEW_LENGTH]
+                # One question's calls share a turn id even with no answer
+                # message (e.g. a turn that failed before creating one).
+                turn_id = assistant_message_id or uuid.uuid4()
                 for call in calls:
                     db.add(
                         LLMUsage(
@@ -58,6 +61,7 @@ class UsageService:
                             tenant_id=user.tenant_id,
                             thread_id=thread_id,
                             assistant_message_id=assistant_message_id,
+                            turn_id=turn_id,
                             query_preview=preview,
                             step=call.step,
                             provider=call.provider_name,
@@ -105,7 +109,7 @@ class UsageService:
                                 case(
                                     (
                                         LLMUsage.step == "generate",
-                                        LLMUsage.assistant_message_id,
+                                        LLMUsage.turn_id,
                                     )
                                 )
                             )
@@ -145,7 +149,7 @@ class UsageService:
                     LLMUsage.cost_usd,
                     LLMUsage.key_owner,
                     LLMUsage.step,
-                    LLMUsage.assistant_message_id,
+                    LLMUsage.turn_id,
                 ).where(LLMUsage.user_id == user_id, LLMUsage.created_at >= start)
             )
         ).all()
@@ -184,7 +188,7 @@ class UsageService:
                             case(
                                 (
                                     LLMUsage.step == "generate",
-                                    LLMUsage.assistant_message_id,
+                                    LLMUsage.turn_id,
                                 )
                             )
                         )
@@ -246,20 +250,18 @@ class UsageService:
         scope = (
             LLMUsage.user_id == user_id,
             LLMUsage.created_at >= since,
-            LLMUsage.assistant_message_id.is_not(None),
+            LLMUsage.turn_id.is_not(None),
         )
         total = (
             await db.execute(
-                select(func.count(distinct(LLMUsage.assistant_message_id))).where(
-                    *scope
-                )
+                select(func.count(distinct(LLMUsage.turn_id))).where(*scope)
             )
         ).scalar_one()
         message_rows = (
             await db.execute(
-                select(LLMUsage.assistant_message_id, func.min(LLMUsage.created_at))
+                select(LLMUsage.turn_id, func.min(LLMUsage.created_at))
                 .where(*scope)
-                .group_by(LLMUsage.assistant_message_id)
+                .group_by(LLMUsage.turn_id)
                 .order_by(func.min(LLMUsage.created_at).desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
@@ -271,12 +273,12 @@ class UsageService:
             rows = (
                 await db.execute(
                     select(LLMUsage)
-                    .where(LLMUsage.assistant_message_id.in_(ids))
+                    .where(LLMUsage.turn_id.in_(ids))
                     .order_by(LLMUsage.created_at)
                 )
             ).scalars()
             for row in rows:
-                calls_by_message[row.assistant_message_id].append(row)
+                calls_by_message[row.turn_id].append(row)
 
         items = []
         for message_id, created_at in message_rows:
