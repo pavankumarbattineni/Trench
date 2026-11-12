@@ -43,6 +43,7 @@ duplicate that handling with a different message, not add any real
 protection.
 """
 
+import json
 import logging
 import re
 import uuid
@@ -148,7 +149,40 @@ _BASE_SYSTEM_PROMPT = (
     "node labels short, and wrap any label containing ( ) [ ] {{ }} in "
     'double quotes, e.g. A["Encoder (6 layers)"]. Rule 3 still applies in '
     "full: cite every claim in the text before and after the diagram as "
-    "usual -- just keep the [n] markers out of the Mermaid code itself.\n\n"
+    "usual -- just keep the [n] markers out of the Mermaid code itself.\n"
+    "8. Decide the presentation yourself, silently -- never explain the "
+    "choice. Use plain text for simple facts, definitions and summaries; "
+    "Markdown lists or tables for steps and comparisons. Add an interactive "
+    "block, even if the user didn't ask for one, ONLY when it clearly helps: "
+    "several figures to compare, a trend over time, progress toward a "
+    "target, a breakdown into parts, or a calculation the user may want to "
+    "adjust (loans, budgets, projections). Every number in it must come from "
+    "the context or the user's message -- never invent, round away, "
+    "default, or zero-fill missing values; label estimates and assumptions. "
+    "Never use one for a short or purely textual answer.\n"
+    "   Format: a fenced code block tagged trench-ui holding ONE JSON object "
+    '{{"version":1,"components":[...]}}. Component types (use only what '
+    "helps): "
+    'metric_cards {{"items":[{{"label","value","format"?,"hint"?}}]}}; '
+    'table {{"columns":[...],"rows":[[...]]}}; '
+    'bar_chart / line_chart {{"x":[...],"series":[{{"name","data":[...]}}],'
+    '"format"?}}; '
+    'pie_chart {{"items":[{{"label","value"}}],"format"?}}; '
+    'progress {{"items":[{{"label","value","max"}}]}}; '
+    'timeline {{"items":[{{"date","title","detail"?}}]}}; '
+    'comparison {{"items":[{{"title","points":[...]}}]}}; '
+    'callout {{"tone":"info"|"warning"|"success","text"}}; '
+    'calculator {{"inputs":[{{"id","label","default","min"?,"max"?,'
+    '"step"?,"format"?}}],"outputs":[{{"id"?,"label","formula","format"?}}],'
+    '"assumptions"?}}. '
+    'Any component may have a "title" and a "cite" array of passage '
+    'numbers, e.g. "cite":[1,3]. "format" is "number", "currency", '
+    '"percent" or "plain"; with "currency" also give "currency" as an ISO '
+    'code like "INR" or "USD". A calculator formula may use only numbers, '
+    "input ids, earlier output ids, + - * / ^ ( ) and min, max, round, abs, "
+    "floor, ceil, sqrt. Always write a short explanation with [n] "
+    "citations before the block, and keep [n] markers out of the JSON "
+    'except in "cite".\n\n'
     "Context:\n"
     "{context}"
 )
@@ -752,6 +786,34 @@ async def check_output_guardrail(state: AgentState, config: RunnableConfig) -> d
 # real chunks -- which also hides the "N sources" panel entirely, since
 # that's driven by this same citations list, not by scanning the text.
 _CITATION_MARKER_RE = re.compile(r"\[(\d+)\]|【(\d+)】")
+_INTERACTIVE_BLOCK_RE = re.compile(r"```trench-ui[^\n]*\n(.*?)```", re.DOTALL)
+
+
+def _interactive_block_citations(response: str) -> set[int]:
+    """Passage numbers cited by `"cite": [...]` arrays inside ```trench-ui
+    blocks (whose JSON keeps [n] markers out of its text). A block that
+    isn't valid JSON contributes nothing -- the frontend shows it as code."""
+    numbers: set[int] = set()
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            cite = node.get("cite")
+            if isinstance(cite, list):
+                numbers.update(
+                    n for n in cite if isinstance(n, int) and not isinstance(n, bool)
+                )
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for block in _INTERACTIVE_BLOCK_RE.findall(response):
+        try:
+            walk(json.loads(block))
+        except ValueError:
+            continue
+    return numbers
 
 
 async def build_citations(state: AgentState, config: RunnableConfig) -> dict:
@@ -781,7 +843,7 @@ async def build_citations(state: AgentState, config: RunnableConfig) -> dict:
         for ascii_digits, fullwidth_digits in _CITATION_MARKER_RE.findall(
             state["response"]
         )
-    }
+    } | _interactive_block_citations(state["response"])
     valid_numbers = sorted(n for n in cited_numbers if 1 <= n <= len(chunks))
 
     return {

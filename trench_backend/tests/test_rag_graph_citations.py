@@ -154,3 +154,53 @@ async def test_citation_number_matches_original_position_even_with_a_gap():
     kept = result["citations"][0]
     assert kept["chunk_id"] == "cited-second"
     assert kept["citation_number"] == 2
+
+
+# --- Interactive (```trench-ui) blocks ---------------------------------------
+
+
+def _state(response: str, *, chunk_count: int) -> dict:
+    return {
+        "best_retrieved_chunks": [
+            _chunk(f"c{i}", f"Passage {i}.") for i in range(1, chunk_count + 1)
+        ],
+        "response": response,
+    }
+
+
+@pytest.mark.asyncio
+async def test_build_citations_reads_cite_arrays_in_interactive_blocks():
+    """A chart may cite passages only through its JSON "cite" array (its text
+    keeps [n] markers out of the JSON); those still become citations."""
+    response = (
+        "Your two loans compare like this [1].\n"
+        "```trench-ui\n"
+        '{"version":1,"components":[{"type":"bar_chart","title":"Rates",'
+        '"x":["Home","Car"],"series":[{"name":"Rate","data":[8.4,9.1]}],'
+        '"cite":[2,3]}]}\n'
+        "```"
+    )
+    result = await build_citations(_state(response, chunk_count=3), {})
+    assert [c["citation_number"] for c in result["citations"]] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_invalid_interactive_json_contributes_no_citations():
+    response = 'Text [1].\n```trench-ui\n{"cite": [ 2 ], not json\n```'
+    result = await build_citations(_state(response, chunk_count=3), {})
+    assert [c["citation_number"] for c in result["citations"]] == [1]
+
+
+def test_normal_answer_prompt_describes_interactive_blocks():
+    from app.graph.rag_graph import _BASE_SYSTEM_PROMPT
+
+    prompt = _BASE_SYSTEM_PROMPT.format(
+        knowledge_scope_label="your documents",
+        knowledge_scope_note="",
+        context="[1] passage",
+    )
+    assert "trench-ui" in prompt
+    assert '{"version":1,"components":[...]}' in prompt
+    # The existing rules are untouched.
+    assert "Cite every factual claim" in prompt
+    assert "```mermaid" in prompt
