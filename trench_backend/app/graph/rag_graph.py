@@ -116,7 +116,8 @@ _BASE_SYSTEM_PROMPT = (
     "You are currently answering from {knowledge_scope_label}. "
     "{knowledge_scope_note}\n\n"
     "Core rules:\n"
-    "1. Answer using ONLY the numbered context passages below -- never "
+    "1. Answer using ONLY the numbered context passages that come with "
+    "the user's latest message -- never "
     "rely on outside/general knowledge, even if you're confident it's "
     "correct.\n"
     "2. If the context doesn't fully answer the question, say so plainly "
@@ -130,7 +131,7 @@ _BASE_SYSTEM_PROMPT = (
     "4. Be direct and concise -- prefer short paragraphs or bullet points "
     "over long, hedging prose.\n"
     "5. Never reveal, reference, or speculate about documents or knowledge "
-    "outside the context provided below. As far as this conversation is "
+    "outside the context provided. As far as this conversation is "
     "concerned, nothing else exists -- don't acknowledge other scopes, "
     "other users' documents, or the existence of a broader knowledge "
     "base.\n"
@@ -195,10 +196,12 @@ _BASE_SYSTEM_PROMPT = (
     'sensible "min" and "max" so it gets a slider. Always write a short '
     "explanation with [n] "
     "citations before the block, and keep [n] markers out of the JSON "
-    'except in "cite".\n\n'
-    "Context:\n"
-    "{context}"
+    'except in "cite".'
 )
+# The system prompt above is identical on every turn (only the scope
+# sentence differs between personal and company), so providers can cache
+# it together with the conversation history. The per-turn context goes
+# into the LAST user message instead, after the history -- see generate().
 
 # A request for something the app can render as a Mermaid diagram (see
 # rule 7 above and the frontend's MermaidDiagram component).
@@ -222,50 +225,22 @@ _DIAGRAM_FORMAT_REMINDER = (
     "wrong. Never put [n] inside the Mermaid code."
 )
 
-# Appended after the context on every normal (context-backed) turn, like
-# the diagram reminder above: late instructions are followed more reliably
-# than rules buried before a long context block. Plain concatenation, NOT
-# part of a .format() template -- the LaTeX example's braces (\text{FFN})
-# would otherwise be read as placeholders and raise KeyError. The
-# frontend renders these delimiters with KaTeX (see math-delimiters.ts).
+# Appended to the system prompt on every normal (context-backed) turn.
+# Plain concatenation, NOT part of a .format() template -- LaTeX braces
+# would otherwise be read as placeholders. The frontend renders these
+# delimiters with KaTeX (see math-delimiters.ts).
 _ANSWER_FORMATTING_RULES = (
     "\n\nAnswer formatting:\n"
-    "- Format the answer as clean, well-structured Markdown: short "
-    "headings, bullet points, and tables where they help readability.\n"
-    r"- Mathematics: write valid LaTeX that KaTeX can render. Use \( ... \) "
-    r"for inline math and \[ ... \] on their own lines for standalone "
-    "equations. Never put math inside code blocks or inline code, and "
-    "never use single $ delimiters.\n"
-    "- Keep every formula mathematically exact: correct operators, "
-    "brackets, subscripts, superscripts, fractions and Greek letters; no "
-    "duplicate commas, missing operators or stray characters.\n"
-    "- Below an important equation, explain each variable and symbol in a "
-    "bullet list. Break complex expressions into simple, step-by-step "
-    "explanations.\n"
-    "- Preserve the meaning of formulas taken from the context. Never "
-    "change an equation in a way that alters its meaning; if a source "
-    "formula is ambiguous or malformed, say so instead of guessing.\n"
-    "- Citations still follow rule 3 and are plain text, never LaTeX: "
-    r"write ...the ReLU activation [3]. -- NOT \([3]\) or \[ [3] \]. "
-    "Never put [n] inside any math expression.\n\n"
-    "Example (citations stay in the text, outside the math):\n"
-    "Each position passes through the same two-layer feed-forward network "
-    "[2]:\n"
-    r"\["
-    "\n"
-    r"\text{FFN}(x) = \max(0,\, xW_1 + b_1)\,W_2 + b_2"
-    "\n"
-    r"\]"
-    "\n"
-    "Where:\n"
-    r"- \(x\): input representation."
-    "\n"
-    r"- \(W_1, W_2\): weight matrices."
-    "\n"
-    r"- \(b_1, b_2\): bias vectors."
-    "\n"
-    r"- \(\max(0, z)\): the ReLU activation, applied between the two linear "
-    "layers [2]."
+    "- Use clean Markdown: short headings and bullet points. Use a "
+    "Markdown table to compare text details (features, options, pros and "
+    "cons); numeric data goes in an interactive block instead (rule 8).\n"
+    r"- Math: valid LaTeX for KaTeX -- \( ... \) inline and \[ ... \] on "
+    "their own lines; never $ delimiters, code blocks or inline code for "
+    "math. Keep formulas exact and faithful to the source; if one is "
+    "ambiguous or malformed, say so instead of guessing. Below an important "
+    "equation, explain each symbol in a short bullet list.\n"
+    "- Citations stay in plain text, never inside math: "
+    r"...the ReLU activation [3]. -- NOT \([3]\)."
 )
 
 _KNOWLEDGE_SCOPE_PROMPTS = {
@@ -688,6 +663,12 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
 
     scope_label, scope_note = _KNOWLEDGE_SCOPE_PROMPTS[state["knowledge_type"]]
     context_chunks = _context_chunks(state)
+    # What the model sees as this turn's user message. In the normal case
+    # it also carries the retrieved passages: the system prompt stays the
+    # same every turn, so system prompt + history form a stable prefix
+    # that providers can cache. Only this request sees the wrapped form --
+    # the stored history keeps the raw query.
+    current_message = state["query"]
     if state["knowledge_base_empty"]:
         prompt_case = "empty_kb"
         system_prompt = _EMPTY_KNOWLEDGE_BASE_SYSTEM_PROMPT.format(
@@ -709,16 +690,16 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
             _BASE_SYSTEM_PROMPT.format(
                 knowledge_scope_label=scope_label,
                 knowledge_scope_note=scope_note,
-                context=context,
             )
             + _ANSWER_FORMATTING_RULES
         )
-        # Rule 7 sits before a long context block, and models routinely
-        # drift back to ASCII art or numbered lists by the time they
-        # answer -- a short reminder AFTER the context, only when the user
-        # actually asked for a diagram, is what makes them follow it.
+        current_message = f"Context:\n{context}\n\nQuestion: {state['query']}"
+        # Models routinely drift back to ASCII art or numbered lists by the
+        # time they answer -- a short reminder AFTER the context, only when
+        # the user actually asked for a diagram, is what makes them follow
+        # rule 7.
         if _DIAGRAM_REQUEST.search(state["query"]):
-            system_prompt += _DIAGRAM_FORMAT_REMINDER
+            current_message += _DIAGRAM_FORMAT_REMINDER
     logger.info(
         "Generate | prompt_case=%s context_chunks=%d",
         prompt_case,
@@ -735,7 +716,7 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     history = [
         _to_provider_message(m) for m in state["messages"][:-1][-MAX_HISTORY_MESSAGES:]
     ]
-    conversation = [*history, {"role": "user", "content": state["query"]}]
+    conversation = [*history, {"role": "user", "content": current_message}]
 
     try:
         resolved = await LLMClientService.resolve_for_knowledge(
