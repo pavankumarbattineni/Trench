@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator
 from functools import lru_cache
 
 import tiktoken
+from langsmith import trace as ls_trace
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -67,6 +68,36 @@ def _openai_style_usage(usage) -> _ProviderUsage:
 _GROQ_MIN_OUTPUT_TOKENS = 1024
 _GROQ_MAX_OUTPUT_TOKENS = 16384
 _GROQ_TOKEN_SAFETY_MARGIN = 400  # tokenizer estimate + per-message overhead
+
+
+_PROVIDER_LABELS = {
+    "groq": "Groq",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "google": "Gemini",
+}
+
+
+def _trace_outputs(text: str, usage: _ProviderUsage | None, truncated: bool) -> dict:
+    """The LangSmith "llm" run's outputs: the answer as a chat completion,
+    plus usage_metadata (which LangSmith reads for tokens and cost) when the
+    provider reported it."""
+    outputs: dict = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "length" if truncated else "stop",
+            }
+        ]
+    }
+    if usage is not None:
+        outputs["usage_metadata"] = {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.input_tokens + usage.output_tokens,
+            "input_token_details": {"cache_read": usage.cached_input_tokens},
+        }
+    return outputs
 
 
 @lru_cache
@@ -257,26 +288,43 @@ class LLMClientService:
         truncated = False
         usage: _ProviderUsage | None = None
         output: list[str] = []
-        try:
-            async for delta in stream_fn(
-                resolved, system_prompt=system_prompt, messages=messages
-            ):
-                if isinstance(delta, _ProviderUsage):
-                    usage = delta
-                    continue
-                if delta == _TRUNCATED:
-                    truncated = True
-                    continue
-                output.append(delta)
-                yield delta
-            if truncated:
-                yield TRUNCATION_NOTE
-        finally:
-            # Runs on completion, error and cancellation alike (a stopped
-            # answer still used tokens). No-op unless a turn is collecting.
-            LLMClientService._record_usage(
-                resolved, usage, system_prompt, messages, "".join(output)
-            )
+        # The provider SDKs aren't LangChain models, so the call is recorded
+        # as an "llm" run by hand; it nests under the current graph node.
+        # No-op unless LangSmith tracing is enabled.
+        with ls_trace(
+            name=f"{_PROVIDER_LABELS.get(resolved.provider_name, 'LLM')} chat",
+            run_type="llm",
+            inputs={
+                "messages": [{"role": "system", "content": system_prompt}, *messages]
+            },
+            metadata={
+                "ls_provider": resolved.provider_name,
+                "ls_model_name": resolved.model_name,
+                "key_owner": resolved.key_owner,
+            },
+        ) as run:
+            try:
+                async for delta in stream_fn(
+                    resolved, system_prompt=system_prompt, messages=messages
+                ):
+                    if isinstance(delta, _ProviderUsage):
+                        usage = delta
+                        continue
+                    if delta == _TRUNCATED:
+                        truncated = True
+                        continue
+                    output.append(delta)
+                    yield delta
+                if truncated:
+                    yield TRUNCATION_NOTE
+            finally:
+                # Runs on completion, error and cancellation alike (a stopped
+                # answer still used tokens). No-op unless a turn is collecting.
+                text = "".join(output)
+                LLMClientService._record_usage(
+                    resolved, usage, system_prompt, messages, text
+                )
+                run.end(outputs=_trace_outputs(text, usage, truncated))
 
     @staticmethod
     def _record_usage(

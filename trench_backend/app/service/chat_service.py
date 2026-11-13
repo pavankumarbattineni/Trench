@@ -23,6 +23,11 @@ from app.database.session import async_session_factory
 from app.graph.rag_graph import build_graph
 from app.service.thread_service import ThreadService
 from app.service.thread_title_service import ThreadTitleService
+from app.service.trace_sync_service import (
+    KIND_CHAT_TURN,
+    KIND_THREAD_TITLE,
+    sync_after_run,
+)
 from app.service.usage_service import UsageService
 from app.utils import usage_tracking
 from app.utils.stream_manager import stream_manager
@@ -78,6 +83,18 @@ def _user_facing_error(exc: Exception) -> str:
 _compiled_graph = None
 
 _ACTIVE_STATUSES = ("pending", "running")
+
+
+# Background trace syncs, kept referenced until done (asyncio holds only
+# weak references to tasks).
+_trace_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_trace_sync(trace_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    """Copy this run's LangSmith trace into Tracing once LangSmith has it."""
+    task = asyncio.create_task(sync_after_run([str(trace_id)], user_id))
+    _trace_tasks.add(task)
+    task.add_done_callback(_trace_tasks.discard)
 
 
 def _get_compiled_graph():
@@ -171,12 +188,26 @@ class ChatService:
         user_id: uuid.UUID | None = None,
         assistant_message_id: uuid.UUID | None = None,
     ) -> None:
+        trace_run_id = uuid.uuid4()
+        trace_meta = {
+            "user_id": str(user_id) if user_id else None,
+            "thread_id": str(thread_id),
+            "trench_kind": KIND_THREAD_TITLE,
+        }
         with (
             usage_tracking.collect_usage() as llm_calls,
             usage_tracking.usage_step("title"),
         ):
             async with async_session_factory() as db:
-                await ThreadTitleService.generate(db, thread_id=thread_id, query=query)
+                await ThreadTitleService.generate(
+                    db,
+                    thread_id=thread_id,
+                    query=query,
+                    trace_run_id=trace_run_id,
+                    trace_meta=trace_meta,
+                )
+        if user_id is not None:
+            _schedule_trace_sync(trace_run_id, user_id)
         if user_id is not None:
             await UsageService.record_calls(
                 user_id=user_id,
@@ -200,6 +231,9 @@ class ChatService:
         it made -- whether the turn completed, was stopped or failed (all of
         them consumed tokens). Recording is best-effort and happens after
         the turn, so it can never affect the answer."""
+        # LangSmith run id for this turn, so Tracing can fetch exactly its
+        # trace afterwards (see trace_sync_service).
+        trace_run_id = uuid.uuid4()
         with usage_tracking.collect_usage() as llm_calls:
             await ChatService._run_generation_turn(
                 assistant_message_id=assistant_message_id,
@@ -208,6 +242,7 @@ class ChatService:
                 query=query,
                 knowledge_type=knowledge_type,
                 stream_id=stream_id,
+                trace_run_id=trace_run_id,
             )
         await UsageService.record_calls(
             user_id=user.id,
@@ -216,6 +251,7 @@ class ChatService:
             query=query,
             calls=llm_calls,
         )
+        _schedule_trace_sync(trace_run_id, user.id)
 
     @staticmethod
     async def _run_generation_turn(
@@ -226,6 +262,7 @@ class ChatService:
         query: str,
         knowledge_type: str,
         stream_id: str,
+        trace_run_id: uuid.UUID | None = None,
     ) -> None:
         # The whole body runs inside this try -- not just the ainvoke() call
         # -- because a Stop click races the background task from the moment
@@ -306,11 +343,14 @@ class ChatService:
                     # into node-level state. See the architecture doc's
                     # observability section.
                     "run_name": "agentic_rag_chat",
+                    "run_id": trace_run_id,
                     "tags": ["agentic-rag", knowledge_type],
                     "metadata": {
                         "user_id": str(user.id),
                         "knowledge_type": knowledge_type,
                         "thread_id": str(thread_id),
+                        "stream_id": stream_id,
+                        "trench_kind": KIND_CHAT_TURN,
                     },
                 }
 

@@ -16,6 +16,7 @@ import logging
 import re
 import uuid
 
+from langsmith import traceable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -114,21 +115,80 @@ def fallback_title(query: str) -> str:
     return _title_case(keep) if keep else "Request for Assistance"
 
 
+def _llm_inputs(inputs: dict) -> dict:
+    """What a traced title call shows as its input (not the SDK client)."""
+    return {"messages": inputs.get("messages"), "model": inputs.get("model")}
+
+
+def _llm_outputs(response) -> dict:
+    """A Groq response in the shape LangSmith reads tokens and text from."""
+    usage = getattr(response, "usage", None)
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": response.choices[0].message.content or "",
+                }
+            }
+        ],
+        "usage_metadata": {
+            "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+        },
+    }
+
+
+@traceable(
+    run_type="llm",
+    name="Groq chat",
+    process_inputs=_llm_inputs,
+    process_outputs=_llm_outputs,
+)
+async def _groq_completion(client, *, model: str, messages: list[dict], **kwargs):
+    """One Groq chat completion, traced as an LLM run (the Groq SDK isn't
+    LangChain, so it isn't traced on its own)."""
+    return await client.chat.completions.create(
+        model=model, messages=messages, **kwargs
+    )
+
+
+@traceable(run_type="chain", name="trench.thread_title")
+async def _title_attempts(db: AsyncSession, query: str) -> str | None:
+    """The model's title (with one retry), traced as one run whose LLM calls
+    are its children."""
+    title = clean_title(await ThreadTitleService._complete(db, query))
+    if title is None:
+        title = clean_title(await ThreadTitleService._complete(db, query, retry=True))
+    return title
+
+
 class ThreadTitleService:
     @staticmethod
-    async def generate(db: AsyncSession, *, thread_id: uuid.UUID, query: str) -> None:
+    async def generate(
+        db: AsyncSession,
+        *,
+        thread_id: uuid.UUID,
+        query: str,
+        trace_run_id: uuid.UUID | None = None,
+        trace_meta: dict | None = None,
+    ) -> None:
         """Best-effort: runs as a fire-and-forget background task (see
         ChatService.send_message) with nothing awaiting its result, so any
         failure here is logged and swallowed rather than propagated -- it
         must never be able to break the chat turn it's attached to.
+
+        trace_run_id/trace_meta: LangSmith run id and metadata for this
+        call, so Tracing can fetch its trace (see trace_sync_service).
         """
         title = None
         try:
-            title = clean_title(await ThreadTitleService._complete(db, query))
-            if title is None:
-                title = clean_title(
-                    await ThreadTitleService._complete(db, query, retry=True)
-                )
+            title = await _title_attempts(
+                db,
+                query,
+                langsmith_extra={"run_id": trace_run_id, "metadata": trace_meta or {}},
+            )
         except Exception:
             logger.exception("Thread title generation failed | thread_id=%s", thread_id)
             return
@@ -155,8 +215,15 @@ class ThreadTitleService:
         user_message = f'Message: """{query[:2000]}"""\nTitle:'
         if retry:
             user_message = f"{_RETRY_REMINDER}\n\n{user_message}"
-        response = await client.chat.completions.create(
+        response = await _groq_completion(
+            client,
             model=default_model.model_name,
+            langsmith_extra={
+                "metadata": {
+                    "ls_provider": "groq",
+                    "ls_model_name": default_model.model_name,
+                }
+            },
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
