@@ -35,6 +35,10 @@ function outsideQuotes(line: string, fn: (segment: string) => string): string {
 export function cleanMermaidSource(source: string): string {
   return source
     .trim()
+    // Models sometimes escape quotes inside a label (`C[Return \"Blocked\"]`);
+    // a raw `"` there would split the label below, so it becomes Mermaid's
+    // quote entity first.
+    .replace(/\\"/g, "#quot;")
     .split("\n")
     .map((rawLine) => {
       const trimmed = rawLine.trim();

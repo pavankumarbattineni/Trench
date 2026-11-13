@@ -17,7 +17,7 @@ ask questions in natural language, and get streamed answers grounded only in you
 ![Next.js](https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white)
 
-**Live:** https://trenchai.vercel.app
+**Live:** https://trenchai.vercel.app · Sibling app: [Abyss](https://abyss-fleet.vercel.app) (AI agents with tools and approvals)
 
 </div>
 

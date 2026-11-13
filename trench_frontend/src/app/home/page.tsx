@@ -110,7 +110,13 @@ export default function Home() {
         </div>
       </section>
 
-      <footer className="px-6 py-6 text-center sm:px-10">
+      <footer className="flex flex-col items-center gap-2 px-6 py-6 text-center sm:px-10">
+        <Link
+          href="/about-abyss"
+          className="text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground"
+        >
+          About Abyss, our sibling app
+        </Link>
         <p className="text-xs text-muted-foreground">
           {isError ? (
             "Backend unreachable"
