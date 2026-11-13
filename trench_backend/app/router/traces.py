@@ -98,6 +98,5 @@ async def get_trace(
     trace, spans = found
     return TraceDetail(
         **TraceSummary.model_validate(trace).model_dump(),
-        langsmith_url=trace.langsmith_url,
         spans=[TraceSpanOut.model_validate(s) for s in spans],
     )

@@ -121,6 +121,7 @@ def test_chat_trace_summary():
     assert summary["input_preview"] == "What is our leave policy?"
     assert summary["output_preview"] == "Employees get 24 days of paid leave [1]."
     assert summary["latency_ms"] == 5000 and summary["complete"] is True
+    assert "langsmith_url" not in summary
     assert spans[2]["inputs"] == {
         "messages": [
             {"role": "system", "content": "cite"},

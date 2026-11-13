@@ -531,7 +531,6 @@ class Trace(Base):
     models: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     input_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
-    langsmith_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # False while LangSmith hadn't finished ingesting it; re-fetched on sync.
     complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     synced_at: Mapped[datetime] = mapped_column(
