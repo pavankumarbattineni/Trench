@@ -85,7 +85,6 @@ export interface TraceSpan {
 }
 
 export interface TraceDetail extends TraceSummary {
-  langsmith_url: string | null;
   spans: TraceSpan[];
 }
 

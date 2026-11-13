@@ -2,7 +2,7 @@
 
 import { use, useMemo, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, ExternalLink, MessageSquare } from "lucide-react";
+import { ArrowLeft, MessageSquare } from "lucide-react";
 import { cn } from "cn";
 
 import { RelativeTime } from "@/components/relative-time";
@@ -128,19 +128,6 @@ function TraceView({ trace }: { trace: TraceDetail }) {
               }
             />
           )}
-          {trace.langsmith_url && (
-            <Button
-              variant="outline"
-              size="sm"
-              nativeButton={false}
-              render={
-                <a href={trace.langsmith_url} target="_blank" rel="noopener noreferrer">
-                  <ExternalLink className="size-3.5" aria-hidden="true" /> LangSmith
-                  <span className="sr-only"> (opens in a new tab)</span>
-                </a>
-              }
-            />
-          )}
         </div>
       </header>
 
@@ -173,7 +160,6 @@ function TraceView({ trace }: { trace: TraceDetail }) {
               key={selected.id}
               span={selected}
               offsetMs={timings.get(selected.id)?.offset ?? 0}
-              langsmithUrl={trace.langsmith_url}
             />
           </div>
         )}

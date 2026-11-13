@@ -286,7 +286,6 @@ def summarize(root: Any, spans: list[dict]) -> dict:
         or _preview(messages_in(root.outputs), "assistant")
         or _preview(last_llm_out, "assistant")
     )
-    app_path = getattr(root, "app_path", None)
     thread_id = meta.get("thread_id")
     return {
         "id": uuid.UUID(str(root.trace_id)),
@@ -315,7 +314,6 @@ def summarize(root: Any, spans: list[dict]) -> dict:
         if kind == KIND_THREAD_TITLE
         else question,
         "output_preview": answer,
-        "langsmith_url": f"https://smith.langchain.com{app_path}" if app_path else None,
         "complete": end is not None and all(s["end_time"] is not None for s in spans),
     }
 

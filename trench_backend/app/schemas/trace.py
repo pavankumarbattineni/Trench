@@ -72,7 +72,6 @@ class TraceSpanOut(BaseModel):
 
 
 class TraceDetail(TraceSummary):
-    langsmith_url: str | None = None
     spans: list[TraceSpanOut]
 
 
