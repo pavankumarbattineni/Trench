@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import {
+  Activity,
   Building2,
   FileText,
   LogOut,
@@ -177,6 +178,14 @@ export function AppSidebarContent({
           label="Tenant"
           icon={<Building2 className="size-4 shrink-0" />}
           active={pathname === "/tenant"}
+          collapsed={collapsed}
+          onNavigate={onNavigate}
+        />
+        <NavLink
+          href="/tracing"
+          label="Tracing"
+          icon={<Activity className="size-4 shrink-0" />}
+          active={pathname.startsWith("/tracing")}
           collapsed={collapsed}
           onNavigate={onNavigate}
         />

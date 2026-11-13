@@ -51,6 +51,7 @@ import uuid
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langsmith import traceable
 
 from app.database.models import ChatHistory
 from app.graph.state import AgentState
@@ -605,6 +606,45 @@ async def condense_query(state: AgentState, config: RunnableConfig) -> dict:
     }
 
 
+def _as_documents(chunks: list) -> dict:
+    """Chunks as LangSmith documents (page_content + metadata), so a traced
+    search or rerank shows what it found."""
+    docs = []
+    for chunk in chunks:
+        c = chunk if isinstance(chunk, dict) else vars(chunk)
+        docs.append(
+            {
+                "page_content": c.get("content", ""),
+                "metadata": {k: v for k, v in c.items() if k != "content"},
+            }
+        )
+    return {"documents": docs}
+
+
+@traceable(
+    run_type="retriever",
+    name="Hybrid search",
+    process_inputs=lambda i: {
+        "query": i.get("query"),
+        "knowledge_type": i["scope"].knowledge_type,
+        "top_k": i.get("top_k"),
+    },
+    process_outputs=_as_documents,
+)
+async def _traced_search(*, query: str, scope: KnowledgeScope, top_k: int) -> list:
+    return await RetrievalService.retrieve(query=query, scope=scope, top_k=top_k)
+
+
+@traceable(
+    run_type="tool",
+    name="Rerank",
+    process_inputs=lambda i: {"query": i.get("query"), "top_k": i.get("top_k")},
+    process_outputs=_as_documents,
+)
+async def _traced_rerank(query: str, candidates: list[dict], *, top_k: int) -> list:
+    return await RerankerService.rerank(query, candidates, top_k=top_k)
+
+
 async def hybrid_retrieve(state: AgentState, config: RunnableConfig) -> dict:
     tenant_id = uuid.UUID(state["tenant_id"]) if state.get("tenant_id") else None
     scope = KnowledgeScope(
@@ -614,7 +654,7 @@ async def hybrid_retrieve(state: AgentState, config: RunnableConfig) -> dict:
         else None,
         tenant_id=tenant_id,
     )
-    chunks = await RetrievalService.retrieve(
+    chunks = await _traced_search(
         query=state["condensed_query"],
         scope=scope,
         top_k=_RETRIEVAL_CANDIDATE_COUNT,
@@ -630,7 +670,7 @@ async def hybrid_retrieve(state: AgentState, config: RunnableConfig) -> dict:
         }
         for c in chunks
     ]
-    reranked = await RerankerService.rerank(
+    reranked = await _traced_rerank(
         state["condensed_query"], candidates, top_k=_FINAL_CHUNK_COUNT
     )
     return {"retrieved_chunks": reranked}
